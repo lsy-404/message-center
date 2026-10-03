@@ -47,9 +47,9 @@ logged-in device <-- local runtime connector <-- device relay
 ```powershell
 Copy-Item .\config.example.json .\config.json
 pnpm install
-pnpm build
+pnpm run build
 $env:BRIDGE_MCP_CONFIG = (Resolve-Path .\config.json)
-pnpm start
+pnpm run start
 ```
 
 默认配置使用 `spool` 和 `dry_run`。真实客户端连接使用 `adapter: "device"`，私有适配器及其配置应放在被忽略的 `local-adapters/` 目录；不要把目标标识或任何凭据提交到配置文件。
@@ -71,7 +71,7 @@ HTTP 模式仅允许回环绑定：
 
 ```powershell
 $env:BRIDGE_MCP_BEARER_TOKEN = "replace-with-a-long-random-secret"
-pnpm start
+pnpm run start
 ```
 
 跨机器访问应使用 Cloud Worker、现有 VPN 或零信任网关，不要直接转发本地 MCP 端口。
@@ -130,7 +130,7 @@ $env:BRIDGE_MESSAGE_CONNECTORS = @'
   }
 }
 '@
-npm run unified-relay
+pnpm run unified-relay
 ```
 
 启动时 relay 会幂等注册所有实例，随后发送心跳、上传消息和入站附件、领取下行命令。每个请求都同时携带实例 ID 与该实例在 `BRIDGE_MESSAGE_CONNECTOR_TOKENS` 中的专属 bearer；一个实例的 token 不能声明或操作另一个实例。迁移期单 token 模式还要求 Worker 显式设置与之绑定的 `LEGACY_CONNECTOR_ID`，不能用于多实例。附件下载同样携带实例 ID，Worker 会阻止实例读取不属于自己的下行附件。旧 `BRIDGE_MESSAGE_CONNECTOR_MAP` 字符串映射仍兼容，但为避免宣称未经验证的附件路径，其能力只按收发文字注册；新部署应使用带元数据的 `BRIDGE_MESSAGE_CONNECTORS`，并仅声明已验证贯通的能力。
@@ -193,9 +193,9 @@ DPAPI 文件只能由创建它的 Windows 用户解密；重装系统或删除�
 ## 验证
 
 ```powershell
-pnpm check
-pnpm test
-pnpm build
+pnpm run check
+pnpm run test
+pnpm run build
 ```
 
 安全边界见 [SECURITY.md](./SECURITY.md)，设备适配器要求见 [docs/device-adapter-contract.md](./docs/device-adapter-contract.md)。

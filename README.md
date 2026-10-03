@@ -23,21 +23,21 @@
 ```powershell
 Set-Location .\bridge
 pnpm install --frozen-lockfile
-pnpm check
-pnpm test
-pnpm build
+pnpm run check
+pnpm run test
+pnpm run build
 
 Set-Location ..\cloudflare-worker
 Set-Location .\ui
-npm ci
-npm run check
-npm run build
+pnpm install --frozen-lockfile
+pnpm run check
+pnpm run build
 
 Set-Location ..
 node --check worker/index.js
 node worker/smoke-test.mjs
 node worker/schema-test.mjs
-npx wrangler deploy --dry-run
+pnpm dlx wrangler deploy --dry-run
 ```
 
 生产部署和密钥管理分别见 `cloudflare-worker/README.md` 与 `bridge/README.md`。公开仓库不包含运行时适配器，并且不应提交任何凭据或设备数据。

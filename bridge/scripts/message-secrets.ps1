@@ -192,21 +192,21 @@ function Invoke-WranglerSecretPut {
     [Parameter(Mandatory)] [string]$Value
   )
 
-  $npx = (Get-Command npx.cmd -ErrorAction Stop).Source
+  $pnpm = (Get-Command corepack.cmd -ErrorAction Stop).Source
   $configPath = Join-Path $WorkerProject 'wrangler.jsonc'
   if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
     throw "Worker configuration not found: $configPath"
   }
 
   $startInfo = [Diagnostics.ProcessStartInfo]::new()
-  $startInfo.FileName = $npx
+  $startInfo.FileName = $pnpm
   $startInfo.WorkingDirectory = $WorkerProject
   $startInfo.UseShellExecute = $false
   $startInfo.CreateNoWindow = $true
   $startInfo.RedirectStandardInput = $true
   $startInfo.RedirectStandardOutput = $true
   $startInfo.RedirectStandardError = $true
-  foreach ($argument in @('wrangler', 'secret', 'put', $Name, '--config', $configPath)) {
+  foreach ($argument in @('pnpm', 'dlx', 'wrangler', 'secret', 'put', $Name, '--config', $configPath)) {
     [void]$startInfo.ArgumentList.Add($argument)
   }
 
@@ -512,7 +512,7 @@ switch ($Action) {
       }
       Push-Location -LiteralPath $RelayProject
       try {
-        & npm.cmd run unified-relay
+        & corepack.cmd pnpm run unified-relay
         if ($LASTEXITCODE -ne 0) {
           throw "Relay exited with code $LASTEXITCODE."
         }

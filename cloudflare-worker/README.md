@@ -59,15 +59,15 @@
 
 ```powershell
 Set-Location .\ui
-npm ci
-npm run check
-npm run build
+pnpm install --frozen-lockfile
+pnpm run check
+pnpm run build
 
 Set-Location ..
 node --check worker/index.js
 node worker/schema-test.mjs
 node worker/smoke-test.mjs
-npx wrangler deploy --dry-run
+pnpm dlx wrangler deploy --dry-run
 ```
 
 生产部署必须严格按“远程备份并核对 pending migration → 远程应用 `migrations/` → `wrangler deploy`”执行。Worker 会直接查询最新 schema，禁止在对应 D1 migration 生效前先部署新 Worker，否则收件箱和布局 API 会因缺表失败。前端主题层与 IRIS 一致，来自 WinUIonWeb；固定来源、GPL-3.0 许可证与归属说明位于 `ui/src/vendor/winui/`，部署副本位于 `/vendor/winui/`。
