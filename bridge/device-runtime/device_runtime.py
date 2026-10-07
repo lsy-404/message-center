@@ -191,7 +191,9 @@ class Relay:
 
     def headers(self):
         return {"Authorization": "Bearer " + self.active_connector["token"],
-                "x-connector-id": self.connector}
+                "x-connector-id": self.connector,
+                "User-Agent": "MessageCenterDevice/1.0",
+                "Accept": "application/json"}
 
     def request(self, method, path, payload=None):
         data = None if payload is None else compact(payload).encode("utf-8")

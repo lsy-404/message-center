@@ -1,7 +1,9 @@
 import importlib.util
+import http.server
 import os
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -484,6 +486,41 @@ class DeviceRuntimeTests(unittest.TestCase):
         request = runtime.urllib.request.Request("https://worker.example/api/connectors/events")
         with self.assertRaises(runtime.urllib.error.HTTPError):
             runtime.NoRedirect().redirect_request(request, None, 302, "Found", {}, "https://other.example/")
+
+    def test_http_request_sends_device_headers_and_connector_identity(self):
+        received = {}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                received["path"] = self.path
+                received["headers"] = self.headers
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"ok":true}')
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            relay = runtime.Relay(self.config, self.db, lambda _request: {}, None)
+            relay.base = "http://127.0.0.1:%d" % server.server_port
+            relay.select_connector(self.config["connectors"][0])
+            result = relay.request("GET", "/api/connectors/healthz")
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(received["path"], "/api/connectors/healthz")
+        self.assertEqual(received["headers"].get("User-Agent"), "MessageCenterDevice/1.0")
+        self.assertEqual(received["headers"].get("Accept"), "application/json")
+        self.assertEqual(received["headers"].get("Authorization"), "Bearer " + "x" * 40)
+        self.assertEqual(received["headers"].get("X-connector-id"), "connector-a")
 
 
 def json_cursor(db):
