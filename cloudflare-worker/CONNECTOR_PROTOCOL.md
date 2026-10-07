@@ -150,7 +150,7 @@ relay 必须按 `idempotencyKey` 去重。暂时故障回执 `retry: true`，确
 例如 Stop 在 revision 2 被接受、响应丢失，管理员随后启用 revision 3；重试原 Stop 时响应仍报告
 `deviceActionRevision: 2, deviceActionEnabled: false`，不能把停止锁错误抬到 revision 3。
 
-入站事件按 `connectorId + externalId` 去重。解析器升级后，Worker 只允许把同一消息的旧 `[file:asset]` 占位正文原地升级为 `[转账]`、`[拍一拍]` 或 `[卡片]`；消息 ID、时间、队列类别和 Agent 租约状态保持不变，其他重复事件仍忽略。
+入站事件按 `connectorId + externalId` 去重。相同正文的重复事件可以补充先前缺少的附件；Worker 仅接受已上传且会话、文件名、MIME、大小与 SHA-256 均匹配的对象，并保留已有附件。附件 ID 已关联到其他消息时不能重绑。相同 ID 的正文或既有附件元数据冲突会拒绝请求。解析器升级后，Worker 仍允许把同一消息的旧 `[file:asset]` 占位正文原地升级为 `[转账]`、`[拍一拍]` 或 `[卡片]`；消息 ID、时间、队列类别和 Agent 租约状态保持不变。
 
 ## 附件
 
