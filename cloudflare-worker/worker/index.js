@@ -1354,22 +1354,59 @@ async function ingestGroupTextBackups(request, env) {
   }
   const connector = await connectorRow(env, connectorId);
   if (!connector) throw new Error("connector_not_found");
-  if (!capabilitySet(connector).has("receive_text")) throw new Error("receive_text_not_supported");
+  const capabilities = capabilitySet(connector);
+  if (!capabilities.has("receive_text")) throw new Error("receive_text_not_supported");
   const stamp = now();
   const statements = [];
   const normalized = [];
   for (const item of body.messages) {
     const bodyText = String(item?.body || "").trim();
+    if (item?.attachments !== undefined && !Array.isArray(item.attachments)) {
+      throw new Error("invalid_group_backup_attachment");
+    }
+    const attachments = item?.attachments || [];
     if (!validShort(item?.externalId) || !item?.conversationExternalId || !item?.conversationTitle ||
         !item?.senderName || item?.conversationType !== "group" || !bodyText || bodyText.length > 20_000 ||
-        !Number.isFinite(Date.parse(item?.occurredAt)) ||
-        (Array.isArray(item?.attachments) && item.attachments.length > 0)) {
+        !Number.isFinite(Date.parse(item?.occurredAt)) || attachments.length > 20) {
       throw new Error("invalid_group_text_backup");
+    }
+    const attachmentMetadata = [];
+    for (const attachment of attachments) {
+      const externalId = String(attachment?.externalId || "");
+      const rawFileName = attachment?.fileName;
+      const fileName = cleanName(rawFileName);
+      const mimeType = String(attachment?.mimeType || "");
+      const sizeBytes = attachment?.sizeBytes;
+      const sha256 = String(attachment?.sha256 || "");
+      if (!capabilities.has("receive_images") || !validShort(externalId) ||
+          typeof rawFileName !== "string" || !rawFileName.trim() ||
+          /[\u0000-\u001f\u007f]/.test(rawFileName) ||
+          !/^image\/[a-z0-9.+-]{1,100}$/i.test(mimeType) || !Number.isInteger(sizeBytes) ||
+          sizeBytes < 1 || sizeBytes > 50 * 1024 * 1024 || !/^[a-f0-9]{64}$/.test(sha256)) {
+        throw new Error("invalid_group_backup_attachment");
+      }
+      const uploaded = await env.DB.prepare(`
+        SELECT id, state, object_key, message_id, conversation_external_id, file_name, mime_type, size_bytes, sha256
+        FROM attachments WHERE connector_id = ? AND external_id = ?
+      `).bind(connectorId, externalId).first();
+      const existingMessage = await env.DB.prepare(`
+        SELECT id FROM messages WHERE connector_id = ? AND external_id = ?
+      `).bind(connectorId, String(item.externalId).slice(0, 300)).first();
+      if (!uploaded || !uploaded.object_key ||
+          !new Set(["uploaded_inbound", "received"]).has(uploaded.state) ||
+          uploaded.conversation_external_id !== String(item.conversationExternalId).slice(0, 500) ||
+          uploaded.file_name !== fileName || uploaded.mime_type !== mimeType ||
+          Number(uploaded.size_bytes) !== sizeBytes || uploaded.sha256 !== sha256 ||
+          (uploaded.message_id && uploaded.message_id !== existingMessage?.id) ||
+          (uploaded.state === "received" && !existingMessage)) {
+        throw new Error("group_backup_attachment_not_uploaded");
+      }
+      attachmentMetadata.push({ externalId, fileName, mimeType, sizeBytes, sha256 });
     }
     const placement = new Set(["normal", "folded", "message_box"]).has(String(item?.placement))
       ? String(item.placement) : "unknown";
     const occurredAt = new Date(item.occurredAt).toISOString();
-    normalized.push({ item, bodyText, placement, occurredAt });
+    normalized.push({ item, bodyText, placement, occurredAt, attachmentMetadata });
     statements.push(env.DB.prepare(`
       INSERT OR IGNORE INTO group_text_backups (
         connector_id, conversation_external_id, conversation_title, external_id,
@@ -1407,10 +1444,11 @@ async function ingestGroupTextBackups(request, env) {
       bodyText: stored.body,
       placement: stored.placement,
       occurredAt: stored.occurred_at,
+      attachmentMetadata: entry.attachmentMetadata,
     });
   }
   let normalizedInserted = 0;
-  for (const { item, bodyText, placement, occurredAt } of canonical) {
+  for (const { item, bodyText, placement, occurredAt, attachmentMetadata } of canonical) {
     const conversationExternalId = String(item.conversationExternalId).slice(0, 500);
     let conversation = await env.DB.prepare(`
       SELECT id FROM conversations WHERE connector_id = ? AND external_id = ?
@@ -1434,15 +1472,17 @@ async function ingestGroupTextBackups(request, env) {
       INSERT OR IGNORE INTO messages (
         id, conversation_id, connector_id, external_id, direction, sender_id, sender_name, body,
         content_type, delivery_state, queue_class, metadata_json, occurred_at, created_by, created_at
-      ) VALUES (?, ?, ?, ?, 'inbound', ?, ?, ?, 'text', 'received', 'background', ?, ?, NULL, ?)
+      ) VALUES (?, ?, ?, ?, 'inbound', ?, ?, ?, ?, 'received', 'background', ?, ?, NULL, ?)
     `).bind(crypto.randomUUID(), conversation.id, connectorId, String(item.externalId).slice(0, 300),
       item.senderId ? String(item.senderId).slice(0, 300) : null, String(item.senderName).slice(0, 200), bodyText,
-      JSON.stringify({ conversationType: "group", trigger: "background", mentioned: false, placement, context: [] }),
+      attachmentMetadata.length ? "mixed" : "text",
+      JSON.stringify({ conversationType: "group", trigger: "background", mentioned: false, placement,
+        context: [], attachments: attachmentMetadata }),
       occurredAt, stamp).run();
     if (count(result.meta?.changes)) normalizedInserted += 1;
     else {
       const existing = await env.DB.prepare(`
-        SELECT conversation_id, body FROM messages WHERE connector_id = ? AND external_id = ?
+        SELECT id, conversation_id, body, metadata_json FROM messages WHERE connector_id = ? AND external_id = ?
       `).bind(connectorId, String(item.externalId).slice(0, 300)).first();
       if (!existing) throw new Error("message_not_found");
       if (existing.conversation_id !== conversation.id || existing.body !== bodyText) {
@@ -1456,6 +1496,46 @@ async function ingestGroupTextBackups(request, env) {
         `).bind(connectorId, String(item.externalId).slice(0, 300), conversationExternalId).run();
         await deleteRequestCreatedEmptyConversation(env, requestCreatedConversationId);
         throw new Error("message_external_id_conflict");
+      }
+      const existingMetadata = safeJson(existing.metadata_json, {});
+      if (JSON.stringify(existingMetadata.attachments || []) !== JSON.stringify(attachmentMetadata)) {
+        throw new Error("message_attachment_conflict");
+      }
+      for (const attachment of attachmentMetadata) {
+        await env.DB.prepare(`
+          UPDATE attachments SET message_id = ?, state = 'received'
+          WHERE connector_id = ? AND external_id = ? AND conversation_external_id = ?
+            AND object_key IS NOT NULL
+            AND ((message_id IS NULL AND state = 'uploaded_inbound') OR
+              (message_id = ? AND state = 'received'))
+        `).bind(existing.id, connectorId, attachment.externalId,
+          conversationExternalId, existing.id).run();
+        const linked = await env.DB.prepare(`
+          SELECT message_id, state FROM attachments
+          WHERE connector_id = ? AND external_id = ? AND conversation_external_id = ?
+        `).bind(connectorId, attachment.externalId, conversationExternalId).first();
+        if (linked?.message_id !== existing.id || linked?.state !== "received") {
+          throw new Error("group_backup_attachment_not_linked");
+        }
+      }
+    }
+    if (count(result.meta?.changes)) {
+      const insertedMessage = await env.DB.prepare(`
+        SELECT id FROM messages WHERE connector_id = ? AND external_id = ?
+      `).bind(connectorId, String(item.externalId).slice(0, 300)).first();
+      for (const attachment of attachmentMetadata) {
+        await env.DB.prepare(`
+          UPDATE attachments SET message_id = ?, state = 'received'
+          WHERE connector_id = ? AND external_id = ? AND conversation_external_id = ?
+            AND message_id IS NULL AND state = 'uploaded_inbound' AND object_key IS NOT NULL
+        `).bind(insertedMessage.id, connectorId, attachment.externalId, conversationExternalId).run();
+        const linked = await env.DB.prepare(`
+          SELECT message_id, state FROM attachments
+          WHERE connector_id = ? AND external_id = ? AND conversation_external_id = ?
+        `).bind(connectorId, attachment.externalId, conversationExternalId).first();
+        if (linked?.message_id !== insertedMessage.id || linked?.state !== "received") {
+          throw new Error("group_backup_attachment_not_linked");
+        }
       }
     }
     // This is deliberately replayable: if a previous request committed the message but

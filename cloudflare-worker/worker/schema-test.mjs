@@ -220,7 +220,7 @@ database.prepare(`
   INSERT INTO connector_instances (
     id, kind, channel_label, account_label, display_name, mode, capabilities_json, created_at, updated_at
   ) VALUES (?, 'im', 'Test IM', 'device', 'Device', 'device_relay',
-    '["receive_text","receive_files","send_text","send_files","layout_control"]', ?, ?)
+    '["receive_text","receive_files","receive_images","send_text","send_files","layout_control"]', ?, ?)
 `).run(connectorId, stamp, stamp);
 database.prepare(`
   INSERT INTO connector_instances (
@@ -755,13 +755,13 @@ database.prepare(`
   UPDATE conversations SET trust_tier = 'untrusted', agent_policy_json = '{}' WHERE id = 'conversation-row'
 `).run();
 
-async function putInboundFile(fileId, externalId, bytes, conversationExternalId = 'conversation-file-test') {
+async function putInboundFile(fileId, externalId, bytes, conversationExternalId = 'conversation-file-test', mimeType = 'application/octet-stream') {
   const sha256 = createHash('sha256').update(bytes).digest('hex');
   return worker.fetch(new Request(`https://message.example.com/api/connectors/files/${fileId}`, {
     method: 'PUT',
     headers: {
       authorization: `Bearer ${connectorToken}`,
-      'content-type': 'application/octet-stream',
+      'content-type': mimeType,
       'content-length': String(bytes.byteLength),
       'x-connector-id': connectorId,
       'x-conversation-id': conversationExternalId,
@@ -1695,6 +1695,53 @@ assert.equal(normalizedBackup.title, backupMessage.conversationTitle);
 assert.equal(normalizedBackup.conversation_external_id, backupMessage.conversationExternalId);
 assert.equal(database.prepare('SELECT COUNT(*) AS total FROM agent_queue WHERE message_id = ?')
   .get(normalizedBackup.id).total, 0);
+
+const groupImageBytes = new Uint8Array([8, 9, 10, 11]);
+const groupImageConversation = 'conversation-group-image';
+const groupImageExternalId = 'message-group-image';
+const groupImageFileExternalId = 'file-group-image';
+const groupImageDigest = createHash('sha256').update(groupImageBytes).digest('hex');
+const uploadedGroupImage = await putInboundFile('file-group-image', groupImageFileExternalId,
+  groupImageBytes, groupImageConversation, 'image/png');
+assert.equal(uploadedGroupImage.status, 201);
+const groupImageMessage = {
+  externalId: groupImageExternalId, conversationExternalId: groupImageConversation,
+  conversationTitle: 'Group with images', senderName: 'Member', body: '[图片]',
+  occurredAt: stamp, conversationType: 'group', trigger: 'background', placement: 'normal',
+  attachments: [{ externalId: groupImageFileExternalId, fileName: 'fixture.bin', mimeType: 'image/png',
+    sizeBytes: groupImageBytes.byteLength, sha256: groupImageDigest }],
+};
+const groupImageBackup = await postBackups([groupImageMessage]);
+assert.equal(groupImageBackup.inserted, 1);
+assert.equal(groupImageBackup.normalizedInserted, 1);
+const normalizedGroupImage = database.prepare(`
+  SELECT id, body, content_type, queue_class, metadata_json FROM messages
+  WHERE connector_id = ? AND external_id = ?
+`).get(connectorId, groupImageExternalId);
+assert.equal(normalizedGroupImage.body, '[图片]');
+assert.equal(normalizedGroupImage.content_type, 'mixed');
+assert.equal(normalizedGroupImage.queue_class, 'background');
+assert.deepEqual(JSON.parse(normalizedGroupImage.metadata_json).attachments, groupImageMessage.attachments);
+assert.deepEqual({ ...database.prepare(`
+  SELECT message_id, state FROM attachments WHERE connector_id = ? AND external_id = ?
+`).get(connectorId, groupImageFileExternalId) }, { message_id: normalizedGroupImage.id, state: 'received' });
+assert.equal(database.prepare('SELECT COUNT(*) AS total FROM agent_queue WHERE message_id = ?')
+  .get(normalizedGroupImage.id).total, 0);
+const replayedGroupImage = await postBackups([groupImageMessage]);
+assert.equal(replayedGroupImage.inserted, 0);
+assert.equal(database.prepare(`
+  SELECT count(*) AS total FROM attachments WHERE connector_id = ? AND external_id = ?
+`).get(connectorId, groupImageFileExternalId).total, 1);
+const unavailableGroupImage = await requestBackups([{
+  ...groupImageMessage,
+  externalId: 'message-image-not-uploaded',
+  attachments: [{ ...groupImageMessage.attachments[0], externalId: 'file-not-uploaded' }],
+}]);
+assert.equal(unavailableGroupImage.status, 400);
+assert.equal((await unavailableGroupImage.json()).error, 'group_backup_attachment_not_uploaded');
+assert.equal(database.prepare(`
+  SELECT count(*) AS total FROM group_text_backups WHERE connector_id = ? AND external_id = 'message-image-not-uploaded'
+`).get(connectorId).total, 0);
 assert.deepEqual({ ...database.prepare(`
   SELECT state, last_seen_at, updated_at FROM connector_instances WHERE id = ?
 `).get(connectorId) }, { state: 'offline', last_seen_at: authoritativeLastSeen, updated_at: authoritativeUpdatedAt });
