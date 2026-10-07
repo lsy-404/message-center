@@ -371,6 +371,17 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(len(scans), 2)
         self.assertEqual(len([call for call in calls if call[1].endswith("/heartbeat")]), 3)
 
+    def test_first_scan_is_immediate_when_monotonic_clock_starts_at_zero(self):
+        scans = []
+        relay = runtime.Relay(self.config, self.db,
+                              lambda request: scans.append(request) or {
+                                  "ok": True, "health": "online", "active": False,
+                                  "cursor": None, "messages": []},
+                              lambda *args: {"ok": True, "commands": []})
+        with patch.object(runtime.time, "monotonic", return_value=0):
+            relay.pass_once()
+        self.assertEqual(len(scans), 1)
+
     def test_redirect_handler_refuses_credential_redirect(self):
         request = runtime.urllib.request.Request("https://worker.example/api/connectors/events")
         with self.assertRaises(runtime.urllib.error.HTTPError):

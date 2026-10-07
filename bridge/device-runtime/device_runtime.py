@@ -165,7 +165,7 @@ class Relay:
         self.connector_by_id = {item["id"]: item for item in self.connectors}
         self.connector = self.connectors[0]["id"]
         self.health = {item["id"]: False for item in self.connectors}
-        self.last_scan = {item["id"]: 0 for item in self.connectors}
+        self.last_scan = {item["id"]: float("-inf") for item in self.connectors}
         self.scan_interval = {item["id"]: 300 for item in self.connectors}
         self.registered = set()
         self.failures = {item["id"]: 0 for item in self.connectors}
