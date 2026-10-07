@@ -8,6 +8,7 @@
     "check": "vue-tsc --noEmit"
   },
   "dependencies": {
+    "@platform-kit/fluent": "https://github.com/lsy-404/platform-kit/releases/download/fluent-v0.2.10/platform-kit-fluent-0.2.10.tgz",
     "vue": "^3.5.21"
   },
   "devDependencies": {

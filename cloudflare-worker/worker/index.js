@@ -2780,7 +2780,7 @@ export default {
       if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/app" || url.pathname === "/index.html")) {
         return await appAssetResponse(request, env, "/index.html");
       }
-      if (request.method === "GET" && (url.pathname.startsWith("/assets/") || url.pathname.startsWith("/vendor/winui/"))) {
+      if (request.method === "GET" && (url.pathname.startsWith("/assets/") || url.pathname.startsWith("/vendor/fluent/"))) {
         return await appAssetResponse(request, env, url.pathname);
       }
       const avatarDownload = url.pathname.match(
