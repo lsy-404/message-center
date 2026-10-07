@@ -313,7 +313,7 @@ class Relay:
             self.db.rollback()
             raise
         active = result.get("active") is True
-        self.scan_interval[self.connector] = 60 if active else 300
+        self.scan_interval[self.connector] = 15 if result.get("more") is True else (60 if active else 300)
         return result.get("health") == "online"
 
     def flush_one(self):

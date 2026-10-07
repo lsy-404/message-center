@@ -150,6 +150,8 @@ def accept_page(cursor, conversation_id, records, page_limit=20, reached_beginni
         page = page[1:]
 
     source_ids = [item["sourceId"] for item in page]
+    if before is not None and state["sweepHead"] in source_ids:
+        raise SourceCursorError("sweep_head_repeated")
     committed_head = state.get("committedHead")
     if committed_head is not None and committed_head in source_ids:
         boundary = source_ids.index(committed_head)

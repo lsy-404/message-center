@@ -1,0 +1,5 @@
+- [x] 检查多连接器扫描轮转及当前 source cursor 状态机。
+- [x] 对 opaque source ID 添加非数值单调分页回归测试，并拒绝 frozen head 在旧页重现。
+- [x] 根据显式 `more` 将下一次扫描间隔收敛到15秒，保留正常 active/idle 间隔。
+- [x] 更新 adapter/runtime README 契约并运行根测试。
+- [x] 提交本地变更，不推送。

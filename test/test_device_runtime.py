@@ -471,6 +471,38 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(len(scans), 2)
         self.assertEqual(len([call for call in calls if call[1].endswith("/heartbeat")]), 3)
 
+    def test_pending_more_scan_uses_fifteen_seconds_then_returns_to_active_or_idle_interval(self):
+        scans = []
+        now = [1000.0]
+        results = [
+            {"ok": True, "health": "online", "active": False, "more": True,
+             "cursor": None, "messages": []},
+            {"ok": True, "health": "online", "active": False,
+             "cursor": None, "messages": []},
+            {"ok": True, "health": "online", "active": True, "more": False,
+             "cursor": None, "messages": []},
+        ]
+        relay = runtime.Relay(
+            self.config, self.db,
+            lambda request: scans.append(request) or results.pop(0),
+            lambda *args: {"ok": True, "commands": []})
+        with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]):
+            relay.pass_once()
+            self.assertEqual(relay.scan_interval["connector-a"], 15)
+            now[0] += 14
+            relay.pass_once()
+            self.assertEqual(len(scans), 1)
+            now[0] += 1
+            relay.pass_once()
+            self.assertEqual(relay.scan_interval["connector-a"], 300)
+            now[0] += 299
+            relay.pass_once()
+            self.assertEqual(len(scans), 2)
+            now[0] += 1
+            relay.pass_once()
+            self.assertEqual(relay.scan_interval["connector-a"], 60)
+        self.assertEqual(len(scans), 3)
+
     def test_first_scan_is_immediate_when_monotonic_clock_starts_at_zero(self):
         scans = []
         relay = runtime.Relay(self.config, self.db,

@@ -103,6 +103,34 @@ class SourceCursorTests(unittest.TestCase):
                 reached_beginning=True, has_more=False)
         self.assertEqual(prior, cursor)
 
+    def test_opaque_ids_need_not_be_numerically_or_lexicographically_monotonic(self):
+        cursor, _ = source_cursor.initialize_baseline(
+            None, "conversation-a", "old-zebra", records("old-zebra"))
+        cursor = source_cursor.begin_sweep(cursor, "conversation-a", "new-ant")
+        cursor, first_events, done = source_cursor.accept_page(
+            cursor, "conversation-a", records("new-ant", "id-91", "id-4"),
+            page_limit=3, has_more=True)
+        self.assertFalse(done)
+        cursor, final_events, done = source_cursor.accept_page(
+            cursor, "conversation-a", records("id-4", "old-zebra"),
+            page_limit=2, reached_beginning=True, has_more=False)
+        self.assertTrue(done)
+        self.assertEqual(["profile:message-new-ant", "profile:message-id-91", "profile:message-id-4"],
+                         [event["externalId"] for event in first_events + final_events])
+
+    def test_frozen_head_reappearing_in_an_older_page_is_rejected(self):
+        cursor, _ = source_cursor.initialize_baseline(None, "conversation-a", "old-head", records("old-head"))
+        cursor = source_cursor.begin_sweep(cursor, "conversation-a", "new-head")
+        cursor, _, done = source_cursor.accept_page(
+            cursor, "conversation-a", records("new-head", "middle"), page_limit=2, has_more=True)
+        self.assertFalse(done)
+        prior = cursor
+        with self.assertRaisesRegex(source_cursor.SourceCursorError, "sweep_head_repeated"):
+            source_cursor.accept_page(
+                cursor, "conversation-a", records("middle", "new-head", "old-head"),
+                page_limit=3, reached_beginning=True, has_more=False)
+        self.assertEqual(prior, cursor)
+
     def test_duplicate_ids_and_pages_over_twenty_are_rejected(self):
         with self.assertRaisesRegex(source_cursor.SourceCursorError, "duplicate_source_id"):
             source_cursor.initialize_baseline(None, "conversation-a", "1", records("1", "1"))
