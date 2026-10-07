@@ -116,8 +116,9 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(json_cursor(self.db), old)
 
     def test_image_scan_stages_bounded_metadata_and_upload_precedes_ack(self):
-        media_dir = os.path.join(self.temp.name, "media")
-        os.mkdir(media_dir)
+        media_root = os.path.join(self.temp.name, "media")
+        media_dir = os.path.join(media_root, "connector-a")
+        os.makedirs(media_dir)
         payload = b"image-data" * 9000
         with open(os.path.join(media_dir, "image-one.bin"), "wb") as staged:
             staged.write(payload)
@@ -132,7 +133,7 @@ class DeviceRuntimeTests(unittest.TestCase):
                                   "ok": True, "health": "online", "cursor": {"n": 1},
                                   "messages": [event]},
                               lambda *args: {"ok": True, "received": 1})
-        relay.media_directory = media_dir
+        relay.media_directory = media_root
         self.assertTrue(relay.scan_profile("primary"))
         self.assertEqual(request_seen[0]["mediaDirectory"], media_dir)
         self.assertEqual(request_seen[0]["maxMediaBytes"], 100000)
@@ -150,9 +151,45 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertNotIn("stagingKey", cloud_attachment)
         self.assertFalse(os.path.exists(os.path.join(media_dir, "image-one.bin")))
 
+    def test_connector_media_directories_isolate_same_staging_key_and_cleanup(self):
+        second = dict(self.config["connectors"][0], id="connector-b", token="y" * 40, profile="secondary")
+        self.config["connectors"].append(second)
+        relay = runtime.Relay(self.config, self.db, lambda _request: {}, lambda *_args: {"ok": True})
+        first_directory = relay.media_directory_for("connector-a")
+        second_directory = relay.media_directory_for("connector-b")
+        first_bytes = b"first-file"
+        second_bytes = b"second-file"
+        for directory, payload in ((first_directory, first_bytes), (second_directory, second_bytes)):
+            with open(os.path.join(directory, "same-name"), "wb") as staged:
+                staged.write(payload)
+            with open(os.path.join(directory, "orphan"), "wb") as staged:
+                staged.write(b"orphan")
+        self.assertNotEqual(first_directory, second_directory)
+        first_attachment = {"externalId": "file-a", "fileName": "a.png", "mimeType": "image/png",
+                            "sizeBytes": len(first_bytes), "sha256": runtime.hashlib.sha256(first_bytes).hexdigest(),
+                            "stagingKey": "same-name"}
+        second_attachment = {"externalId": "file-b", "fileName": "b.png", "mimeType": "image/png",
+                             "sizeBytes": len(second_bytes), "sha256": runtime.hashlib.sha256(second_bytes).hexdigest(),
+                             "stagingKey": "same-name"}
+        relay.select_connector(self.config["connectors"][0])
+        self.assertEqual(relay.validate_staged_attachment(first_attachment)["sha256"], first_attachment["sha256"])
+        relay.select_connector(second)
+        self.assertEqual(relay.validate_staged_attachment(second_attachment)["sha256"], second_attachment["sha256"])
+        for connector_id, attachment in (("connector-a", first_attachment), ("connector-b", second_attachment)):
+            body = runtime.compact({"attachments": [attachment]})
+            self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,?)",
+                            (connector_id, "primary", "message-" + connector_id, body, 1))
+        self.db.commit()
+        relay.cleanup_unreferenced_media()
+        self.assertTrue(os.path.exists(os.path.join(first_directory, "same-name")))
+        self.assertTrue(os.path.exists(os.path.join(second_directory, "same-name")))
+        self.assertFalse(os.path.exists(os.path.join(first_directory, "orphan")))
+        self.assertFalse(os.path.exists(os.path.join(second_directory, "orphan")))
+
     def test_image_upload_failure_keeps_outbox_and_staged_bytes_for_retry(self):
-        media_dir = os.path.join(self.temp.name, "media")
-        os.mkdir(media_dir)
+        media_root = os.path.join(self.temp.name, "media")
+        media_dir = os.path.join(media_root, "connector-a")
+        os.makedirs(media_dir)
         payload = b"image"
         with open(os.path.join(media_dir, "image-retry.bin"), "wb") as staged:
             staged.write(payload)
@@ -164,29 +201,31 @@ class DeviceRuntimeTests(unittest.TestCase):
                         ("connector-a", "primary", "retry-image", runtime.compact(message), 500))
         self.db.commit()
         relay = runtime.Relay(self.config, self.db, lambda req: {}, lambda *args: {"ok": True})
-        relay.media_directory = media_dir
+        relay.media_directory = media_root
         relay.upload_attachment = lambda *_args: (_ for _ in ()).throw(OSError("upload response lost"))
         self.assertFalse(relay.flush_one())
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox WHERE external_id='retry-image'").fetchone()[0], 1)
         self.assertTrue(os.path.exists(os.path.join(media_dir, "image-retry.bin")))
 
     def test_invalid_staged_image_metadata_freezes_cursor(self):
-        media_dir = os.path.join(self.temp.name, "media")
-        os.mkdir(media_dir)
+        media_root = os.path.join(self.temp.name, "media")
+        media_dir = os.path.join(media_root, "connector-a")
+        os.makedirs(media_dir)
         message = dict(self.event("unsafe-image"), attachments=[{
             "externalId": "file-unsafe", "fileName": "photo.png", "mimeType": "image/png",
             "sizeBytes": 1, "sha256": "0" * 64, "stagingKey": "../escape.png"}])
         relay = runtime.Relay(self.config, self.db,
                               lambda req: {"ok": True, "health": "online", "cursor": {"n": 1},
                                            "messages": [message]}, lambda *args: {"ok": True})
-        relay.media_directory = media_dir
+        relay.media_directory = media_root
         with self.assertRaisesRegex(RuntimeError, "invalid_staging_key"):
             relay.scan_profile("primary")
         self.assertIsNone(self.db.execute("SELECT value FROM cursors").fetchone())
 
     def test_https_image_upload_sends_fixed_size_chunks_and_idempotency_headers(self):
-        media_dir = os.path.join(self.temp.name, "media")
-        os.mkdir(media_dir)
+        media_root = os.path.join(self.temp.name, "media")
+        media_dir = os.path.join(media_root, "connector-a")
+        os.makedirs(media_dir)
         payload = b"z" * (runtime.MEDIA_CHUNK * 2 + 13)
         with open(os.path.join(media_dir, "upload.bin"), "wb") as staged:
             staged.write(payload)
@@ -217,7 +256,7 @@ class DeviceRuntimeTests(unittest.TestCase):
                 pass
 
         relay = runtime.Relay(self.config, self.db, lambda req: {}, lambda *args: {"ok": True})
-        relay.media_directory = media_dir
+        relay.media_directory = media_root
         relay.select_connector(self.config["connectors"][0])
         with patch.object(runtime.http.client, "HTTPSConnection", Connection):
             result = relay.upload_attachment({"conversationExternalId": "conversation-1"}, attachment)

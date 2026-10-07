@@ -1173,6 +1173,50 @@ async function ensureImmediateMessageState(env, input) {
   await reconcileConversationUnread(env, input.conversationId);
 }
 
+function mergeAttachmentMetadata(existing, incoming) {
+  const merged = [];
+  const byId = new Map();
+  for (const attachment of [...existing, ...incoming]) {
+    const value = {
+      externalId: String(attachment?.externalId || "").slice(0, 200),
+      fileName: cleanName(attachment?.fileName),
+      mimeType: String(attachment?.mimeType || "application/octet-stream").slice(0, 200),
+      sizeBytes: Math.max(0, Math.min(Number(attachment?.sizeBytes || 0), 100 * 1024 * 1024)),
+      sha256: /^[a-f0-9]{64}$/.test(String(attachment?.sha256 || "")) ? attachment.sha256 : "",
+    };
+    if (!value.externalId) throw new Error("invalid_attachment_metadata");
+    const previous = byId.get(value.externalId);
+    if (previous) {
+      if (JSON.stringify(previous) !== JSON.stringify(value)) {
+        throw new Error("message_attachment_conflict");
+      }
+      continue;
+    }
+    if (merged.length >= 20) throw new Error("too_many_attachments");
+    byId.set(value.externalId, value);
+    merged.push(value);
+  }
+  return merged;
+}
+
+async function verifySupplementalAttachments(env, input) {
+  for (const attachment of input.attachments) {
+    const stored = await env.DB.prepare(`
+      SELECT message_id, state, object_key, conversation_external_id, file_name, mime_type, size_bytes, sha256
+      FROM attachments WHERE connector_id = ? AND external_id = ?
+    `).bind(input.connectorId, attachment.externalId).first();
+    if (!stored || !stored.object_key ||
+        !new Set(["uploaded_inbound", "received"]).has(stored.state) ||
+        stored.conversation_external_id !== input.conversationExternalId ||
+        stored.file_name !== attachment.fileName || stored.mime_type !== attachment.mimeType ||
+        Number(stored.size_bytes) !== attachment.sizeBytes || stored.sha256 !== attachment.sha256 ||
+        (stored.message_id && stored.message_id !== input.messageId) ||
+        (stored.state === "received" && stored.message_id !== input.messageId)) {
+      throw new Error("message_attachment_not_uploaded");
+    }
+  }
+}
+
 async function deleteRequestCreatedEmptyConversation(env, conversationId) {
   if (!conversationId) return;
   await env.DB.prepare(`
@@ -1229,7 +1273,7 @@ async function ingestEvents(request, env) {
       sizeBytes: Math.max(0, Math.min(Number(attachment?.sizeBytes || 0), 100 * 1024 * 1024)),
       sha256: /^[a-f0-9]{64}$/.test(String(attachment?.sha256 || "")) ? attachment.sha256 : "",
     })).filter((attachment) => attachment.externalId);
-    const metadata = JSON.stringify({ ...(item.metadata && typeof item.metadata === "object" ? item.metadata : {}),
+    let metadata = JSON.stringify({ ...(item.metadata && typeof item.metadata === "object" ? item.metadata : {}),
       conversationType: event.conversationType, trigger: event.trigger, mentioned: event.mentioned,
       placement: event.placement, context: event.context, attachments: attachmentMetadata,
       observedAt: event.observedAt });
@@ -1285,8 +1329,23 @@ async function ingestEvents(request, env) {
       canonicalBody = String(existing.body || "").slice(0, 20_000);
       canonicalOccurredAt = String(existing.occurred_at || event.occurredAt);
       const existingMetadata = safeJson(existing.metadata_json, {});
-      canonicalAttachments = Array.isArray(existingMetadata.attachments)
-        ? existingMetadata.attachments.slice(0, 20) : attachmentMetadata;
+      if (existing.queue_class !== "background" && canonicalBody !== upgradedBody &&
+          !(canonicalBody === "[file:asset]" && semanticCardBody(upgradedBody))) {
+        await deleteRequestCreatedEmptyConversation(env, requestCreatedConversationId);
+        throw new Error("message_external_id_conflict");
+      }
+      const previousAttachments = Array.isArray(existingMetadata.attachments)
+        ? existingMetadata.attachments.slice(0, 20) : [];
+      canonicalAttachments = mergeAttachmentMetadata(previousAttachments, attachmentMetadata);
+      const previousIds = new Set(previousAttachments.map((attachment) => String(attachment?.externalId || "")));
+      const supplementalAttachments = canonicalAttachments.filter((attachment) => !previousIds.has(attachment.externalId));
+      if (supplementalAttachments.length) {
+        await verifySupplementalAttachments(env, {
+          connectorId, conversationExternalId, messageId: existing.id, attachments: supplementalAttachments,
+        });
+      }
+      metadata = JSON.stringify({ ...existingMetadata, ...safeJson(metadata, {}),
+        attachments: canonicalAttachments });
       canonicalConversationTitle = String(conversation.title || item.conversationTitle).slice(0, 200);
       canonicalAvatarLabel = String(conversation.avatar_label || item.avatarLabel || item.conversationTitle[0] || "?").slice(0, 2);
       if (existing?.queue_class === "background") {
@@ -1297,7 +1356,7 @@ async function ingestEvents(request, env) {
             metadata_json = ?, occurred_at = ?, created_at = ?
           WHERE id = ? AND queue_class = 'background'
         `).bind(item.senderId || null, String(item.senderName).slice(0, 200), upgradedBody, upgradedBody,
-          String(item.contentType || (attachments.length ? "mixed" : "text")).slice(0, 50),
+          String(item.contentType || (canonicalAttachments.length ? "mixed" : "text")).slice(0, 50),
           metadata, event.occurredAt, stamp, existing.id).run();
         if (count(promotion.meta?.changes)) {
           promoted += 1;
@@ -1307,6 +1366,13 @@ async function ingestEvents(request, env) {
           canonicalConversationTitle = String(item.conversationTitle).slice(0, 200);
           canonicalAvatarLabel = String(item.avatarLabel || item.conversationTitle[0] || "?").slice(0, 2);
         }
+      }
+      if (supplementalAttachments.length && existing?.queue_class !== "background") {
+        await env.DB.prepare(`
+          UPDATE messages SET metadata_json = ?,
+            content_type = CASE WHEN content_type = 'text' THEN 'mixed' ELSE content_type END
+          WHERE id = ? AND connector_id = ? AND external_id = ?
+        `).bind(metadata, existing.id, connectorId, item.externalId).run();
       }
       if (semanticCardBody(upgradedBody)) {
         const upgradeResult = await env.DB.prepare(`
@@ -1498,10 +1564,20 @@ async function ingestGroupTextBackups(request, env) {
         throw new Error("message_external_id_conflict");
       }
       const existingMetadata = safeJson(existing.metadata_json, {});
-      if (JSON.stringify(existingMetadata.attachments || []) !== JSON.stringify(attachmentMetadata)) {
-        throw new Error("message_attachment_conflict");
+      const previousAttachments = Array.isArray(existingMetadata.attachments)
+        ? existingMetadata.attachments.slice(0, 20) : [];
+      const mergedAttachments = mergeAttachmentMetadata(previousAttachments, attachmentMetadata);
+      const previousIds = new Set(previousAttachments.map((attachment) => String(attachment?.externalId || "")));
+      const supplementalAttachments = mergedAttachments.filter((attachment) => !previousIds.has(attachment.externalId));
+      if (supplementalAttachments.length) {
+        await env.DB.prepare(`
+          UPDATE messages SET metadata_json = ?,
+            content_type = CASE WHEN content_type = 'text' THEN 'mixed' ELSE content_type END
+          WHERE id = ? AND connector_id = ? AND external_id = ?
+        `).bind(JSON.stringify({ ...existingMetadata, attachments: mergedAttachments }),
+          existing.id, connectorId, String(item.externalId).slice(0, 300)).run();
       }
-      for (const attachment of attachmentMetadata) {
+      for (const attachment of mergedAttachments) {
         await env.DB.prepare(`
           UPDATE attachments SET message_id = ?, state = 'received'
           WHERE connector_id = ? AND external_id = ? AND conversation_external_id = ?

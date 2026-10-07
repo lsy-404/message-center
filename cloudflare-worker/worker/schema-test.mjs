@@ -1448,11 +1448,13 @@ await postEvents([{
   conversationTitle: 'Profile renamed', senderName: 'Member', body: 'canonical event body',
   occurredAt: observedEventAt, conversationType: 'direct', trigger: 'direct', attachments: [],
 }]);
-await postEvents([{
+const conflictingDuplicate = await requestEvents([{
   externalId: 'message-observed-unread', conversationExternalId: 'profile-only-live',
   conversationTitle: 'Tampered duplicate title', senderName: 'Member', body: 'tampered duplicate body',
   occurredAt: observedEventAt, conversationType: 'direct', trigger: 'direct', attachments: [],
 }]);
+assert.equal(conflictingDuplicate.status, 400);
+assert.equal((await conflictingDuplicate.json()).error, 'message_external_id_conflict');
 assert.deepEqual({ ...database.prepare(`
   SELECT unread_count, last_message_preview FROM conversations WHERE id = ?
 `).get(profileOnlyConversation.id) }, { unread_count: 4, last_message_preview: 'canonical event body' });
