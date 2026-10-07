@@ -1624,11 +1624,15 @@ async function readInbox(env, selectedConversationId) {
     const ids = (messageResult.results || []).map((row) => row.id);
     const attachmentMap = new Map();
     if (ids.length) {
-      const placeholders = ids.map(() => "?").join(",");
       const files = await env.DB.prepare(`
         SELECT id, message_id, file_name, mime_type, size_bytes, sha256, state, object_key
-        FROM attachments WHERE message_id IN (${placeholders}) ORDER BY created_at
-      `).bind(...ids).all();
+        FROM attachments
+        WHERE message_id IN (
+          SELECT id FROM messages WHERE conversation_id = ?
+          ORDER BY occurred_at DESC, created_at DESC LIMIT 300
+        )
+        ORDER BY created_at
+      `).bind(selected).all();
       for (const row of files.results || []) {
         const list = attachmentMap.get(row.message_id) || [];
         list.push({ id: row.id, fileName: row.file_name, mimeType: row.mime_type, sizeBytes: row.size_bytes,
@@ -2268,9 +2272,12 @@ async function downloadFile(request, env, ctx, fileId) {
   }
   const object = await env.FILES.get(row.object_key);
   if (!object) return fail("file_object_not_found", 404);
+  const inlineImage = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"])
+    .has(String(row.mime_type || "").toLowerCase());
+  const disposition = inlineImage ? "inline" : "attachment";
   return new Response(object.body, { headers: {
     "content-type": row.mime_type, "content-length": String(row.size_bytes),
-    "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(row.file_name)}`,
+    "content-disposition": `${disposition}; filename*=UTF-8''${encodeURIComponent(row.file_name)}`,
     "x-content-sha256": row.sha256, "cache-control": "private, no-store", "x-content-type-options": "nosniff",
   }});
 }
