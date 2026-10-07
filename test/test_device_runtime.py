@@ -3,6 +3,7 @@ import http.server
 import os
 import sqlite3
 import tempfile
+import sys
 import threading
 import time
 import unittest
@@ -10,6 +11,7 @@ from unittest.mock import patch
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "bridge", "device-runtime"))
 SOURCE = os.path.join(ROOT, "bridge", "device-runtime", "device_runtime.py")
 SPEC = importlib.util.spec_from_file_location("device_runtime", SOURCE)
 runtime = importlib.util.module_from_spec(SPEC)
@@ -40,6 +42,22 @@ class DeviceRuntimeTests(unittest.TestCase):
         return {"externalId": ident, "conversationExternalId": "conversation-1",
                 "conversationTitle": "Test", "senderName": "Sender",
                 "occurredAt": "2026-10-07T12:00:00.000Z", "body": ident}
+
+    def test_profile_sync_failure_preserves_cursor_and_outbox(self):
+        result = {"ok": True, "health": "online", "cursor": {"next": "2"},
+                  "messages": [self.event("new-1")],
+                  "conversationProfiles": [{"conversationExternalId": "conversation-1", "displayName": "中文 😀"}]}
+        relay = runtime.Relay(self.config, self.db, lambda _: result)
+        with patch.object(runtime, "sync_profiles", side_effect=RuntimeError("offline")):
+            with self.assertRaises(RuntimeError):
+                relay.scan_profile("primary")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM cursors").fetchone()[0], 0)
+        with patch.object(runtime, "sync_profiles", return_value=1) as synchronized:
+            relay.scan_profile("primary")
+            self.assertEqual(synchronized.call_args.args[1], result["conversationProfiles"])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM cursors").fetchone()[0], 1)
 
     def test_offline_spool_survives_restart_and_response_loss_reuses_event_id(self):
         calls = []
