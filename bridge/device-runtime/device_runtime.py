@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""Small direct HTTPS relay for a device-resident private adapter."""
+
+import json
+import hashlib
+import os
+import re
+import selectors
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime
+import urllib.error
+import urllib.parse
+import urllib.request
+
+if os.name == "posix":
+    import fcntl
+
+MAX_RESPONSE = 1024 * 1024
+MAX_EVENT = 256 * 1024
+DEFAULT_OUTBOX_BYTES = 16 * 1024 * 1024
+MAX_DELIVERIES_PER_PASS = 5
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        raise urllib.error.HTTPError(request.full_url, code, "redirect_refused", headers, response)
+
+
+def open_database(path):
+    parent = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(parent):
+        os.makedirs(parent, mode=0o700)
+    db = sqlite3.connect(path, timeout=10)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=FULL")
+    db.execute("PRAGMA busy_timeout=10000")
+    db.executescript("""
+      CREATE TABLE IF NOT EXISTS cursors(connector_id TEXT NOT NULL, profile TEXT NOT NULL,
+        value TEXT NOT NULL, PRIMARY KEY(connector_id,profile));
+      CREATE TABLE IF NOT EXISTS outbox(
+        seq INTEGER PRIMARY KEY AUTOINCREMENT, connector_id TEXT NOT NULL, profile TEXT NOT NULL,
+        external_id TEXT NOT NULL, body TEXT NOT NULL, size INTEGER NOT NULL,
+        UNIQUE(connector_id, external_id));
+      CREATE TABLE IF NOT EXISTS command_ledger(
+        connector_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, fingerprint TEXT NOT NULL,
+        state TEXT NOT NULL,
+        result TEXT, retryable INTEGER NOT NULL DEFAULT 0);
+      CREATE UNIQUE INDEX IF NOT EXISTS command_ledger_key ON command_ledger(connector_id,idempotency_key);
+    """)
+    return db
+
+
+def compact(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+def resolve_local_paths(config, config_path):
+    base = os.path.dirname(os.path.abspath(config_path))
+    for key in ("database", "adapter"):
+        if not os.path.isabs(config[key]):
+            config[key] = os.path.join(base, config[key])
+    return config
+
+
+def run_adapter(path, request, timeout=30):
+    deadline = time.monotonic() + timeout
+    process = subprocess.Popen([path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, bufsize=0,
+                               start_new_session=(os.name == "posix"))
+    selector = None
+    output = bytearray()
+    try:
+        selector = selectors.DefaultSelector()
+        os.set_blocking(process.stdin.fileno(), False)
+        os.set_blocking(process.stdout.fileno(), False)
+        selector.register(process.stdin, selectors.EVENT_WRITE, "input")
+        selector.register(process.stdout, selectors.EVENT_READ, "output")
+        request_bytes = memoryview(compact(request).encode("utf-8"))
+        offset = 0
+        input_open = True
+        output_open = True
+        while input_open or output_open:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("adapter_timeout")
+            for key, _ in selector.select(remaining):
+                if key.data == "input":
+                    try:
+                        written = os.write(process.stdin.fileno(), request_bytes[offset:offset + 16384])
+                        offset += written
+                    except BrokenPipeError:
+                        offset = len(request_bytes)
+                    if offset >= len(request_bytes):
+                        selector.unregister(process.stdin)
+                        process.stdin.close()
+                        input_open = False
+                else:
+                    chunk = os.read(process.stdout.fileno(), 16384)
+                    if not chunk:
+                        selector.unregister(process.stdout)
+                        output_open = False
+                        continue
+                    output.extend(chunk)
+                    if len(output) > MAX_RESPONSE:
+                        raise RuntimeError("adapter_response_too_large")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("adapter_timeout")
+        return_code = process.wait(timeout=remaining)
+    except Exception:
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                if process.poll() is None:
+                    process.kill()
+        elif process.poll() is None:
+            process.kill()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        raise
+    finally:
+        if selector is not None:
+            selector.close()
+        if process.stdin:
+            process.stdin.close()
+        if process.stdout:
+            process.stdout.close()
+    if return_code != 0:
+        raise RuntimeError("adapter_failed")
+    value = json.loads(bytes(output).decode("utf-8"))
+    if not isinstance(value, dict):
+        raise RuntimeError("adapter_invalid_response")
+    return value
+
+
+class Relay:
+    def __init__(self, config, db=None, adapter_call=None, http_call=None):
+        self.config = config
+        self.db = db or open_database(config["database"])
+        self.adapter_call = adapter_call or (lambda req: run_adapter(config["adapter"], req))
+        self.http_call = http_call or self.request
+        self.base = config["serviceUrl"].rstrip("/")
+        if not self.base.startswith("https://"):
+            raise ValueError("https_required")
+        self.connectors = config["connectors"]
+        if not self.connectors or len({item["id"] for item in self.connectors}) != len(self.connectors):
+            raise ValueError("invalid_connector_configuration")
+        if len({item["token"] for item in self.connectors}) != len(self.connectors):
+            raise ValueError("connector_tokens_must_be_unique")
+        for connector in self.connectors:
+            if (not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._:-]{7,199}", connector["id"]) or
+                    len(connector["token"]) < 32):
+                raise ValueError("invalid_connector_configuration")
+        self.connector_by_id = {item["id"]: item for item in self.connectors}
+        self.connector = self.connectors[0]["id"]
+        self.health = {item["id"]: False for item in self.connectors}
+        self.last_scan = {item["id"]: 0 for item in self.connectors}
+        self.scan_interval = {item["id"]: 300 for item in self.connectors}
+        self.registered = set()
+        self.failures = {item["id"]: 0 for item in self.connectors}
+        self.retry_at = {item["id"]: 0 for item in self.connectors}
+
+    def eligible(self, connector_id):
+        return time.monotonic() >= self.retry_at[connector_id]
+
+    def failed(self, connector_id):
+        count = self.failures[connector_id] + 1
+        self.failures[connector_id] = count
+        self.retry_at[connector_id] = time.monotonic() + min(15 * (2 ** min(count - 1, 5)), 300)
+
+    def succeeded(self, connector_id):
+        self.failures[connector_id] = 0
+        self.retry_at[connector_id] = 0
+
+    def select_connector(self, connector):
+        self.connector = connector["id"]
+        self.active_connector = connector
+
+    def headers(self):
+        return {"Authorization": "Bearer " + self.active_connector["token"],
+                "x-connector-id": self.connector}
+
+    def request(self, method, path, payload=None):
+        data = None if payload is None else compact(payload).encode("utf-8")
+        headers = self.headers()
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(self.base + path, data=data, headers=headers, method=method)
+        opener = urllib.request.build_opener(NoRedirect())
+        with opener.open(req, timeout=20) as response:
+            if response.geturl() != req.full_url:
+                raise RuntimeError("redirect_refused")
+            raw = response.read(MAX_RESPONSE + 1)
+            if len(raw) > MAX_RESPONSE:
+                raise RuntimeError("response_too_large")
+            value = json.loads(raw.decode("utf-8")) if raw else {}
+            if not isinstance(value, dict) or value.get("ok") is False:
+                raise RuntimeError(str(value.get("error", "invalid_response")))
+            return value
+
+    def count_bytes(self, connector_id=None):
+        if connector_id is None:
+            row = self.db.execute("SELECT COALESCE(SUM(size),0) FROM outbox").fetchone()
+        else:
+            row = self.db.execute("SELECT COALESCE(SUM(size),0) FROM outbox WHERE connector_id=?",
+                                  (connector_id,)).fetchone()
+        return int(row[0])
+
+    def scan_profile(self, profile, history=False):
+        ceiling = max(1, int(self.config.get("outboxMaxBytes", DEFAULT_OUTBOX_BYTES)) // len(self.connectors))
+        if self.count_bytes(self.connector) >= ceiling:
+            return None
+        row = self.db.execute("SELECT value FROM cursors WHERE connector_id=? AND profile=?",
+                              (self.connector, profile)).fetchone()
+        cursor = json.loads(row[0]) if row else None
+        limit = max(1, min(int(self.config.get("pageLimit", 20)), 20))
+        result = self.adapter_call({"op": "scan", "profile": profile, "cursor": cursor,
+                                    "limit": limit, "history": bool(history)})
+        if result.get("ok") is not True or "cursor" not in result or not isinstance(result.get("messages"), list):
+            raise RuntimeError("scan_failed")
+        messages = result["messages"]
+        if len(messages) > limit:
+            raise RuntimeError("scan_page_too_large")
+        encoded = []
+        page_ids = {}
+        for message in messages:
+            if (not isinstance(message, dict) or not isinstance(message.get("externalId"), str) or
+                    not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._:-]{0,199}", message["externalId"])):
+                raise RuntimeError("invalid_event")
+            if message.get("attachments"):
+                raise RuntimeError("adapter_file_receive_not_supported")
+            if (not isinstance(message.get("conversationExternalId"), str) or not message["conversationExternalId"] or
+                    not isinstance(message.get("conversationTitle"), str) or not message["conversationTitle"] or
+                    not isinstance(message.get("senderName"), str) or not message["senderName"] or
+                    not isinstance(message.get("occurredAt"), str) or
+                    not isinstance(message.get("body", ""), str) or
+                    not isinstance(message.get("context", []), list) or len(message.get("context", [])) > 20):
+                raise RuntimeError("invalid_event")
+            try:
+                datetime.fromisoformat(message["occurredAt"].replace("Z", "+00:00"))
+            except ValueError:
+                raise RuntimeError("invalid_event_time")
+            conversation_type = message.get("conversationType", "direct")
+            trigger = message.get("trigger", "direct" if conversation_type != "group" else "background")
+            if conversation_type not in ("direct", "group"):
+                raise RuntimeError("invalid_event")
+            if trigger not in (("mention", "explicit_request", "background") if conversation_type == "group" else ("direct",)):
+                raise RuntimeError("invalid_event")
+            for context_item in message.get("context", []):
+                if not isinstance(context_item, dict) or not isinstance(context_item.get("receivedAt"), str):
+                    raise RuntimeError("invalid_event_context")
+                try:
+                    datetime.fromisoformat(context_item["receivedAt"].replace("Z", "+00:00"))
+                except ValueError:
+                    raise RuntimeError("invalid_event_context")
+            if message.get("observedAt") is not None:
+                if not isinstance(message["observedAt"], str):
+                    raise RuntimeError("invalid_event")
+                try:
+                    datetime.fromisoformat(message["observedAt"].replace("Z", "+00:00"))
+                except ValueError:
+                    raise RuntimeError("invalid_event")
+            raw = compact({"connectorId": self.connector, "messages": [message]}).encode("utf-8")
+            if len(raw) > MAX_EVENT:
+                raise RuntimeError("event_too_large")
+            body = compact(message)
+            previous = page_ids.get(message["externalId"])
+            if previous is not None and previous != body:
+                raise RuntimeError("event_id_conflict_in_page")
+            if previous is None:
+                page_ids[message["externalId"]] = body
+                encoded.append((self.connector, profile, str(message["externalId"]), body, len(raw)))
+        candidate = compact(result.get("cursor"))
+        if len(candidate.encode("utf-8")) > 65536:
+            raise RuntimeError("cursor_too_large")
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            current = self.count_bytes(self.connector)
+            added = sum(item[4] for item in encoded)
+            ceiling = max(1, int(self.config.get("outboxMaxBytes", DEFAULT_OUTBOX_BYTES)) // len(self.connectors))
+            if current + added > ceiling:
+                self.db.rollback()
+                return None
+            for item in encoded:
+                existing = self.db.execute("SELECT body FROM outbox WHERE connector_id=? AND external_id=?",
+                                           (item[0], item[2])).fetchone()
+                if existing and existing[0] != item[3]:
+                    raise RuntimeError("event_id_conflict_in_outbox")
+                self.db.execute("INSERT OR IGNORE INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,?)", item)
+            self.db.execute("INSERT INTO cursors(connector_id,profile,value) VALUES(?,?,?) "
+                            "ON CONFLICT(connector_id,profile) DO UPDATE SET value=excluded.value",
+                            (self.connector, profile, candidate))
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+        active = result.get("active") is True
+        self.scan_interval[self.connector] = 60 if active else 300
+        return result.get("health") == "online"
+
+    def flush_one(self):
+        available = [item["id"] for item in self.connectors if self.eligible(item["id"])]
+        if not available:
+            return False
+        marks = ",".join("?" for _ in available)
+        row = self.db.execute("SELECT seq,connector_id,profile,external_id,body FROM outbox "
+                              "WHERE connector_id IN (" + marks + ") ORDER BY seq LIMIT 1", available).fetchone()
+        if row is None:
+            return False
+        seq, connector_id, profile, external_id, body = row
+        self.select_connector(self.connector_by_id[connector_id])
+        try:
+            self.http_call("POST", "/api/connectors/events",
+                           {"connectorId": self.connector, "messages": [json.loads(body)]})
+        except Exception:
+            self.failed(connector_id)
+            raise
+        self.db.execute("DELETE FROM outbox WHERE seq=?", (seq,))
+        self.db.commit()
+        self.succeeded(connector_id)
+        return True
+
+    def complete(self, command, result):
+        self.http_call("POST", "/api/connectors/commands/" + urllib.parse.quote(command["id"], safe="") + "/complete",
+                       {"connectorId": self.connector, "leaseToken": command["leaseToken"], **result})
+
+    def process_command(self, command, profile):
+        key = command.get("idempotencyKey")
+        if not key:
+            self.complete(command, {"ok": False, "error": "invalid_idempotency_key"})
+            return
+        payload = command.get("payload") or {}
+        fingerprint = hashlib.sha256(compact({
+            "externalConversationId": payload.get("externalConversationId"),
+            "body": payload.get("body", ""), "attachments": payload.get("attachments", []),
+        }).encode("utf-8")).hexdigest()
+        row = self.db.execute("SELECT state,result,retryable,fingerprint FROM command_ledger WHERE connector_id=? AND idempotency_key=?",
+                              (self.connector, key)).fetchone()
+        if row:
+            if row[3] != fingerprint:
+                self.complete(command, {"uncertain": True, "error": "device_idempotency_key_conflict"})
+                return
+            if row[0] == "done":
+                outcome = json.loads(row[1])
+                self.complete(command, outcome)
+                return
+            if row[0] == "started":
+                outcome = {"uncertain": True, "error": "device_send_outcome_uncertain"}
+                self.complete(command, outcome)
+                return
+            try:
+                self.http_call("POST", "/api/connectors/commands/" +
+                               urllib.parse.quote(command["id"], safe="") + "/lease",
+                               {"connectorId": self.connector, "leaseToken": command["leaseToken"]})
+            except Exception:
+                return False
+            self.db.execute("UPDATE command_ledger SET state='started',result=NULL WHERE connector_id=? AND idempotency_key=?",
+                            (self.connector, key))
+            self.db.commit()
+        else:
+            try:
+                self.http_call("POST", "/api/connectors/commands/" +
+                               urllib.parse.quote(command["id"], safe="") + "/lease",
+                               {"connectorId": self.connector, "leaseToken": command["leaseToken"]})
+            except Exception:
+                return False
+            self.db.execute("INSERT INTO command_ledger(connector_id,idempotency_key,fingerprint,state) "
+                            "VALUES(?,?,?,'started')", (self.connector, key, fingerprint))
+            self.db.commit()
+        if payload.get("attachments"):
+            outcome, retryable = {"ok": False, "error": "adapter_file_send_not_supported"}, 0
+            self.db.execute("UPDATE command_ledger SET state='done',result=? WHERE connector_id=? AND idempotency_key=?",
+                            (compact(outcome), self.connector, key))
+            self.db.commit()
+            self.complete(command, outcome)
+            return
+        try:
+            result = self.adapter_call({"op": "send", "profile": profile, "commandId": command["id"],
+                                        "idempotencyKey": key,
+                                        "conversationExternalId": payload.get("externalConversationId"),
+                                        "body": payload.get("body", ""),
+                                        "attachments": payload.get("attachments", [])})
+            if result.get("ok") is True and isinstance(result.get("receipt"), str) and result.get("receipt"):
+                outcome = {"ok": True, "result": {"receipt": result["receipt"]}}
+                retryable = 0
+            elif result.get("retryable") is True:
+                if result.get("dispatched") is not False:
+                    raise RuntimeError("send_result_ambiguous")
+                outcome = {"retry": True, "error": str(result.get("error", "send_failed"))[:100]}
+                retryable = 1
+                self.db.execute("UPDATE command_ledger SET state='retry' WHERE connector_id=? AND idempotency_key=?",
+                                (self.connector, key))
+            elif result.get("ok") is False and result.get("dispatched") is False:
+                outcome = {"ok": False, "error": str(result.get("error", "send_failed"))[:100]}
+                retryable = 0
+            else:
+                outcome = {"uncertain": True, "error": "device_send_outcome_uncertain"}
+                retryable = 0
+        except Exception:
+            outcome, retryable = {"uncertain": True, "error": "device_send_outcome_uncertain"}, 0
+        if not retryable:
+            self.db.execute("UPDATE command_ledger SET state='done',result=?,retryable=? WHERE connector_id=? AND idempotency_key=?",
+                            (compact(outcome), retryable, self.connector, key))
+        self.db.commit()
+        self.complete(command, outcome)
+
+    def register_connectors(self):
+        for connector in self.connectors:
+            if connector["id"] in self.registered or not self.eligible(connector["id"]):
+                continue
+            self.select_connector(connector)
+            try:
+                self.http_call("POST", "/api/connectors/register", {
+                    "id": connector["id"], "kind": connector["kind"],
+                    "accountLabel": connector["accountLabel"], "displayName": connector["displayName"],
+                    "mode": "device_relay", "capabilities": ["receive_text", "send_text"],
+                })
+                self.registered.add(connector["id"])
+                self.succeeded(connector["id"])
+            except Exception:
+                self.failed(connector["id"])
+
+    def pass_once(self):
+        for _ in range(MAX_DELIVERIES_PER_PASS):
+            try:
+                if not self.flush_one():
+                    break
+            except Exception:
+                break
+        pending_connectors = {row[0] for row in self.db.execute("SELECT DISTINCT connector_id FROM outbox")}
+        for connector in self.connectors:
+            self.select_connector(connector)
+            profile = connector["profile"]
+            connector_id = connector["id"]
+            if (connector_id not in pending_connectors and self.eligible(connector_id) and
+                    time.monotonic() - self.last_scan[connector_id] >= self.scan_interval[connector_id]):
+                try:
+                    self.health[connector_id] = self.scan_profile(profile)
+                    self.last_scan[connector_id] = time.monotonic()
+                    self.succeeded(connector_id)
+                except Exception:
+                    self.health[connector_id] = False
+                    self.last_scan[connector_id] = time.monotonic() - self.scan_interval[connector_id]
+                    self.failed(connector_id)
+            if self.eligible(connector_id):
+                try:
+                    self.http_call("POST", "/api/connectors/heartbeat", {
+                        "connectorId": self.connector,
+                        "state": "online" if self.health[connector_id] and
+                        time.monotonic() - self.last_scan[connector_id] <= self.scan_interval[connector_id] + 30
+                        else "offline"})
+                except Exception:
+                    self.failed(connector_id)
+        for connector in self.connectors:
+            self.select_connector(connector)
+            connector_id = self.connector
+            if (not self.eligible(connector_id) or not self.health.get(connector_id) or
+                    time.monotonic() - self.last_scan[connector_id] > self.scan_interval[connector_id] + 30):
+                continue
+            path = "/api/connectors/commands?connectorId=" + urllib.parse.quote(self.connector, safe="") + "&limit=1"
+            try:
+                commands = self.http_call("GET", path, None).get("commands", [])
+                if commands:
+                    if self.process_command(commands[0], connector["profile"]) is False:
+                        self.failed(connector_id)
+                        continue
+                self.succeeded(connector_id)
+            except Exception:
+                self.failed(connector_id)
+
+
+def main(argv):
+    if len(argv) != 2:
+        raise SystemExit("usage: device_runtime.py CONFIG.json")
+    config_path = os.path.abspath(argv[1])
+    if os.name == "posix" and os.stat(config_path).st_mode & 0o077:
+        raise SystemExit("config_permissions_must_be_private")
+    os.umask(0o077)
+    with open(config_path, "r", encoding="utf-8") as source:
+        config = json.load(source)
+    config = resolve_local_paths(config, config_path)
+    lock = None
+    if os.name == "posix":
+        database_parent = os.path.dirname(os.path.abspath(config["database"]))
+        if not os.path.isdir(database_parent):
+            os.makedirs(database_parent, mode=0o700)
+        lock = open(config["database"] + ".lock", "a+")
+        os.chmod(config["database"] + ".lock", 0o600)
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise SystemExit("device_runtime_already_running")
+    relay = Relay(config)
+    backoff = 1
+    while True:
+        try:
+            relay.register_connectors()
+            relay.pass_once()
+            backoff = 1
+            time.sleep(15)
+        except KeyboardInterrupt:
+            return
+        except Exception:
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 300)
+
+
+if __name__ == "__main__":
+    main(sys.argv)
