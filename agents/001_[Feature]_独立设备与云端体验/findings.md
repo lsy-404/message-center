@@ -10,3 +10,7 @@
 - 设备临时 USB SSH 已通过已有私钥和严格主机密钥校验；仅用于诊断与部署，不作为正式运行依赖。
 - 当前远端数据库没有待应用的 migration；未执行任何 schema 变更。
 - 标准公开密钥路径与旧部署私有密钥路径不同；首次公开验证脚本提示文件缺失，后使用旧部署脚本验证，未输出明文凭据。
+- 实时设备：iPad5,1 / iOS 15.8.5（19H394），Python 3.9.9 与 SQLite 可用；没有 Frida Python 绑定或本机编译器。
+- 对消息客户端空脚本 attach 失败，精确错误为 `unexpected error while resuming process: (os/kern) failure`。对本次临时创建的 sleep 进程 attach/load/unload 成功并清理，说明不是全局注入故障。
+- 设备内存快照：空闲页约 20 MiB，inactive 约 487 MiB 可回收；不能把空闲页等同于可用内存或宣称单一泄漏。Frida 服务约 21 MiB RSS。
+- 查询 WSL 发行版时主机 WSL 安装组件报注册表权限错误；不修改系统 WSL，当前实现不依赖它。
