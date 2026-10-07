@@ -51,8 +51,7 @@ class DeviceRuntimeTests(unittest.TestCase):
             return {"ok": True}
         first = runtime.Relay(self.config, self.db, scan, lose_response)
         first.scan_profile("primary")
-        with self.assertRaises(OSError):
-            first.flush_one()
+        self.assertFalse(first.flush_one())
         saved = self.db.execute("SELECT external_id FROM outbox").fetchone()[0]
         self.assertEqual(saved, "stable-1")
         self.db.close()
@@ -146,6 +145,62 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(json_cursor(self.db), old)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
 
+    def test_scan_contract_supplies_page_and_byte_budgets(self):
+        requests = []
+        relay = runtime.Relay(self.config, self.db,
+                              lambda request: requests.append(request) or {
+                                  "ok": True, "health": "online", "active": False,
+                                  "cursor": {"next": 1}, "messages": [self.event("one")]},
+                              lambda *args: {"ok": True})
+        self.assertTrue(relay.scan_profile("primary"))
+        self.assertEqual(requests[0]["limit"], 20)
+        self.assertEqual(requests[0]["maxBytes"], runtime.MAX_SCAN_RESPONSE)
+        self.assertEqual(requests[0]["maxEventBytes"], runtime.MAX_EVENT)
+
+    def test_adapter_byte_pagination_advances_cursor_without_replaying_page(self):
+        self.config["outboxMaxBytes"] = 3 * 1024 * 1024
+        source = [dict(self.event("item-" + str(index)), body="x" * 200000) for index in range(8)]
+        requests = []
+        def adapter(request):
+            requests.append(request)
+            offset = request["cursor"] or 0
+            page = []
+            next_offset = offset
+            for item in source[offset:]:
+                candidate = page + [item]
+                candidate_cursor = offset + len(candidate)
+                envelope = {"ok": True, "health": "online", "active": False,
+                            "cursor": candidate_cursor, "messages": candidate}
+                single = runtime.compact({"connectorId": "connector-a", "messages": [item]}).encode("utf-8")
+                if (len(candidate) > request["limit"] or len(single) > request["maxEventBytes"] or
+                        len(runtime.compact(envelope).encode("utf-8")) > request["maxBytes"]):
+                    break
+                page = candidate
+                next_offset = candidate_cursor
+            return {"ok": True, "health": "online", "active": False,
+                    "cursor": next_offset, "messages": page}
+        relay = runtime.Relay(self.config, self.db, adapter, lambda *args: {"ok": True})
+        relay.scan_profile("primary")
+        first_cursor = json_cursor(self.db)
+        self.assertEqual(int(first_cursor), 4)
+        relay.scan_profile("primary")
+        self.assertEqual(json_cursor(self.db), runtime.compact(8))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 8)
+        self.assertLess(int(first_cursor), 8)
+        self.assertEqual(requests[1]["cursor"], int(first_cursor))
+
+    def test_oversized_scan_envelope_is_rejected_before_cursor_commit(self):
+        old = runtime.compact({"next": "old"})
+        self.db.execute("INSERT INTO cursors(connector_id,profile,value) VALUES('connector-a','primary',?)", (old,))
+        self.db.commit()
+        relay = runtime.Relay(self.config, self.db,
+                              lambda request: {"ok": True, "health": "online", "cursor": {"next": "new"},
+                                  "messages": [], "padding": "x" * (runtime.MAX_SCAN_RESPONSE + 1)},
+                              lambda *args: {"ok": True})
+        with self.assertRaisesRegex(RuntimeError, "scan_response_too_large"):
+            relay.scan_profile("primary")
+        self.assertEqual(json_cursor(self.db), old)
+
     def test_scan_commits_cursor_atomically_with_durable_outbox(self):
         relay = runtime.Relay(self.config, self.db,
                               lambda req: {"ok": True, "health": "online", "cursor": {"n": 3},
@@ -180,6 +235,49 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(event_ids, ["connector-a", "connector-b"])
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM cursors WHERE profile='primary'").fetchone()[0], 2)
+
+    def test_outbox_delivery_round_robins_after_large_connector_backlog(self):
+        self.config["connectors"] = [
+            {"id": "connector-a", "token": "a" * 40, "profile": "primary",
+             "kind": "im", "accountLabel": "A", "displayName": "A"},
+            {"id": "connector-b", "token": "b" * 40, "profile": "primary",
+             "kind": "im", "accountLabel": "B", "displayName": "B"},
+        ]
+        for index in range(12):
+            self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) "
+                            "VALUES('connector-a','primary',?,?,1)", ("a" + str(index), "{}"))
+        self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) "
+                        "VALUES('connector-b','primary','b0','{}',1)")
+        self.db.commit()
+        delivered = []
+        relay = runtime.Relay(self.config, self.db, lambda request: {},
+                              lambda method, path, payload=None: delivered.append(payload["connectorId"]) or {"ok": True})
+        relay.flush_one()
+        relay.flush_one()
+        self.assertEqual(delivered, ["connector-a", "connector-b"])
+
+    def test_failed_connector_does_not_block_another_outbox_delivery(self):
+        self.config["connectors"] = [
+            {"id": "connector-a", "token": "a" * 40, "profile": "primary",
+             "kind": "im", "accountLabel": "A", "displayName": "A"},
+            {"id": "connector-b", "token": "b" * 40, "profile": "primary",
+             "kind": "im", "accountLabel": "B", "displayName": "B"},
+        ]
+        self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) "
+                        "VALUES('connector-a','primary','a0','{}',1)")
+        self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) "
+                        "VALUES('connector-b','primary','b0','{}',1)")
+        self.db.commit()
+        delivered = []
+        def http(method, path, payload=None):
+            if payload["connectorId"] == "connector-a":
+                raise OSError("connector A is offline")
+            delivered.append(payload["connectorId"])
+            return {"ok": True}
+        relay = runtime.Relay(self.config, self.db, lambda request: {}, http)
+        self.assertTrue(relay.flush_one())
+        self.assertEqual(delivered, ["connector-b"])
+        self.assertEqual(self.db.execute("SELECT connector_id FROM outbox").fetchone()[0], "connector-a")
 
     def test_started_send_is_marked_uncertain_without_second_adapter_call(self):
         command = {"id": "command-1", "leaseToken": "lease-1", "idempotencyKey": "key-1",
