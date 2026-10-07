@@ -8,7 +8,6 @@ import os
 import re
 import selectors
 import signal
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -179,7 +178,6 @@ class Relay:
                     len(connector["token"]) < 32):
                 raise ValueError("invalid_connector_configuration")
         self.connector_by_id = {item["id"]: item for item in self.connectors}
-        self.migrate_legacy_staged_media()
         self.connector = self.connectors[0]["id"]
         self.health = {item["id"]: False for item in self.connectors}
         self.last_scan = {item["id"]: float("-inf") for item in self.connectors}
@@ -202,48 +200,6 @@ class Relay:
         except OSError:
             pass
         return path
-
-    def migrate_legacy_staged_media(self):
-        referenced = {}
-        for connector_id, body in self.db.execute("SELECT connector_id,body FROM outbox"):
-            if connector_id not in self.connector_by_id:
-                continue
-            try:
-                attachments = json.loads(body).get("attachments", [])
-            except (ValueError, TypeError, AttributeError):
-                continue
-            for attachment in attachments:
-                key = attachment.get("stagingKey")
-                if isinstance(key, str) and STAGING_KEY.fullmatch(key):
-                    referenced.setdefault(key, set()).add(connector_id)
-        for key, connector_ids in referenced.items():
-            source = os.path.join(self.media_directory, key)
-            if os.path.islink(source) or not os.path.isfile(source):
-                continue
-            destinations = [os.path.join(self.media_directory_for(connector_id), key)
-                            for connector_id in sorted(connector_ids)]
-            for destination in destinations:
-                if os.path.exists(destination):
-                    continue
-                if len(destinations) == 1:
-                    os.replace(source, destination)
-                    break
-                shutil.copyfile(source, destination)
-            try:
-                if os.path.exists(source) and all(os.path.isfile(path) for path in destinations):
-                    os.unlink(source)
-            except OSError:
-                pass
-        try:
-            with os.scandir(self.media_directory) as entries:
-                for entry in entries:
-                    if entry.name not in referenced and not entry.is_dir(follow_symlinks=False):
-                        try:
-                            os.unlink(entry.path)
-                        except OSError:
-                            pass
-        except OSError:
-            pass
 
     def eligible(self, connector_id):
         return time.monotonic() >= self.retry_at[connector_id]

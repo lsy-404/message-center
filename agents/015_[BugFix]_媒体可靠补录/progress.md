@@ -10,3 +10,7 @@
 - 全量验证完成：46 Python tests（1 skipped）、全部根 JS 测试及 Worker schema 集成测试通过。
 - UI check/build 因此工作树未安装 UI node_modules 不可用；本任务未修改 UI。
 - 准备审查 diff 并提交。
+
+- 按当前部署状态精简实现；connector 隔离目录和命名空间内孤儿清理保留，不触碰 root 目录其它文件。
+- 重放相同的补录事件验证附件仍关联原消息，agent_queue 数量和未读数均不变。
+- 精简后 Python 45 tests（1 skipped）、Worker media backfill 与 schema tests 通过。

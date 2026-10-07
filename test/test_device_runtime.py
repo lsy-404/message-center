@@ -168,32 +168,6 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(first_directory, "orphan")))
         self.assertFalse(os.path.exists(os.path.join(second_directory, "orphan")))
 
-    def test_restart_moves_persisted_media_into_connector_directory(self):
-        media_root = os.path.join(self.temp.name, "media")
-        os.makedirs(media_root)
-        payload = b"persisted image"
-        legacy_file = os.path.join(media_root, "legacy-image")
-        with open(legacy_file, "wb") as staged:
-            staged.write(payload)
-        legacy_orphan = os.path.join(media_root, "legacy-orphan")
-        with open(legacy_orphan, "wb") as staged:
-            staged.write(b"orphan")
-        attachment = {"externalId": "file-persisted", "fileName": "photo.png", "mimeType": "image/png",
-                      "sizeBytes": len(payload), "sha256": runtime.hashlib.sha256(payload).hexdigest(),
-                      "stagingKey": "legacy-image"}
-        self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,?)",
-                        ("connector-a", "primary", "persisted-message",
-                         runtime.compact({"attachments": [attachment]}), len(payload)))
-        self.db.commit()
-        config = dict(self.config, mediaDirectory=media_root)
-        relay = runtime.Relay(config, self.db, lambda _request: {}, lambda *_args: {"ok": True})
-        expected = os.path.join(media_root, "connector-a", "legacy-image")
-        self.assertTrue(os.path.isfile(expected))
-        self.assertFalse(os.path.exists(legacy_file))
-        self.assertFalse(os.path.exists(legacy_orphan))
-        relay.select_connector(config["connectors"][0])
-        self.assertEqual(relay.validate_staged_attachment(attachment)["sha256"], attachment["sha256"])
-
     def test_image_upload_failure_keeps_outbox_and_staged_bytes_for_retry(self):
         media_root = os.path.join(self.temp.name, "media")
         media_dir = os.path.join(media_root, "connector-a")

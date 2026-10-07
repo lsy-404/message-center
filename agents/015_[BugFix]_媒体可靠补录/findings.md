@@ -6,7 +6,6 @@
 
 ## 实现约束
 - staging 根目录下按已配置 connector ID 建 0700 子目录；适配器每次 scan 只得到当前 connector 子目录。清理按 connector 的 outbox 引用独立执行。
-- 启动时把旧 flat root 中被 outbox 引用的文件迁入对应子目录，并清理旧 flat root 的未引用普通文件，保持已有持久队列可重试。
 - 新增附件必须先上传并与 D1 中的 connector、会话、文件名、MIME、大小、hash 一致；既有文件只能仍绑定原 message。
 - 普通重复事件与群聊备份合并最多 20 个附件；正文或同文件 ID 元数据冲突返回错误。普通 background -> immediate promotion 保留原有语义例外。
 - 附件补录只更新消息附件 metadata/content type 并依赖现有 `INSERT OR IGNORE agent_queue`，不新建消息或增加 unread。
