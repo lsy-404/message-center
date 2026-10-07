@@ -3,6 +3,7 @@
 
 import json
 import hashlib
+import http.client
 import os
 import re
 import selectors
@@ -22,7 +23,12 @@ if os.name == "posix":
 MAX_RESPONSE = 1024 * 1024
 MAX_SCAN_RESPONSE = 900 * 1024
 MAX_EVENT = 256 * 1024
-DEFAULT_OUTBOX_BYTES = 16 * 1024 * 1024
+MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+MEDIA_CHUNK = 64 * 1024
+MEDIA_UPLOAD_TIMEOUT = 600
+STAGING_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
+IMAGE_MIME = re.compile(r"^image/[a-z0-9.+-]{1,100}$", re.IGNORECASE)
+DEFAULT_OUTBOX_BYTES = 128 * 1024 * 1024
 MAX_DELIVERIES_PER_PASS = 5
 
 
@@ -65,7 +71,8 @@ def compact(value):
 
 def resolve_local_paths(config, config_path):
     base = os.path.dirname(os.path.abspath(config_path))
-    for key in ("database", "adapter"):
+    config.setdefault("mediaDirectory", config["database"] + ".media")
+    for key in ("database", "adapter", "mediaDirectory"):
         if not os.path.isabs(config[key]):
             config[key] = os.path.join(base, config[key])
     return config
@@ -155,6 +162,13 @@ class Relay:
         if not self.base.startswith("https://"):
             raise ValueError("https_required")
         self.connectors = config["connectors"]
+        self.media_directory = os.path.abspath(config.get("mediaDirectory", config["database"] + ".media"))
+        if not os.path.isdir(self.media_directory):
+            os.makedirs(self.media_directory, mode=0o700)
+        try:
+            os.chmod(self.media_directory, 0o700)
+        except OSError:
+            pass
         if not self.connectors or len({item["id"] for item in self.connectors}) != len(self.connectors):
             raise ValueError("invalid_connector_configuration")
         if len({item["token"] for item in self.connectors}) != len(self.connectors):
@@ -221,6 +235,27 @@ class Relay:
                                   (connector_id,)).fetchone()
         return int(row[0])
 
+    def cleanup_unreferenced_media(self):
+        referenced = set()
+        try:
+            for (body,) in self.db.execute("SELECT body FROM outbox"):
+                for attachment in json.loads(body).get("attachments", []):
+                    key = attachment.get("stagingKey")
+                    if isinstance(key, str) and STAGING_KEY.fullmatch(key):
+                        referenced.add(key)
+        except (ValueError, TypeError, AttributeError):
+            return
+        try:
+            with os.scandir(self.media_directory) as entries:
+                for entry in entries:
+                    if entry.name not in referenced and not entry.is_dir(follow_symlinks=False):
+                        try:
+                            os.unlink(entry.path)
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+
     def scan_profile(self, profile, history=False):
         ceiling = max(1, int(self.config.get("outboxMaxBytes", DEFAULT_OUTBOX_BYTES)) // len(self.connectors))
         if self.count_bytes(self.connector) >= ceiling:
@@ -229,9 +264,11 @@ class Relay:
                               (self.connector, profile)).fetchone()
         cursor = json.loads(row[0]) if row else None
         limit = max(1, min(int(self.config.get("pageLimit", 20)), 20))
+        remaining = max(0, ceiling - self.count_bytes(self.connector))
         result = self.adapter_call({"op": "scan", "profile": profile, "cursor": cursor,
                                     "limit": limit, "maxBytes": MAX_SCAN_RESPONSE,
-                                    "maxEventBytes": MAX_EVENT, "history": bool(history)})
+                                    "maxEventBytes": MAX_EVENT, "mediaDirectory": self.media_directory,
+                                    "maxMediaBytes": remaining, "history": bool(history)})
         if result.get("ok") is not True or "cursor" not in result or not isinstance(result.get("messages"), list):
             raise RuntimeError("scan_failed")
         if len(compact(result).encode("utf-8")) > MAX_SCAN_RESPONSE:
@@ -240,6 +277,7 @@ class Relay:
         if len(messages) > limit:
             raise RuntimeError("scan_page_too_large")
         encoded = []
+        staged_bytes = 0
         page_ids = {}
         for message in messages:
             if (not isinstance(message, dict) or not isinstance(message.get("externalId"), str) or
@@ -262,17 +300,28 @@ class Relay:
                 raise RuntimeError("invalid_event")
             if trigger not in (("mention", "explicit_request", "background") if conversation_type == "group" else ("direct",)):
                 raise RuntimeError("invalid_event")
+            attachments = message.get("attachments", [])
+            if attachments is None:
+                attachments = []
+            if not isinstance(attachments, list) or len(attachments) > 20:
+                raise RuntimeError("invalid_attachments")
+            normalized_attachments = []
+            for attachment in attachments:
+                normalized_attachments.append(self.validate_staged_attachment(attachment))
             if conversation_type == "group" and trigger == "background":
                 body = message.get("body", "")
+                if not body.strip() and normalized_attachments:
+                    message["body"] = "[图片]"
+                    body = message["body"]
                 try:
                     body_length = len(body.encode("utf-16-le")) // 2
                 except UnicodeEncodeError:
                     raise RuntimeError("invalid_group_text_backup")
-                if (not body.strip() or body_length > 20000 or
-                        (message.get("attachments") and len(message["attachments"]) > 0)):
+                if (not body.strip() or body_length > 20000):
                     raise RuntimeError("invalid_group_text_backup")
-            if message.get("attachments"):
-                raise RuntimeError("adapter_file_receive_not_supported")
+            if normalized_attachments:
+                message["attachments"] = normalized_attachments
+            media_size = sum(item["sizeBytes"] for item in normalized_attachments)
             for context_item in message.get("context", []):
                 if not isinstance(context_item, dict) or not isinstance(context_item.get("receivedAt"), str):
                     raise RuntimeError("invalid_event_context")
@@ -295,15 +344,20 @@ class Relay:
             if previous is not None and previous != body:
                 raise RuntimeError("event_id_conflict_in_page")
             if previous is None:
+                staged_bytes += media_size
+                if staged_bytes > remaining:
+                    raise RuntimeError("media_budget_exceeded")
                 page_ids[message["externalId"]] = body
-                encoded.append((self.connector, profile, str(message["externalId"]), body, len(raw)))
+                encoded.append((self.connector, profile, str(message["externalId"]), body,
+                                len(raw) + media_size))
         candidate = compact(result.get("cursor"))
         if len(candidate.encode("utf-8")) > 65536:
             raise RuntimeError("cursor_too_large")
         self.db.execute("BEGIN IMMEDIATE")
         try:
             current = self.count_bytes(self.connector)
-            added = sum(item[4] for item in encoded)
+            added = sum(item[4] for item in encoded if not self.db.execute(
+                "SELECT 1 FROM outbox WHERE connector_id=? AND external_id=?", (item[0], item[2])).fetchone())
             ceiling = max(1, int(self.config.get("outboxMaxBytes", DEFAULT_OUTBOX_BYTES)) // len(self.connectors))
             if current + added > ceiling:
                 self.db.rollback()
@@ -325,6 +379,96 @@ class Relay:
         self.scan_interval[self.connector] = 15 if result.get("more") is True else (60 if active else 300)
         return result.get("health") == "online"
 
+    def validate_staged_attachment(self, attachment):
+        if not isinstance(attachment, dict):
+            raise RuntimeError("invalid_attachment")
+        key = attachment.get("stagingKey")
+        if not isinstance(key, str) or not STAGING_KEY.fullmatch(key):
+            raise RuntimeError("invalid_staging_key")
+        external_id = attachment.get("externalId")
+        file_name = attachment.get("fileName")
+        mime_type = attachment.get("mimeType")
+        size = attachment.get("sizeBytes")
+        expected_hash = attachment.get("sha256")
+        if (not isinstance(external_id, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._:-]{0,199}", external_id) or
+                not isinstance(file_name, str) or not file_name or len(file_name) > 255 or
+                any(ord(character) < 32 or ord(character) == 127 for character in file_name) or
+                not isinstance(mime_type, str) or not IMAGE_MIME.fullmatch(mime_type) or
+                not isinstance(size, int) or isinstance(size, bool) or size < 1 or size > MAX_ATTACHMENT_BYTES or
+                not isinstance(expected_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", expected_hash)):
+            raise RuntimeError("invalid_attachment_metadata")
+        path = os.path.join(self.media_directory, key)
+        if os.path.commonpath([self.media_directory, os.path.abspath(path)]) != self.media_directory:
+            raise RuntimeError("invalid_staging_key")
+        if os.path.islink(path) or not os.path.isfile(path):
+            raise RuntimeError("staged_file_missing")
+        digest = hashlib.sha256()
+        observed = 0
+        with open(path, "rb") as source:
+            while True:
+                chunk = source.read(MEDIA_CHUNK)
+                if not chunk:
+                    break
+                observed += len(chunk)
+                if observed > size or observed > MAX_ATTACHMENT_BYTES:
+                    raise RuntimeError("staged_file_size_mismatch")
+                digest.update(chunk)
+        if observed != size or digest.hexdigest() != expected_hash:
+            raise RuntimeError("staged_file_integrity_mismatch")
+        return {"externalId": external_id, "fileName": file_name,
+                "mimeType": mime_type, "sizeBytes": size, "sha256": expected_hash,
+                "stagingKey": key}
+
+    def upload_attachment(self, message, attachment):
+        parsed = urllib.parse.urlsplit(self.base)
+        if parsed.scheme != "https" or not parsed.hostname:
+            raise RuntimeError("https_required")
+        file_id = attachment["externalId"]
+        path = os.path.join(self.media_directory, attachment["stagingKey"])
+        target = "/api/connectors/files/" + urllib.parse.quote(file_id, safe="")
+        connection = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=30)
+        deadline = time.monotonic() + MEDIA_UPLOAD_TIMEOUT
+        headers = dict(self.headers())
+        headers.update({"Content-Type": attachment["mimeType"],
+                        "Content-Length": str(attachment["sizeBytes"]),
+                        "x-conversation-id": str(message["conversationExternalId"]),
+                        "x-file-external-id": file_id,
+                        "x-file-name": urllib.parse.quote(attachment["fileName"], safe=""),
+                        "x-content-sha256": attachment["sha256"]})
+        try:
+            connection.putrequest("PUT", target)
+            for name, value in headers.items():
+                connection.putheader(name, value)
+            connection.endheaders()
+            with open(path, "rb") as source:
+                while True:
+                    chunk = source.read(MEDIA_CHUNK)
+                    if not chunk:
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RuntimeError("attachment_upload_timeout")
+                    sock = getattr(connection, "sock", None)
+                    if sock:
+                        sock.settimeout(min(30, remaining))
+                    connection.send(chunk)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("attachment_upload_timeout")
+            sock = getattr(connection, "sock", None)
+            if sock:
+                sock.settimeout(min(30, remaining))
+            response = connection.getresponse()
+            raw = response.read(MAX_RESPONSE + 1)
+            if len(raw) > MAX_RESPONSE or response.status < 200 or response.status >= 300:
+                raise RuntimeError("attachment_upload_failed")
+            value = json.loads(raw.decode("utf-8")) if raw else {}
+            if value.get("ok") is not True:
+                raise RuntimeError("attachment_upload_failed")
+            return value
+        finally:
+            connection.close()
+
     def flush_one(self):
         count = len(self.connectors)
         order = [(self.flush_next_index + offset) % count for offset in range(count)]
@@ -341,6 +485,12 @@ class Relay:
             self.select_connector(connector)
             try:
                 message = json.loads(body)
+                attachments = message.get("attachments", [])
+                for attachment in attachments:
+                    self.upload_attachment(message, attachment)
+                if attachments:
+                    message["attachments"] = [{key: value for key, value in attachment.items()
+                                               if key != "stagingKey"} for attachment in attachments]
                 default_trigger = "background" if message.get("conversationType") == "group" else "direct"
                 background_group = (message.get("conversationType") == "group" and
                                     message.get("trigger", default_trigger) == "background")
@@ -355,6 +505,11 @@ class Relay:
                 continue
             self.db.execute("DELETE FROM outbox WHERE seq=?", (seq,))
             self.db.commit()
+            for attachment in json.loads(body).get("attachments", []):
+                try:
+                    os.remove(os.path.join(self.media_directory, attachment["stagingKey"]))
+                except OSError:
+                    pass
             self.succeeded(connector_id)
             self.flush_next_index = (index + 1) % count
             return True
@@ -450,7 +605,7 @@ class Relay:
                 continue
             self.select_connector(connector)
             try:
-                capabilities = ["receive_text"]
+                capabilities = ["receive_text", "receive_images"]
                 if connector.get("receiveOnly") is not True:
                     capabilities.append("send_text")
                 self.http_call("POST", "/api/connectors/register", {
@@ -485,6 +640,8 @@ class Relay:
                     self.health[connector_id] = False
                     self.last_scan[connector_id] = time.monotonic() - self.scan_interval[connector_id]
                     self.failed(connector_id)
+                finally:
+                    self.cleanup_unreferenced_media()
             if self.eligible(connector_id):
                 try:
                     self.http_call("POST", "/api/connectors/heartbeat", {

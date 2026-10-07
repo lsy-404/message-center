@@ -1,0 +1,6 @@
+- [x] 核对 Worker 已有上传、事件附件关联和群后台入库契约。
+- [x] 定义 private adapter 的安全 stagingKey 与媒体元数据协议。
+- [x] 实现图片附件验证、大小预算、流式 SHA-256 与 HTTPS 上传，并保持 cursor/outbox 原子性。
+- [x] 扩展 group-text-backups POST 支持已上传的图像附件并维持 background 队列隔离。
+- [x] 增加根目录合成测试覆盖流式有界读取、上传重试路由、cursor/outbox失败边界和Worker关联去重。
+- [x] 运行最终 suite、检查 diff 与审计约束并提交本地分支，不部署或推送。

@@ -85,7 +85,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(json_cursor(self.db), old)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
 
-    def test_unsupported_attachment_page_does_not_commit_cursor(self):
+    def test_attachment_without_staging_contract_does_not_commit_cursor(self):
         old = runtime.compact({"next": "old"})
         self.db.execute("INSERT INTO cursors(connector_id,profile,value) VALUES('connector-a','primary',?)", (old,))
         self.db.commit()
@@ -93,9 +93,126 @@ class DeviceRuntimeTests(unittest.TestCase):
                               lambda req: {"ok": True, "health": "online", "cursor": {"next": "new"},
                                            "messages": [dict(self.event("file"), attachments=[{"externalId": "f"}])]},
                               lambda *args: {"ok": True})
-        with self.assertRaisesRegex(RuntimeError, "adapter_file_receive_not_supported"):
+        with self.assertRaisesRegex(RuntimeError, "invalid_staging_key"):
             relay.scan_profile("primary")
         self.assertEqual(json_cursor(self.db), old)
+
+    def test_image_scan_stages_bounded_metadata_and_upload_precedes_ack(self):
+        media_dir = os.path.join(self.temp.name, "media")
+        os.mkdir(media_dir)
+        payload = b"image-data" * 9000
+        with open(os.path.join(media_dir, "image-one.bin"), "wb") as staged:
+            staged.write(payload)
+        media_hash = runtime.hashlib.sha256(payload).hexdigest()
+        attachment = {"externalId": "file-one", "fileName": "photo.png", "mimeType": "image/png",
+                      "sizeBytes": len(payload), "sha256": media_hash, "stagingKey": "image-one.bin"}
+        request_seen = []
+        event = dict(self.event("group-image"), conversationType="group", trigger="background",
+                      body="", attachments=[attachment])
+        relay = runtime.Relay(self.config, self.db,
+                              lambda request: request_seen.append(request) or {
+                                  "ok": True, "health": "online", "cursor": {"n": 1},
+                                  "messages": [event]},
+                              lambda *args: {"ok": True, "received": 1})
+        relay.media_directory = media_dir
+        self.assertTrue(relay.scan_profile("primary"))
+        self.assertEqual(request_seen[0]["mediaDirectory"], media_dir)
+        self.assertEqual(request_seen[0]["maxMediaBytes"], 100000)
+        row = self.db.execute("SELECT body,size FROM outbox WHERE external_id='group-image'").fetchone()
+        saved = __import__("json").loads(row[0])
+        self.assertEqual(saved["body"], "[图片]")
+        self.assertEqual(row[1], len(runtime.compact({"connectorId": "connector-a", "messages": [saved]}).encode()) + len(payload))
+        uploaded = []
+        relay.upload_attachment = lambda message, item: uploaded.append((message["externalId"], item["externalId"]))
+        delivered = []
+        relay.http_call = lambda method, path, body=None: delivered.append((path, body)) or {"ok": True, "received": 1}
+        self.assertTrue(relay.flush_one())
+        self.assertEqual(uploaded, [("group-image", "file-one")])
+        cloud_attachment = delivered[0][1]["messages"][0]["attachments"][0]
+        self.assertNotIn("stagingKey", cloud_attachment)
+        self.assertFalse(os.path.exists(os.path.join(media_dir, "image-one.bin")))
+
+    def test_image_upload_failure_keeps_outbox_and_staged_bytes_for_retry(self):
+        media_dir = os.path.join(self.temp.name, "media")
+        os.mkdir(media_dir)
+        payload = b"image"
+        with open(os.path.join(media_dir, "image-retry.bin"), "wb") as staged:
+            staged.write(payload)
+        attachment = {"externalId": "file-retry", "fileName": "photo.png", "mimeType": "image/png",
+                      "sizeBytes": len(payload), "sha256": runtime.hashlib.sha256(payload).hexdigest(),
+                      "stagingKey": "image-retry.bin"}
+        message = dict(self.event("retry-image"), attachments=[attachment])
+        self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,?)",
+                        ("connector-a", "primary", "retry-image", runtime.compact(message), 500))
+        self.db.commit()
+        relay = runtime.Relay(self.config, self.db, lambda req: {}, lambda *args: {"ok": True})
+        relay.media_directory = media_dir
+        relay.upload_attachment = lambda *_args: (_ for _ in ()).throw(OSError("upload response lost"))
+        self.assertFalse(relay.flush_one())
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox WHERE external_id='retry-image'").fetchone()[0], 1)
+        self.assertTrue(os.path.exists(os.path.join(media_dir, "image-retry.bin")))
+
+    def test_invalid_staged_image_metadata_freezes_cursor(self):
+        media_dir = os.path.join(self.temp.name, "media")
+        os.mkdir(media_dir)
+        message = dict(self.event("unsafe-image"), attachments=[{
+            "externalId": "file-unsafe", "fileName": "photo.png", "mimeType": "image/png",
+            "sizeBytes": 1, "sha256": "0" * 64, "stagingKey": "../escape.png"}])
+        relay = runtime.Relay(self.config, self.db,
+                              lambda req: {"ok": True, "health": "online", "cursor": {"n": 1},
+                                           "messages": [message]}, lambda *args: {"ok": True})
+        relay.media_directory = media_dir
+        with self.assertRaisesRegex(RuntimeError, "invalid_staging_key"):
+            relay.scan_profile("primary")
+        self.assertIsNone(self.db.execute("SELECT value FROM cursors").fetchone())
+
+    def test_https_image_upload_sends_fixed_size_chunks_and_idempotency_headers(self):
+        media_dir = os.path.join(self.temp.name, "media")
+        os.mkdir(media_dir)
+        payload = b"z" * (runtime.MEDIA_CHUNK * 2 + 13)
+        with open(os.path.join(media_dir, "upload.bin"), "wb") as staged:
+            staged.write(payload)
+        attachment = {"externalId": "file-id-1", "fileName": "photo one.png", "mimeType": "image/png",
+                      "sizeBytes": len(payload), "sha256": runtime.hashlib.sha256(payload).hexdigest(),
+                      "stagingKey": "upload.bin"}
+        sent = {"chunks": [], "headers": [], "request": None}
+
+        class Response:
+            status = 200
+            def read(self, _limit):
+                return b'{"ok":true,"fileId":"file-id-1"}'
+
+        class Connection:
+            def __init__(self, host, port, timeout):
+                sent["host_port_timeout"] = (host, port, timeout)
+            def putrequest(self, method, path):
+                sent["request"] = (method, path)
+            def putheader(self, name, value):
+                sent["headers"].append((name.lower(), value))
+            def endheaders(self):
+                pass
+            def send(self, chunk):
+                sent["chunks"].append(bytes(chunk))
+            def getresponse(self):
+                return Response()
+            def close(self):
+                pass
+
+        relay = runtime.Relay(self.config, self.db, lambda req: {}, lambda *args: {"ok": True})
+        relay.media_directory = media_dir
+        relay.select_connector(self.config["connectors"][0])
+        with patch.object(runtime.http.client, "HTTPSConnection", Connection):
+            result = relay.upload_attachment({"conversationExternalId": "conversation-1"}, attachment)
+        self.assertTrue(result["ok"])
+        self.assertEqual(sent["request"], ("PUT", "/api/connectors/files/file-id-1"))
+        self.assertEqual(max(map(len, sent["chunks"])), runtime.MEDIA_CHUNK)
+        self.assertEqual(b"".join(sent["chunks"]), payload)
+        headers = dict(sent["headers"])
+        self.assertEqual(headers["content-length"], str(len(payload)))
+        self.assertEqual(headers["x-file-external-id"], "file-id-1")
+        self.assertEqual(headers["x-conversation-id"], "conversation-1")
+        self.assertEqual(headers["x-file-name"], "photo%20one.png")
+        self.assertEqual(headers["x-content-sha256"], attachment["sha256"])
 
     def test_database_write_failure_rolls_back_spool_and_cursor(self):
         old = runtime.compact({"next": "old"})
@@ -351,7 +468,8 @@ class DeviceRuntimeTests(unittest.TestCase):
                 event["attachments"] = attachments
             relay.adapter_call = lambda request, item=event: {
                 "ok": True, "health": "online", "cursor": {"next": "new"}, "messages": [item]}
-            with self.assertRaisesRegex(RuntimeError, "invalid_group_text_backup"):
+            expected = "invalid_staging_key" if attachments else "invalid_group_text_backup"
+            with self.assertRaisesRegex(RuntimeError, expected):
                 relay.scan_profile("primary")
             self.assertEqual(json_cursor(self.db), old)
             self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
@@ -368,7 +486,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         relay.register_connectors()
         relay.pass_once()
         registration = next(payload for _, path, payload in calls if path.endswith("/register"))
-        self.assertEqual(registration["capabilities"], ["receive_text"])
+        self.assertEqual(registration["capabilities"], ["receive_text", "receive_images"])
         self.assertFalse(any(path.startswith("/api/connectors/commands") for _, path, _ in calls))
 
     def test_started_send_is_marked_uncertain_without_second_adapter_call(self):
