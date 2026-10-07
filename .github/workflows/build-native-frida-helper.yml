@@ -1,0 +1,87 @@
+name: Build native Frida session helper
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "bridge/device/native-frida-helper/**"
+      - ".github/workflows/build-native-frida-helper.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Check out Frida license
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: frida/frida-core
+          ref: 16.3.3
+          path: .frida-core-source
+          persist-credentials: false
+
+      - name: Prepare pinned iOS arm64 devkit
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/frida-core-devkit.tar.xz"
+          devkit="$RUNNER_TEMP/frida-core-devkit"
+          url="https://github.com/frida/frida/releases/download/16.3.3/frida-core-devkit-16.3.3-ios-arm64.tar.xz"
+          expected="C31AA39618A6996BF43A472F2F48E3E4C2CC72EEE101A1ED6820192CBF58BDEC"
+          curl --fail --location --silent --show-error "$url" --output "$archive"
+          printf '%s  %s\n' "$expected" "$archive" | shasum --algorithm 256 --check --status
+          mkdir -p "$devkit"
+          tar -xJf "$archive" -C "$devkit"
+          test -s "$devkit/frida-core.h"
+          test -s "$devkit/libfrida-core.a"
+          echo "FRIDA_DEVKIT=$devkit" >> "$GITHUB_ENV"
+
+      - name: Build iOS 15+ arm64 helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          out="$RUNNER_TEMP/native-frida-helper"
+          mkdir -p "$out"
+          xcrun --sdk iphoneos clang \
+            -arch arm64 -miphoneos-version-min=15.0 -isysroot "$sdk" \
+            -fobjc-arc -Wall -Wextra -I"$FRIDA_DEVKIT" \
+            -c bridge/device/native-frida-helper/main.m \
+            -o "$out/main.o"
+          xcrun --sdk iphoneos clang \
+            -arch arm64 -miphoneos-version-min=15.0 -isysroot "$sdk" \
+            "$out/main.o" "$FRIDA_DEVKIT/libfrida-core.a" \
+            -lbsm -ldl -lm -lresolv \
+            -Wl,-framework,Foundation,-framework,CoreGraphics,-framework,UIKit \
+            -o "$out/native-frida-helper"
+          if ! command -v ldid >/dev/null 2>&1; then
+            brew install ldid
+          fi
+          ldid -S "$out/native-frida-helper"
+          file "$out/native-frida-helper"
+          lipo -info "$out/native-frida-helper"
+          otool -l "$out/native-frida-helper" | grep -A5 -m1 LC_BUILD_VERSION
+          cp bridge/device/native-frida-helper/main.m "$out/main.m"
+          cp bridge/device/native-frida-helper/README.md "$out/README.md"
+          cp .frida-core-source/COPYING "$out/FRIDA-COPYING"
+          printf '%s\n' \
+            "Frida 16.3.3 iOS arm64 devkit SHA-256: C31AA39618A6996BF43A472F2F48E3E4C2CC72EEE101A1ED6820192CBF58BDEC" \
+            "Frida source tag: 16.3.3" > "$out/BUILD-PROVENANCE.txt"
+          (cd "$out" && shasum --algorithm 256 native-frida-helper main.o main.m README.md FRIDA-COPYING BUILD-PROVENANCE.txt > SHA256SUMS.txt)
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-frida-helper-ios-arm64-${{ github.sha }}
+          path: ${{ runner.temp }}/native-frida-helper/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
