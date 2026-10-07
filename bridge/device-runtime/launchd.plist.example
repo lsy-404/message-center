@@ -11,9 +11,17 @@
     <string>/var/mobile/Library/MessageCenter/device_runtime.py</string>
     <string>/var/mobile/Library/MessageCenter/private-config.json</string>
   </array>
+  <key>WorkingDirectory</key>
+  <string>/var/mobile/Library/MessageCenter</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>Nice</key>
+  <integer>10</integer>
+  <key>LowPriorityIO</key>
   <true/>
   <key>StandardOutPath</key>
   <string>/var/mobile/Library/MessageCenter/runtime.log</string>
