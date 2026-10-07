@@ -27,3 +27,7 @@
 - 公共运行器与测试更新到设备专用验证目录，Python 3.9.9 实机完整 26/26 通过（7.549 秒），运行器自身请求 /healthz 返回 ok。没有安装或启用常驻 daemon。
 - Apple developer screenshot 服务不可用，当前没有取得屏幕截图；CLI 虽退出 0 但 stderr 报 Failed to start service，不能以退出码宣称成功。未安装 DeveloperDiskImage 或修改 Developer Mode。
 - 现有私有 SOURCE 的会话发现会在截取结果之前读取头像，后续本机采集应关闭或延迟头像提取；限制返回会话数并不等于限制头像读取开销。
+- 2026-10-07 本机 helper：两个固定 Frida devkit 构建均成功。相同 ad-hoc 二进制在 /var/mobile/Library 直接被 SIGKILL；复制到 /var/jb/usr/local/libexec/message-center 后入口正常。仅信任已核验二进制的 CodeDirectory，未清空信任缓存、重启设备或升级越狱。
+- 2026-10-07 原生分页：最新页原生列表从旧到新。已实测 queryOrder=false 向新，true 向旧；raw message ID 与时间不单调。私有适配器改为 true 向旧并整体反转原生列表，ID 仅等值比较。修正后20条上一页包含首位锚点及19条更早记录，约2.08秒。
+- 2026-10-07 持久队列：单次设备原生采集20条、SQLite原子存储cursor和outbox成功，约1.84秒。首次HTTP联调暴露后台群记录发到 events 会被 suppressed但仍200的问题；停止继续投递，修复为专用group-text-backups，并准备重建本次验证基线恢复5条已从验证队列确认的记录。
+- 2026-10-07 发送范围：用户授权仅向 QQ 我的电脑发送一次固定测试文本。原生recent列表23项中无精确匹配，未发消息，等待用户打开目标。旧private wrapper本身禁用裸native-send，要求UI目标校验和读回；本轮不绕过该边界。

@@ -18,3 +18,6 @@
 - 2026-10-07：最终差异关键词检查仅匹配合法 CSS 十六进制颜色；没有新增任务编号、模型来源署名或明文凭据。复查电脑旧中继任务为 Disabled。
 - 2026-10-07：用户要求继续并通过此前 iPad 远程控制执行。默认终端和浏览器控制均因 sandbox setup refresh 失败；经自动审核的沙箱外只读检查可执行。确认已有 USB mux + SSH 管理入口和固定主机公钥条目，未恢复电脑中继服务。准备短时连接，仅输出设备能力与无凭据 HTTPS 状态。
 - 2026-10-07：合并 c77bcc2 请求头修复并在 iPad 运行全套合成回归；远控开启前台后完成 QQ 小批量读取。开始通用原生 helper 子任务，复用已有 macOS/iOS CI 构建方式，仅公开通用代码，私有客户端 JS 和凭据留在本机。
+- 2026-10-07：原生helper实机round-trip、首send锁存、JS错误、1秒超时四项通过（0.27到1.19秒），只创建并清理自己的sleep进程。
+- 2026-10-07：通过严格SSH传输私有adapter与既有profile凭据，保留云端connector identity。空事件认证探测200。未把private source/config/数据库加入公开Git。
+- 2026-10-07：合并native helper与source cursor/15秒补采子分支；远端main保护状态仍false。独立审查修复非文本元素阻塞、错误页不得推进、最大connectorId字节预算等问题。
