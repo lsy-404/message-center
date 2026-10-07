@@ -8,3 +8,4 @@
 - Dopamine's configurable jetsam multiplier is not a per-job limit interface; no built-in targeted command was found.
 - The Windows host has no Apple iOS SDK, so the actual iOS arm64 link/sign check must be established by the existing macOS workflow. The host-stub C harness is compiled and run locally.
 - The sample launchd job is intentionally marked operationally unverified: its launcher fails closed unless the syscall succeeds and its own GET reports exact 64/64 MB fatal properties; post-exec persistence still requires a device check.
+- GitHub Actions run 37690830081 succeeded: host-stub contract tests, iOS 15+ arm64 compilation, ad-hoc CodeDirectory checks for both binaries, and artifact upload passed. The launcher artifact is ready for the parent agent's device check; post-exec GET remains unverified.

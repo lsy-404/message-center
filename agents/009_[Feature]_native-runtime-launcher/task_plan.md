@@ -5,5 +5,5 @@
 - [x] Update the launchd example, concise device-install instructions, and artifact workflow.
 - [x] Add focused tests proving invalid inputs and failed kernel calls never exec.
 - [x] Run local checks.
-- [ ] Commit and trigger the scoped CI build.
-- [ ] Record device-verification boundary and report the artifact run.
+- [x] Commit and trigger the scoped CI build.
+- [x] Record device-verification boundary and report the artifact run.
