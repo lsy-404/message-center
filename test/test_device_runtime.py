@@ -281,6 +281,96 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(delivered, ["connector-b"])
         self.assertEqual(self.db.execute("SELECT connector_id FROM outbox").fetchone()[0], "connector-a")
 
+    def test_background_group_text_uses_backup_route_and_other_events_use_ingest_route(self):
+        group = dict(self.event("group-background"), conversationType="group")
+        direct = self.event("direct-event")
+        for message in (group, direct):
+            self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,1)",
+                            ("connector-a", "primary", message["externalId"], runtime.compact(message)))
+        self.db.commit()
+        calls = []
+        relay = runtime.Relay(
+            self.config, self.db, lambda request: {},
+            lambda method, path, payload=None: calls.append((path, payload)) or
+                ({"ok": True, "received": 1} if path.endswith("group-text-backups") else
+                 {"ok": True, "received": 1, "suppressed": 0}))
+        self.assertTrue(relay.flush_one())
+        self.assertTrue(relay.flush_one())
+        self.assertEqual([path for path, _ in calls], [
+            "/api/connectors/group-text-backups", "/api/connectors/events"])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+
+    def test_suppressed_ingest_response_keeps_outbox_and_backs_off(self):
+        message = dict(self.event("group-mention"), conversationType="group", trigger="mention")
+        self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,1)",
+                        ("connector-a", "primary", message["externalId"], runtime.compact(message)))
+        self.db.commit()
+        relay = runtime.Relay(self.config, self.db, lambda request: {},
+                              lambda *args: {"ok": True, "suppressed": 1})
+        with patch.object(runtime.time, "monotonic", return_value=100):
+            self.assertFalse(relay.flush_one())
+            self.assertGreater(relay.retry_at["connector-a"], 100)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
+        group = dict(self.event("group-background"), conversationType="group", trigger="background")
+        self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,1)",
+                        ("connector-a", "primary", group["externalId"], runtime.compact(group)))
+        self.db.commit()
+        relay.retry_at["connector-a"] = 0
+        with patch.object(runtime.time, "monotonic", return_value=200):
+            self.assertFalse(relay.flush_one())
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 2)
+
+    def test_normal_ingest_ack_with_zero_suppressed_is_deduplicated_before_delete(self):
+        message = self.event("once")
+        self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,1)",
+                        ("connector-a", "primary", message["externalId"], runtime.compact(message)))
+        self.db.commit()
+        calls = []
+        relay = runtime.Relay(self.config, self.db, lambda request: {},
+                              lambda method, path, payload=None: calls.append(path) or
+                                  {"ok": True, "received": 1, "inserted": 0, "suppressed": 0})
+        self.assertTrue(relay.flush_one())
+        self.assertFalse(relay.flush_one())
+        self.assertEqual(calls, ["/api/connectors/events"])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+
+    def test_group_background_invalid_text_or_attachments_do_not_commit_cursor(self):
+        old = runtime.compact({"next": "old"})
+        self.db.execute("INSERT INTO cursors(connector_id,profile,value) VALUES('connector-a','primary',?)", (old,))
+        self.db.commit()
+        cases = [
+            ("empty", "", None),
+            ("too-long", "x" * 20001, None),
+            ("utf16-too-long", "😀" * 10001, None),
+            ("attachment", "text", [{"externalId": "file-1"}]),
+        ]
+        relay = runtime.Relay(self.config, self.db, lambda request: {}, lambda *args: {"ok": True})
+        for external_id, body, attachments in cases:
+            event = dict(self.event(external_id), conversationType="group", trigger="background", body=body)
+            if attachments is not None:
+                event["attachments"] = attachments
+            relay.adapter_call = lambda request, item=event: {
+                "ok": True, "health": "online", "cursor": {"next": "new"}, "messages": [item]}
+            with self.assertRaisesRegex(RuntimeError, "invalid_group_text_backup"):
+                relay.scan_profile("primary")
+            self.assertEqual(json_cursor(self.db), old)
+            self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+
+    def test_receive_only_connector_registers_without_send_and_never_polls_commands(self):
+        self.config["connectors"][0]["receiveOnly"] = True
+        calls = []
+        relay = runtime.Relay(
+            self.config, self.db,
+            lambda request: {"ok": True, "health": "online", "active": False,
+                             "cursor": None, "messages": []},
+            lambda method, path, payload=None: calls.append((method, path, payload)) or
+                ({"ok": True, "commands": []} if path.endswith("/commands") else {"ok": True}))
+        relay.register_connectors()
+        relay.pass_once()
+        registration = next(payload for _, path, payload in calls if path.endswith("/register"))
+        self.assertEqual(registration["capabilities"], ["receive_text"])
+        self.assertFalse(any(path.startswith("/api/connectors/commands") for _, path, _ in calls))
+
     def test_started_send_is_marked_uncertain_without_second_adapter_call(self):
         command = {"id": "command-1", "leaseToken": "lease-1", "idempotencyKey": "key-1",
                    "payload": {"externalConversationId": "conversation-1", "body": "hello"}}

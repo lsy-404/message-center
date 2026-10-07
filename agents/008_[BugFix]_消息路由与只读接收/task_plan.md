@@ -1,0 +1,4 @@
+- [x] 核对 Worker normal event 与 group-text-backups 的现有响应和去重契约。
+- [x] 为 group/background 文本验证、分流和 suppressed 响应保留 outbox 增加行为测试。
+- [x] 增加 receiveOnly 注册 capability 与 command poll 禁用选项。
+- [x] 更新运行器说明，运行根测试并提交本地变更，不推送。

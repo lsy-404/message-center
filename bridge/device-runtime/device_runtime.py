@@ -245,8 +245,6 @@ class Relay:
             if (not isinstance(message, dict) or not isinstance(message.get("externalId"), str) or
                     not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._:-]{0,199}", message["externalId"])):
                 raise RuntimeError("invalid_event")
-            if message.get("attachments"):
-                raise RuntimeError("adapter_file_receive_not_supported")
             if (not isinstance(message.get("conversationExternalId"), str) or not message["conversationExternalId"] or
                     not isinstance(message.get("conversationTitle"), str) or not message["conversationTitle"] or
                     not isinstance(message.get("senderName"), str) or not message["senderName"] or
@@ -264,6 +262,17 @@ class Relay:
                 raise RuntimeError("invalid_event")
             if trigger not in (("mention", "explicit_request", "background") if conversation_type == "group" else ("direct",)):
                 raise RuntimeError("invalid_event")
+            if conversation_type == "group" and trigger == "background":
+                body = message.get("body", "")
+                try:
+                    body_length = len(body.encode("utf-16-le")) // 2
+                except UnicodeEncodeError:
+                    raise RuntimeError("invalid_group_text_backup")
+                if (not body.strip() or body_length > 20000 or
+                        (message.get("attachments") and len(message["attachments"]) > 0)):
+                    raise RuntimeError("invalid_group_text_backup")
+            if message.get("attachments"):
+                raise RuntimeError("adapter_file_receive_not_supported")
             for context_item in message.get("context", []):
                 if not isinstance(context_item, dict) or not isinstance(context_item.get("receivedAt"), str):
                     raise RuntimeError("invalid_event_context")
@@ -331,8 +340,16 @@ class Relay:
             seq, profile, body = row
             self.select_connector(connector)
             try:
-                self.http_call("POST", "/api/connectors/events",
-                               {"connectorId": connector_id, "messages": [json.loads(body)]})
+                message = json.loads(body)
+                default_trigger = "background" if message.get("conversationType") == "group" else "direct"
+                background_group = (message.get("conversationType") == "group" and
+                                    message.get("trigger", default_trigger) == "background")
+                path = ("/api/connectors/group-text-backups" if background_group
+                        else "/api/connectors/events")
+                response = self.http_call("POST", path,
+                                          {"connectorId": connector_id, "messages": [message]})
+                if response.get("ok") is not True or response.get("suppressed", 0) > 0:
+                    raise RuntimeError("event_not_acknowledged")
             except Exception:
                 self.failed(connector_id)
                 continue
@@ -433,10 +450,13 @@ class Relay:
                 continue
             self.select_connector(connector)
             try:
+                capabilities = ["receive_text"]
+                if connector.get("receiveOnly") is not True:
+                    capabilities.append("send_text")
                 self.http_call("POST", "/api/connectors/register", {
                     "id": connector["id"], "kind": connector["kind"],
                     "accountLabel": connector["accountLabel"], "displayName": connector["displayName"],
-                    "mode": "device_relay", "capabilities": ["receive_text", "send_text"],
+                    "mode": "device_relay", "capabilities": capabilities,
                 })
                 self.registered.add(connector["id"])
                 self.succeeded(connector["id"])
@@ -477,7 +497,8 @@ class Relay:
         for connector in self.connectors:
             self.select_connector(connector)
             connector_id = self.connector
-            if (not self.eligible(connector_id) or not self.health.get(connector_id) or
+            if (connector.get("receiveOnly") is True or not self.eligible(connector_id) or
+                    not self.health.get(connector_id) or
                     time.monotonic() - self.last_scan[connector_id] > self.scan_interval[connector_id] + 30):
                 continue
             path = "/api/connectors/commands?connectorId=" + urllib.parse.quote(self.connector, safe="") + "&limit=1"
