@@ -1,0 +1,5 @@
+- [x] Review project rules, existing relay protocol, cursor durability, and command leasing.
+- [x] Define and document the private adapter JSON contract and local configuration.
+- [x] Implement bounded SQLite outbox, cursor commit, HTTPS relay, and command ledger.
+- [x] Add root-level Python 3.9 tests for offline recovery, dedupe, saturation, and uncertain sends.
+- [x] Inspect the final diff and commit this isolated task.
