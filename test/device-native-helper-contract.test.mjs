@@ -22,7 +22,14 @@ test('helper reports uncertain dispatch after script loading starts', () => {
   assert.match(docs, /dispatch.*unknown/);
 });
 
-test('build is manual, pins the devkit bytes, and uploads rather than tracks binaries', () => {
+test('helper latches the first valid send and reserves space for JSON envelopes', () => {
+  assert.match(source, /MAX_RESULT_BYTES \(MAX_INPUT_BYTES - 4096\)/);
+  assert.match(source, /helper->cleanup_started \|\| helper->result_received \|\| message == NULL/);
+  assert.match(source, /payload_data\.length > MAX_RESULT_BYTES/);
+  assert.match(source, /data\.length > MAX_INPUT_BYTES/);
+});
+
+test('build is manual with a narrow source trigger, pinned devkit, and artifact output', () => {
   assert.match(workflow, /workflow_dispatch:/);
   assert.match(workflow, /push:\s+paths:/);
   assert.match(workflow, /"bridge\/device\/native-frida-helper\/\*\*"/);

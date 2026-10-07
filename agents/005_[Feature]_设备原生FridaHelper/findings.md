@@ -9,3 +9,7 @@
 [原子结果契约] -> Frida `send` envelope 使用 JSON -> Foundation NSJSONSerialization 解析 envelope 并重新序列化 payload；stdout 只在调用结束输出一个 JSON 对象，Frida 日志和错误细节不输出。
 
 [本机无法验证 iOS 链接结果] -> 当前 Windows 工作环境没有 Apple SDK、xcrun 或 clang -> 由窄路径 push/manual workflow 在 macOS runner 上执行原生链接与签名检查；设备端安装/调用仍需后续单独验证。
+
+[异步 load 期间可连续收到 send] -> 首个 send 尚未触发卸载时，后续 send 可能到达并替换结果缓冲区 -> 锁存首个有效 payload，忽略之后所有 send；限制 payload 到 1 MiB 减 4 KiB 并对最终序列化响应再次设限。
+
+[本机没有 workflow YAML linter] -> `actionlint`/`yamllint` 不在当前环境，Python 也未安装 YAML 模块 -> 按现有 workflow 结构复核 trigger、权限、SDK、静态链接参数、签名与 artifact 步骤；真实编译检查待 macOS runner。

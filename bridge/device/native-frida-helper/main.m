@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #define MAX_INPUT_BYTES (1024 * 1024)
+#define MAX_RESULT_BYTES (MAX_INPUT_BYTES - 4096)
 #define DEFAULT_TIMEOUT_MS 30000
 #define MAX_TIMEOUT_MS 120000
 #define CLEANUP_TIMEOUT_MS 5000
@@ -33,6 +34,7 @@ typedef struct {
   const gchar *stage;
   const gchar *error_stage;
   const gchar *error_code;
+  const gchar *response_error_code;
   const gchar *cleanup_code;
   guint timeout_source;
   guint cleanup_timeout_source;
@@ -218,14 +220,12 @@ on_script_message(FridaScript *script, const gchar *message, GBytes *data,
 
   (void) script;
   (void) data;
-  if (helper->cleanup_started || message == NULL)
+  if (helper->cleanup_started || helper->result_received || message == NULL)
     return;
 
   length = strnlen(message, MAX_INPUT_BYTES + 1);
   if (length > MAX_INPUT_BYTES) {
-    fail(helper, "receive", "response_too_large");
-    if (!helper->operation_in_flight)
-      start_cleanup(helper);
+    helper->response_error_code = "response_too_large";
     return;
   }
 
@@ -242,16 +242,16 @@ on_script_message(FridaScript *script, const gchar *message, GBytes *data,
   if ([type isEqualToString:@"send"]) {
     id payload = envelope[@"payload"];
     if (payload == nil) {
-      fail(helper, "receive", "invalid_response");
-      if (!helper->operation_in_flight)
-        start_cleanup(helper);
+      helper->response_error_code = "invalid_response";
       return;
     }
     NSError *serialize_error = nil;
     NSData *payload_data = [NSJSONSerialization dataWithJSONObject:payload
         options:NSJSONWritingFragmentsAllowed error:&serialize_error];
-    if (payload_data == nil || payload_data.length > MAX_INPUT_BYTES) {
-      fail(helper, "receive", "invalid_response");
+    if (payload_data == nil) {
+      helper->response_error_code = "invalid_response";
+    } else if (payload_data.length > MAX_RESULT_BYTES) {
+      helper->response_error_code = "response_too_large";
     } else {
       helper->result_json = g_strndup(payload_data.bytes, payload_data.length);
       helper->result_received = TRUE;
@@ -402,7 +402,10 @@ on_operation_timeout(gpointer user_data)
   helper->timeout_source = 0;
   helper->timed_out = TRUE;
   if (helper->error_code == NULL)
-    fail(helper, helper->stage, "timeout");
+    fail(helper, helper->stage,
+        (g_strcmp0(helper->stage, "await_result") == 0 &&
+            helper->response_error_code != NULL)
+            ? helper->response_error_code : "timeout");
   g_cancellable_cancel(helper->operation_cancel);
   if (helper->operation_in_flight)
     helper->force_source = g_timeout_add(CANCEL_GRACE_MS, force_finish, helper);
@@ -519,8 +522,17 @@ write_json(NSDictionary *object)
 {
   NSError *error = nil;
   NSData *data = [NSJSONSerialization dataWithJSONObject:object options:0 error:&error];
-  if (data == nil) {
-    fputs("{\"ok\":false,\"stage\":\"output\",\"code\":\"serialization_failed\"}\n", stdout);
+  if (data == nil || data.length > MAX_INPUT_BYTES) {
+    id dispatch = object[@"dispatch"];
+    NSString *dispatch_value = [dispatch isKindOfClass:[NSString class]]
+        ? dispatch : @"not_started";
+    NSDictionary *fallback = @{@"ok": @NO, @"stage": @"output",
+        @"code": (data == nil ? @"serialization_failed" : @"response_too_large"),
+        @"dispatch": dispatch_value};
+    NSData *fallback_data = [NSJSONSerialization dataWithJSONObject:fallback
+        options:0 error:NULL];
+    fwrite(fallback_data.bytes, 1, fallback_data.length, stdout);
+    fputc('\n', stdout);
   } else {
     fwrite(data.bytes, 1, data.length, stdout);
     fputc('\n', stdout);
