@@ -65,7 +65,47 @@ jobs:
           if ! command -v ldid >/dev/null 2>&1; then
             brew install ldid
           fi
-          ldid -S "$out/native-frida-helper"
+          ldid -Cadhoc -S "$out/native-frida-helper"
+          python3 - "$out/native-frida-helper" <<'PY'
+          import pathlib
+          import struct
+          import sys
+
+          data = pathlib.Path(sys.argv[1]).read_bytes()
+          if len(data) < 32 or data[:4] != b"\xcf\xfa\xed\xfe":
+              raise SystemExit("expected a 64-bit little-endian Mach-O executable")
+          ncmds = struct.unpack_from("<I", data, 16)[0]
+          offset = 32
+          signature = None
+          for _ in range(ncmds):
+              command, size = struct.unpack_from("<II", data, offset)
+              if size < 8 or offset + size > len(data):
+                  raise SystemExit("invalid Mach-O load command")
+              if command == 0x1D:
+                  _, _, signature_offset, signature_size = struct.unpack_from(
+                      "<IIII", data, offset
+                  )
+                  signature = data[signature_offset:signature_offset + signature_size]
+              offset += size
+          if signature is None or len(signature) < 12:
+              raise SystemExit("missing embedded code signature")
+          magic, length, count = struct.unpack_from(">III", signature)
+          if magic != 0xFADE0CC0 or length > len(signature):
+              raise SystemExit("invalid code signature superblob")
+          code_directories = []
+          for index in range(count):
+              _, blob_offset = struct.unpack_from(">II", signature, 12 + 8 * index)
+              blob_magic, blob_length = struct.unpack_from(">II", signature, blob_offset)
+              if blob_magic == 0xFADE0C02:
+                  if blob_length < 16 or blob_offset + blob_length > length:
+                      raise SystemExit("invalid CodeDirectory")
+                  code_directories.append(
+                      struct.unpack_from(">I", signature, blob_offset + 12)[0]
+                  )
+          if not code_directories or any(flags & 0x2 == 0 for flags in code_directories):
+              raise SystemExit("every CodeDirectory must carry CS_ADHOC")
+          print(f"CS_ADHOC verified in {len(code_directories)} CodeDirectories")
+          PY
           file "$out/native-frida-helper"
           lipo -info "$out/native-frida-helper"
           otool -l "$out/native-frida-helper" | grep -A5 -m1 LC_BUILD_VERSION

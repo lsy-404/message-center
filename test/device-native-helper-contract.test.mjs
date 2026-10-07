@@ -39,6 +39,8 @@ test('build is manual with a narrow source trigger, pinned devkit, and artifact 
   assert.match(workflow, /actions\/upload-artifact/);
   assert.match(workflow, /miphoneos-version-min=15\.0/);
   assert.match(workflow, /permissions:\s+contents: read/);
+  assert.match(workflow, /ldid -Cadhoc -S/);
+  assert.match(workflow, /every CodeDirectory must carry CS_ADHOC/);
   assert.doesNotMatch(workflow, /contents: write|secrets\./);
 });
 

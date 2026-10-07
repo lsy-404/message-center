@@ -13,3 +13,5 @@
 [异步 load 期间可连续收到 send] -> 首个 send 尚未触发卸载时，后续 send 可能到达并替换结果缓冲区 -> 锁存首个有效 payload，忽略之后所有 send；限制 payload 到 1 MiB 减 4 KiB 并对最终序列化响应再次设限。
 
 [本机没有 workflow YAML linter] -> `actionlint`/`yamllint` 不在当前环境，Python 也未安装 YAML 模块 -> 按现有 workflow 结构复核 trigger、权限、SDK、静态链接参数、签名与 artifact 步骤；真实编译检查待 macOS runner。
+
+[首个 iOS 构建成功但设备启动立即 SIGKILL] -> 产物静态检查显示 arm64 Mach-O、iOS 15.0 最低版本、SDK 18.5、有效 LC_MAIN 与 cryptid=0；两个 CodeDirectory 的 flags 均为 0，而 workflow 只调用 `ldid -S` -> 改为 `ldid -Cadhoc -S` 并在构建时检查每个嵌入 CodeDirectory 都带 `CS_ADHOC` (`0x2`)；这为下一轮设备验证提供可核查的签名差异，但尚不能断言该差异就是设备 SIGKILL 的根因。
