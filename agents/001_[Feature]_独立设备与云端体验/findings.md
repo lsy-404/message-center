@@ -20,3 +20,10 @@
 - 从 iPad 到新域名的无凭据 HTTPS 连通性检查也被自动审批拒绝，仅返回 blocked by policy；不能以主机访问成功替代设备侧验证。
 - 每 5 秒固定定时器发起网页快照请求，若请求持续超过间隔会使响应持续过期并累积网络工作；改为完成后调度、单个在途与有界超时，保留用户切换会话抢占能力。
 - 独立设备中继尚未启用：私有原生适配器不满足本机执行契约，设备缺少 Frida Python 绑定，客户端注入恢复未证实。公开运行器测试通过不代表真实消息端到端读取或发送成功。
+- 继续排查时当前 SSH 管理入口可用，已使用固定 known-host 别名与 BatchMode/严格校验；临时 USB mux 转发在 finally 中退出，不恢复电脑常驻服务。pymobiledevice3 --simple 输出 JSON，须解析 JSON 而非按输出行计数，当前为一台设备。
+- iPad urllib 默认请求新域名 /login 和 /healthz 返回 403，响应为 Cloudflare 1010；使用诚实产品 User-Agent: MessageCenterDevice/1.0 与 Accept: application/json 后 /healthz 返回 200。未关闭站点防护。官方依据：https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/error-1010/。
+- QQ 初次新探测报 unexpected error while probing dyld of target process；通过既有 SSH 的 uiopen 将已确认 bundle 打开后，空脚本 attach/load/unload/detach 均成功，未终止或重启 App。设备与主机 Frida 都为 16.3.3。
+- 用既有私有 QQ 源码进行受限只读探测，临时禁用头像读取、关闭历史翻页：最多发现两会话，实际遍历 23 项，从首个会话读取一条记录，native errCode 0，无读取错误，正常 detach。只打印数量，不保存正文；没有发送消息。
+- 公共运行器与测试更新到设备专用验证目录，Python 3.9.9 实机完整 26/26 通过（7.549 秒），运行器自身请求 /healthz 返回 ok。没有安装或启用常驻 daemon。
+- Apple developer screenshot 服务不可用，当前没有取得屏幕截图；CLI 虽退出 0 但 stderr 报 Failed to start service，不能以退出码宣称成功。未安装 DeveloperDiskImage 或修改 Developer Mode。
+- 现有私有 SOURCE 的会话发现会在截取结果之前读取头像，后续本机采集应关闭或延迟头像提取；限制返回会话数并不等于限制头像读取开销。
