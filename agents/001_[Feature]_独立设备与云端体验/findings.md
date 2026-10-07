@@ -31,3 +31,12 @@
 - 2026-10-07 原生分页：最新页原生列表从旧到新。已实测 queryOrder=false 向新，true 向旧；raw message ID 与时间不单调。私有适配器改为 true 向旧并整体反转原生列表，ID 仅等值比较。修正后20条上一页包含首位锚点及19条更早记录，约2.08秒。
 - 2026-10-07 持久队列：单次设备原生采集20条、SQLite原子存储cursor和outbox成功，约1.84秒。首次HTTP联调暴露后台群记录发到 events 会被 suppressed但仍200的问题；停止继续投递，修复为专用group-text-backups，并准备重建本次验证基线恢复5条已从验证队列确认的记录。
 - 2026-10-07 发送范围：用户授权仅向 QQ 我的电脑发送一次固定测试文本。原生recent列表23项中无精确匹配，未发消息，等待用户打开目标。旧private wrapper本身禁用裸native-send，要求UI目标校验和读回；本轮不绕过该边界。
+
+## 接收入库与常驻启动
+- 实机 Python 3.9.9 公共行为测试 40 项全部通过；验证队列恢复原有冻结 head 的 20 条记录并成功排空。
+- 正确备份路由首条 inserted=1，原事件重试 inserted=0 且 suppressed=0；已确认真实存储和幂等去重。
+- 接收服务配置 receiveOnly，独立使用 HTTPS，生产数据库复制验证游标，初始 outbox=0；未领取发送命令，未发送真实消息。
+- 新 launchd job 默认 active soft/inactive hard 均 6 MB，Python 启动即因 JETSAM_REASON_MEMORY_PERPROCESSLIMIT 退出。已暂停本服务以停止重试。
+- 尝试 JetsamProperties.JetsamMemoryLimit、嵌套与顶层 ActiveHardMemoryLimit/InactiveHardMemoryLimit 均未改变实际 6/6 MB。设备 launchd 字符串给出旧键弃用提示，但无法据此推出 job plist 层级；不修改系统 jetsam 数据库。
+- 下一步是使用 libSystem 原生启动器仅对自身 PID 设置 active/inactive 各 64 MB 硬上限并 exec 运行器；必须验证 exec 后有效限额。失败不提高权限，不改系统全局设置。
+- 轻量 UIKit 检查确认 QQ 前台位于最近消息列表及 iPad 空白详情窗；不是用户指定的测试会话。堆扫描辅助检查超时，已弃用该重量级前台确认方法。

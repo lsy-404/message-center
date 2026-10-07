@@ -21,3 +21,8 @@
 - 2026-10-07：原生helper实机round-trip、首send锁存、JS错误、1秒超时四项通过（0.27到1.19秒），只创建并清理自己的sleep进程。
 - 2026-10-07：通过严格SSH传输私有adapter与既有profile凭据，保留云端connector identity。空事件认证探测200。未把private source/config/数据库加入公开Git。
 - 2026-10-07：合并native helper与source cursor/15秒补采子分支；远端main保护状态仍false。独立审查修复非文本元素阻塞、错误页不得推进、最大connectorId字节预算等问题。
+
+- 生产接收文件和专属 launchd job 已安装。启动诊断定位 6 MB per-process jetsam；三个 plist 字段布局均未生效，已 bootout 仅本 job。
+- 已验证源最新页及向旧分页、队列原子提交、备份路由和远端去重；实际发送次数仍为 0。
+- 委派独立复核队列和 receiveOnly；未发现需修复问题。委派原生有限内存启动器构建，等待设备验证。
+- 原生启动器 exec 后 GET 返回 active/inactive=64 MB、属性1/1；真实 launchd 进程运行且 RSS 20–21 MB，二次检查同 PID 并从1扩展到3个会话，云端在线连接器=1。临时 SSH 通道每次诊断后关闭，电脑中继仍禁用。
