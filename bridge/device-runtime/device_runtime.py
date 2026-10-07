@@ -8,6 +8,7 @@ import os
 import re
 import selectors
 import signal
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -178,6 +179,7 @@ class Relay:
                     len(connector["token"]) < 32):
                 raise ValueError("invalid_connector_configuration")
         self.connector_by_id = {item["id"]: item for item in self.connectors}
+        self.migrate_legacy_staged_media()
         self.connector = self.connectors[0]["id"]
         self.health = {item["id"]: False for item in self.connectors}
         self.last_scan = {item["id"]: float("-inf") for item in self.connectors}
@@ -186,6 +188,62 @@ class Relay:
         self.flush_next_index = 0
         self.failures = {item["id"]: 0 for item in self.connectors}
         self.retry_at = {item["id"]: 0 for item in self.connectors}
+
+    def media_directory_for(self, connector_id):
+        if not any(item["id"] == connector_id for item in self.connectors):
+            raise RuntimeError("invalid_connector_media_directory")
+        path = os.path.join(self.media_directory, connector_id)
+        if os.path.commonpath([self.media_directory, os.path.abspath(path)]) != self.media_directory:
+            raise RuntimeError("invalid_connector_media_directory")
+        if not os.path.isdir(path):
+            os.makedirs(path, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
+        return path
+
+    def migrate_legacy_staged_media(self):
+        referenced = {}
+        for connector_id, body in self.db.execute("SELECT connector_id,body FROM outbox"):
+            if connector_id not in self.connector_by_id:
+                continue
+            try:
+                attachments = json.loads(body).get("attachments", [])
+            except (ValueError, TypeError, AttributeError):
+                continue
+            for attachment in attachments:
+                key = attachment.get("stagingKey")
+                if isinstance(key, str) and STAGING_KEY.fullmatch(key):
+                    referenced.setdefault(key, set()).add(connector_id)
+        for key, connector_ids in referenced.items():
+            source = os.path.join(self.media_directory, key)
+            if os.path.islink(source) or not os.path.isfile(source):
+                continue
+            destinations = [os.path.join(self.media_directory_for(connector_id), key)
+                            for connector_id in sorted(connector_ids)]
+            for destination in destinations:
+                if os.path.exists(destination):
+                    continue
+                if len(destinations) == 1:
+                    os.replace(source, destination)
+                    break
+                shutil.copyfile(source, destination)
+            try:
+                if os.path.exists(source) and all(os.path.isfile(path) for path in destinations):
+                    os.unlink(source)
+            except OSError:
+                pass
+        try:
+            with os.scandir(self.media_directory) as entries:
+                for entry in entries:
+                    if entry.name not in referenced and not entry.is_dir(follow_symlinks=False):
+                        try:
+                            os.unlink(entry.path)
+                        except OSError:
+                            pass
+        except OSError:
+            pass
 
     def eligible(self, connector_id):
         return time.monotonic() >= self.retry_at[connector_id]
@@ -236,25 +294,27 @@ class Relay:
         return int(row[0])
 
     def cleanup_unreferenced_media(self):
-        referenced = set()
-        try:
-            for (body,) in self.db.execute("SELECT body FROM outbox"):
-                for attachment in json.loads(body).get("attachments", []):
-                    key = attachment.get("stagingKey")
-                    if isinstance(key, str) and STAGING_KEY.fullmatch(key):
-                        referenced.add(key)
-        except (ValueError, TypeError, AttributeError):
-            return
-        try:
-            with os.scandir(self.media_directory) as entries:
-                for entry in entries:
-                    if entry.name not in referenced and not entry.is_dir(follow_symlinks=False):
-                        try:
-                            os.unlink(entry.path)
-                        except OSError:
-                            pass
-        except OSError:
-            pass
+        for connector in self.connectors:
+            connector_id = connector["id"]
+            referenced = set()
+            try:
+                for (body,) in self.db.execute("SELECT body FROM outbox WHERE connector_id=?", (connector_id,)):
+                    for attachment in json.loads(body).get("attachments", []):
+                        key = attachment.get("stagingKey")
+                        if isinstance(key, str) and STAGING_KEY.fullmatch(key):
+                            referenced.add(key)
+            except (ValueError, TypeError, AttributeError):
+                continue
+            try:
+                with os.scandir(self.media_directory_for(connector_id)) as entries:
+                    for entry in entries:
+                        if entry.name not in referenced and not entry.is_dir(follow_symlinks=False):
+                            try:
+                                os.unlink(entry.path)
+                            except OSError:
+                                pass
+            except OSError:
+                pass
 
     def scan_profile(self, profile, history=False):
         ceiling = max(1, int(self.config.get("outboxMaxBytes", DEFAULT_OUTBOX_BYTES)) // len(self.connectors))
@@ -267,7 +327,7 @@ class Relay:
         remaining = max(0, ceiling - self.count_bytes(self.connector))
         result = self.adapter_call({"op": "scan", "profile": profile, "cursor": cursor,
                                     "limit": limit, "maxBytes": MAX_SCAN_RESPONSE,
-                                    "maxEventBytes": MAX_EVENT, "mediaDirectory": self.media_directory,
+                                    "maxEventBytes": MAX_EVENT, "mediaDirectory": self.media_directory_for(self.connector),
                                     "maxMediaBytes": remaining, "history": bool(history)})
         if result.get("ok") is not True or "cursor" not in result or not isinstance(result.get("messages"), list):
             raise RuntimeError("scan_failed")
@@ -397,8 +457,9 @@ class Relay:
                 not isinstance(size, int) or isinstance(size, bool) or size < 1 or size > MAX_ATTACHMENT_BYTES or
                 not isinstance(expected_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", expected_hash)):
             raise RuntimeError("invalid_attachment_metadata")
-        path = os.path.join(self.media_directory, key)
-        if os.path.commonpath([self.media_directory, os.path.abspath(path)]) != self.media_directory:
+        media_directory = self.media_directory_for(self.connector)
+        path = os.path.join(media_directory, key)
+        if os.path.commonpath([media_directory, os.path.abspath(path)]) != media_directory:
             raise RuntimeError("invalid_staging_key")
         if os.path.islink(path) or not os.path.isfile(path):
             raise RuntimeError("staged_file_missing")
@@ -424,7 +485,7 @@ class Relay:
         if parsed.scheme != "https" or not parsed.hostname:
             raise RuntimeError("https_required")
         file_id = attachment["externalId"]
-        path = os.path.join(self.media_directory, attachment["stagingKey"])
+        path = os.path.join(self.media_directory_for(self.connector), attachment["stagingKey"])
         target = "/api/connectors/files/" + urllib.parse.quote(file_id, safe="")
         connection = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=30)
         deadline = time.monotonic() + MEDIA_UPLOAD_TIMEOUT
@@ -507,7 +568,7 @@ class Relay:
             self.db.commit()
             for attachment in json.loads(body).get("attachments", []):
                 try:
-                    os.remove(os.path.join(self.media_directory, attachment["stagingKey"]))
+                    os.remove(os.path.join(self.media_directory_for(connector_id), attachment["stagingKey"]))
                 except OSError:
                     pass
             self.succeeded(connector_id)
