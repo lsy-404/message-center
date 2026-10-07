@@ -20,6 +20,7 @@ if os.name == "posix":
     import fcntl
 
 MAX_RESPONSE = 1024 * 1024
+MAX_SCAN_RESPONSE = 900 * 1024
 MAX_EVENT = 256 * 1024
 DEFAULT_OUTBOX_BYTES = 16 * 1024 * 1024
 MAX_DELIVERIES_PER_PASS = 5
@@ -168,6 +169,7 @@ class Relay:
         self.last_scan = {item["id"]: float("-inf") for item in self.connectors}
         self.scan_interval = {item["id"]: 300 for item in self.connectors}
         self.registered = set()
+        self.flush_next_index = 0
         self.failures = {item["id"]: 0 for item in self.connectors}
         self.retry_at = {item["id"]: 0 for item in self.connectors}
 
@@ -226,9 +228,12 @@ class Relay:
         cursor = json.loads(row[0]) if row else None
         limit = max(1, min(int(self.config.get("pageLimit", 20)), 20))
         result = self.adapter_call({"op": "scan", "profile": profile, "cursor": cursor,
-                                    "limit": limit, "history": bool(history)})
+                                    "limit": limit, "maxBytes": MAX_SCAN_RESPONSE,
+                                    "maxEventBytes": MAX_EVENT, "history": bool(history)})
         if result.get("ok") is not True or "cursor" not in result or not isinstance(result.get("messages"), list):
             raise RuntimeError("scan_failed")
+        if len(compact(result).encode("utf-8")) > MAX_SCAN_RESPONSE:
+            raise RuntimeError("scan_response_too_large")
         messages = result["messages"]
         if len(messages) > limit:
             raise RuntimeError("scan_page_too_large")
@@ -310,26 +315,31 @@ class Relay:
         return result.get("health") == "online"
 
     def flush_one(self):
-        available = [item["id"] for item in self.connectors if self.eligible(item["id"])]
-        if not available:
-            return False
-        marks = ",".join("?" for _ in available)
-        row = self.db.execute("SELECT seq,connector_id,profile,external_id,body FROM outbox "
-                              "WHERE connector_id IN (" + marks + ") ORDER BY seq LIMIT 1", available).fetchone()
-        if row is None:
-            return False
-        seq, connector_id, profile, external_id, body = row
-        self.select_connector(self.connector_by_id[connector_id])
-        try:
-            self.http_call("POST", "/api/connectors/events",
-                           {"connectorId": self.connector, "messages": [json.loads(body)]})
-        except Exception:
-            self.failed(connector_id)
-            raise
-        self.db.execute("DELETE FROM outbox WHERE seq=?", (seq,))
-        self.db.commit()
-        self.succeeded(connector_id)
-        return True
+        count = len(self.connectors)
+        order = [(self.flush_next_index + offset) % count for offset in range(count)]
+        for index in order:
+            connector = self.connectors[index]
+            connector_id = connector["id"]
+            if not self.eligible(connector_id):
+                continue
+            row = self.db.execute("SELECT seq,profile,body FROM outbox WHERE connector_id=? ORDER BY seq LIMIT 1",
+                                  (connector_id,)).fetchone()
+            if row is None:
+                continue
+            seq, profile, body = row
+            self.select_connector(connector)
+            try:
+                self.http_call("POST", "/api/connectors/events",
+                               {"connectorId": connector_id, "messages": [json.loads(body)]})
+            except Exception:
+                self.failed(connector_id)
+                continue
+            self.db.execute("DELETE FROM outbox WHERE seq=?", (seq,))
+            self.db.commit()
+            self.succeeded(connector_id)
+            self.flush_next_index = (index + 1) % count
+            return True
+        return False
 
     def complete(self, command, result):
         self.http_call("POST", "/api/connectors/commands/" + urllib.parse.quote(command["id"], safe="") + "/complete",
