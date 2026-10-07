@@ -48,3 +48,8 @@ test('helper embeds no remote service or application-specific endpoint', () => {
   assert.doesNotMatch(source, /https?:\/\//);
   assert.doesNotMatch(source, /getenv\(|SERVICE_URL|REMOTE_HOST/);
 });
+
+test('device instructions separate the executable from adapter state', () => {
+  assert.match(docs, /\/var\/jb\/usr\/local\/libexec\/message-center/);
+  assert.match(docs, /status, queues, and databases under `\/var\/mobile\/Library\//);
+});

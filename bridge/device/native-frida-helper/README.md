@@ -17,6 +17,19 @@ cat authorized-script.js | native-frida-helper --pid 1234 --stdin
 
 The script must send one JSON-serializable result with Frida's `send(value)`. The helper treats the first `send` as the completed result and returns one JSON object on stdout. It does not expose script text, Frida log messages, or script error details. Failures identify a stable stage and code. `dispatch` is `not_started` only when script loading has not begun; after loading begins without a returned result it is `unknown`.
 
+## Device installation
+
+Install the executable in the jailbreak's program directory, not under a user library or application-data directory:
+
+```sh
+install_dir=/var/jb/usr/local/libexec/message-center
+mkdir -p "$install_dir"
+cp native-frida-helper "$install_dir/native-frida-helper"
+chmod 755 "$install_dir/native-frida-helper"
+```
+
+Keep adapter status, queues, and databases under `/var/mobile/Library/` with the adapter's normal ownership and permissions. The helper is stateless and does not read or write that data directory.
+
 Successful output has the form `{"ok":true,"stage":"complete","dispatch":"confirmed","result":...}`. An attach error has the form `{"ok":false,"stage":"attach","code":"attach_failed","dispatch":"not_started"}`. A timeout while waiting for the script result reports stage `await_result` and dispatch `unknown`.
 
 Exit code is zero only when a result was received and cleanup completed. Any other exit code indicates an error or incomplete cleanup. Diagnostics never include the supplied script or returned message content.

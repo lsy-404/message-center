@@ -9,3 +9,4 @@
 - 2026-10-07：加入首个有效结果锁存与 envelope 边界回归检查；最终 `node --test test/device-native-helper-contract.test.mjs` 通过 5 项，`git diff --check` 通过。
 - 2026-10-07：首个 CI 原生构建成功，但设备运行该 artifact 时在 main 前 SIGKILL。只读解析显示目标架构、部署版本、入口点和加密状态正常，CodeDirectory flags 为 0。将伪签名改为明确 ad hoc 签名，并增加构建期 CS_ADHOC 位检查；此变更仅形成可比较的新 artifact，设备端验证仍待执行。
 - 2026-10-07：签名修正提交 `6a9fd2c` 的 macOS CI 构建成功（run `37686380803`）；构建检查确认两个 CodeDirectory 均包含 `CS_ADHOC`，artifact 目标仍为 iOS 15.0 / SDK 18.5。尚未在设备运行新 artifact，不能确认其消除了 SIGKILL。
+- 2026-10-07：同一 artifact 在 `/var/jb/usr/local/libexec/message-center` 启动成功并返回参数错误 JSON；原 `/var/mobile/Library` 安装位置仍立即 SIGKILL。静态逐页校验 SHA-1/SHA-256 两套各 5,497 个签名页全部匹配。README 现在指定独立程序目录，适配器状态与数据库继续放在 `/var/mobile/Library/`；不继续构造 smoke/linker 变体。

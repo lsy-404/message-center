@@ -15,3 +15,7 @@
 [本机没有 workflow YAML linter] -> `actionlint`/`yamllint` 不在当前环境，Python 也未安装 YAML 模块 -> 按现有 workflow 结构复核 trigger、权限、SDK、静态链接参数、签名与 artifact 步骤；真实编译检查待 macOS runner。
 
 [首个 iOS 构建成功但设备启动立即 SIGKILL] -> 产物静态检查显示 arm64 Mach-O、iOS 15.0 最低版本、SDK 18.5、有效 LC_MAIN 与 cryptid=0；两个 CodeDirectory 的 flags 均为 0，而 workflow 只调用 `ldid -S` -> 改为 `ldid -Cadhoc -S` 并在构建时检查每个嵌入 CodeDirectory 都带 `CS_ADHOC` (`0x2`)；这为下一轮设备验证提供可核查的签名差异，但尚不能断言该差异就是设备 SIGKILL 的根因。
+
+[ad hoc artifact 在原安装位置立即 SIGKILL] -> 相同 SHA-256 的二进制放在 `/var/jb/usr/local/libexec/message-center` 后可启动并返回 `invalid_arguments`，在 `/var/mobile/Library` 下则在进入 main 前 SIGKILL -> 将可执行程序与适配器状态/数据库目录分开：helper 安装在 jailbreak 程序目录，持久状态继续留在 `/var/mobile/Library/`；此路径对照证明标准程序目录可执行，不推断更具体的内核策略原因。
+
+[签名页哈希可能与传输后二进制不一致] -> 对新 artifact 的 SHA-1 与 SHA-256 CodeDirectory 均逐页重算，5,497 个 code slots 全部匹配，签名 blob 无尾随截断 -> 页面哈希/传输损坏不是当前设备启动差异的解释；已停止增加签名或 linker 变体。
