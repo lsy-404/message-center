@@ -8,3 +8,7 @@
 - Committed scoped changes as `ccb201e` on `feature/fluent-ui`; no push or deploy.
 - Chromium screenshots with synthetic fixture in light and dark modes: `work/message-center-ipad-portrait.png` and `work/message-center-ipad-dark.png`.
 - Follow-up review moved app token aliases to the FluentTheme wrapper, split the Safari 15 focus selector, added Safari 15 color-mix token fallbacks, and confirmed FluentSwitch emits a boolean via the layout API mock. UI check/build, root smoke, schema, and diff whitespace checks passed again.
+- Reopened the Fluent UI worktree for a focused iPad mini 4 refresh stability fix; identified polling overlap and missing cancellation/backoff as the concrete issue.
+- Added `ui/src/inbox-refresh.mjs` with a serialized refresh loop and session-scoped GET gate; wired visibility, page lifecycle, online/offline, request timeout, and unchanged-snapshot checks into `App.vue`.
+- Added root `test/inbox-refresh.test.mjs` and clarified the completion-based polling/backoff behavior in both repository README descriptions.
+- Ran UI type check/build, inbox refresh tests, Worker smoke/schema tests, and whitespace validation; all passed.

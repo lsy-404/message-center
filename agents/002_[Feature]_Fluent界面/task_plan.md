@@ -7,3 +7,7 @@
 - [x] Run type check, production build, Worker smoke test, and schema test.
 - [x] Verify portrait layout with a synthetic Chromium fixture.
 - [x] Review final diff, stage scoped files, and commit.
+- [x] Replace overlapping five-second inbox polling with a single completion-driven refresh loop.
+- [x] Abort stale inbox reads on session changes and bound each read without sharing cancellation with writes.
+- [x] Pause polling while hidden/offline and resume immediately; add scheduler behavior tests under root test/.
+- [x] Run UI checks/build and focused regression tests, then commit scoped follow-up changes.
