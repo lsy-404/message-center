@@ -283,7 +283,12 @@ class Relay:
         cursor = json.loads(row[0]) if row else None
         limit = max(1, min(int(self.config.get("pageLimit", 20)), 20))
         remaining = max(0, ceiling - self.count_bytes(self.connector))
-        result = self.adapter_call({"op": "scan", "profile": profile, "cursor": cursor,
+        connector = self.connector_by_id[self.connector]
+        driver = connector.get("kind")
+        if driver not in {"qq", "wechat"}:
+            raise RuntimeError("unsupported_connector_driver")
+        result = self.adapter_call({"op": "scan", "driver": driver,
+                                    "profile": profile, "cursor": cursor,
                                     "limit": limit, "maxBytes": MAX_SCAN_RESPONSE,
                                     "maxEventBytes": MAX_EVENT, "mediaDirectory": self.media_directory_for(self.connector),
                                     "maxMediaBytes": remaining, "history": bool(history)})
@@ -590,10 +595,16 @@ class Relay:
             self.complete(command, outcome)
             return
         try:
-            result = self.adapter_call({"op": "send", "profile": profile, "commandId": command["id"],
+            connector = self.connector_by_id[self.connector]
+            driver = connector.get("kind")
+            if driver not in {"qq", "wechat"}:
+                raise RuntimeError("unsupported_connector_driver")
+            result = self.adapter_call({"op": "send", "driver": driver,
+                                        "profile": profile, "commandId": command["id"],
                                         "idempotencyKey": key,
                                         "conversationExternalId": payload.get("externalConversationId"),
                                         "body": payload.get("body", ""),
+                                        "confirmed": True, "targetConfirmed": True,
                                         "attachments": payload.get("attachments", [])})
             if result.get("ok") is True and isinstance(result.get("receipt"), str) and result.get("receipt"):
                 outcome = {"ok": True, "result": {"receipt": result["receipt"]}}

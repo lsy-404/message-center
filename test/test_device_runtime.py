@@ -27,7 +27,7 @@ class DeviceRuntimeTests(unittest.TestCase):
             "database": self.db_path,
             "adapter": "unused-private-adapter",
             "connectors": [{"id": "connector-a", "token": "x" * 40,
-                            "kind": "im", "accountLabel": "test", "displayName": "device",
+                            "kind": "qq", "accountLabel": "test", "displayName": "device",
                             "profile": "primary"}],
             "outboxMaxBytes": 100000,
             "pageLimit": 20,
@@ -39,14 +39,14 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.temp.cleanup()
 
     def event(self, ident):
-        return {"externalId": ident, "conversationExternalId": "conversation-1",
+        return {"externalId": ident, "conversationExternalId": "primary:conversation-aaaaaaaa",
                 "conversationTitle": "Test", "senderName": "Sender",
                 "occurredAt": "2026-10-07T12:00:00.000Z", "body": ident}
 
     def test_profile_sync_failure_preserves_cursor_and_outbox(self):
         result = {"ok": True, "health": "online", "cursor": {"next": "2"},
                   "messages": [self.event("new-1")],
-                  "conversationProfiles": [{"conversationExternalId": "conversation-1", "displayName": "中文 😀"}]}
+                  "conversationProfiles": [{"conversationExternalId": "primary:conversation-aaaaaaaa", "displayName": "中文 😀"}]}
         relay = runtime.Relay(self.config, self.db, lambda _: result)
         with patch.object(runtime, "sync_profiles", side_effect=RuntimeError("offline")):
             with self.assertRaises(RuntimeError):
@@ -102,6 +102,21 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertFalse(relay.scan_profile("primary"))
         self.assertEqual(json_cursor(self.db), old)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
+
+    def test_scan_passes_selected_connector_kind_as_explicit_driver(self):
+        captured = []
+        relay = runtime.Relay(
+            self.config, self.db,
+            lambda request: captured.append(request) or {
+                "ok": True, "health": "offline", "active": False,
+                "cursor": None, "messages": [],
+            },
+        )
+        relay.scan_profile("primary")
+        self.assertEqual(captured[0]["driver"], "qq")
+        self.config["connectors"][0]["kind"] = "wechat"
+        relay.scan_profile("primary")
+        self.assertEqual(captured[1]["driver"], "wechat")
 
     def test_attachment_without_staging_contract_does_not_commit_cursor(self):
         old = runtime.compact({"next": "old"})
@@ -389,9 +404,9 @@ class DeviceRuntimeTests(unittest.TestCase):
     def test_two_connector_identities_share_one_sequential_runtime(self):
         self.config["connectors"] = [
             {"id": "connector-a", "token": "a" * 40, "profile": "primary",
-             "kind": "im", "accountLabel": "A", "displayName": "A"},
+             "kind": "qq", "accountLabel": "A", "displayName": "A"},
             {"id": "connector-b", "token": "b" * 40, "profile": "primary",
-             "kind": "im", "accountLabel": "B", "displayName": "B"},
+             "kind": "wechat", "accountLabel": "B", "displayName": "B"},
         ]
         adapter_profiles = []
         requests = []
@@ -415,9 +430,9 @@ class DeviceRuntimeTests(unittest.TestCase):
     def test_outbox_delivery_round_robins_after_large_connector_backlog(self):
         self.config["connectors"] = [
             {"id": "connector-a", "token": "a" * 40, "profile": "primary",
-             "kind": "im", "accountLabel": "A", "displayName": "A"},
+             "kind": "qq", "accountLabel": "A", "displayName": "A"},
             {"id": "connector-b", "token": "b" * 40, "profile": "primary",
-             "kind": "im", "accountLabel": "B", "displayName": "B"},
+             "kind": "wechat", "accountLabel": "B", "displayName": "B"},
         ]
         for index in range(12):
             self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) "
@@ -435,9 +450,9 @@ class DeviceRuntimeTests(unittest.TestCase):
     def test_failed_connector_does_not_block_another_outbox_delivery(self):
         self.config["connectors"] = [
             {"id": "connector-a", "token": "a" * 40, "profile": "primary",
-             "kind": "im", "accountLabel": "A", "displayName": "A"},
+             "kind": "qq", "accountLabel": "A", "displayName": "A"},
             {"id": "connector-b", "token": "b" * 40, "profile": "primary",
-             "kind": "im", "accountLabel": "B", "displayName": "B"},
+             "kind": "wechat", "accountLabel": "B", "displayName": "B"},
         ]
         self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) "
                         "VALUES('connector-a','primary','a0','{}',1)")
@@ -548,7 +563,7 @@ class DeviceRuntimeTests(unittest.TestCase):
 
     def test_started_send_is_marked_uncertain_without_second_adapter_call(self):
         command = {"id": "command-1", "leaseToken": "lease-1", "idempotencyKey": "key-1",
-                   "payload": {"externalConversationId": "conversation-1", "body": "hello"}}
+                   "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "hello"}}
         adapter_calls = []
         completions = []
         def adapter(request):
@@ -568,7 +583,7 @@ class DeviceRuntimeTests(unittest.TestCase):
 
     def test_lost_completion_response_replays_saved_result_without_resending(self):
         command = {"id": "command-2", "leaseToken": "lease-2", "idempotencyKey": "key-2",
-                   "payload": {"externalConversationId": "conversation-1", "body": "hello"}}
+                   "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "hello"}}
         adapter_calls = []
         completion_calls = []
         def adapter(request):
@@ -589,7 +604,7 @@ class DeviceRuntimeTests(unittest.TestCase):
 
     def test_invalid_lease_is_checked_before_native_send(self):
         command = {"id": "command-3", "leaseToken": "expired", "idempotencyKey": "key-3",
-                   "payload": {"externalConversationId": "conversation-1", "body": "hello"}}
+                   "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "hello"}}
         adapter_calls = []
         def http(method, path, payload=None):
             if path.endswith("/lease"):
@@ -601,9 +616,52 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(adapter_calls, [])
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM command_ledger").fetchone()[0], 0)
 
+    def test_leased_command_passes_driver_canonical_target_and_authorization(self):
+        command = {
+            "id": "command-authorized", "leaseToken": "lease-authorized",
+            "idempotencyKey": "key-authorized",
+            "payload": {"externalConversationId": "primary:conversation-aaaaaaaa",
+                        "body": "exact command body"},
+        }
+        adapter_calls = []
+        http_calls = []
+        timeline = []
+
+        def adapter(request):
+            timeline.append("adapter")
+            ledger = self.db.execute(
+                "SELECT state FROM command_ledger WHERE connector_id=? AND idempotency_key=?",
+                ("connector-a", "key-authorized"),
+            ).fetchone()
+            self.assertEqual(ledger[0], "started")
+            adapter_calls.append(request)
+            return {"ok": True, "dispatched": True, "receipt": "verified-receipt"}
+
+        def http(method, path, payload=None):
+            http_calls.append((method, path, payload))
+            if path.endswith("/lease"):
+                timeline.append("lease")
+            return {"ok": True}
+
+        relay = runtime.Relay(
+            self.config, self.db, adapter, http,
+        )
+        relay.process_command(command, "primary")
+        self.assertEqual(len(adapter_calls), 1)
+        request = adapter_calls[0]
+        self.assertEqual(request["driver"], "qq")
+        self.assertEqual(request["profile"], "primary")
+        self.assertEqual(request["conversationExternalId"], "primary:conversation-aaaaaaaa")
+        self.assertEqual(request["body"], "exact command body")
+        self.assertIs(request["confirmed"], True)
+        self.assertIs(request["targetConfirmed"], True)
+        self.assertNotIn("targetAlias", request)
+        self.assertEqual(len(http_calls), 2)
+        self.assertEqual(timeline, ["lease", "adapter"])
+
     def test_retryable_unknown_dispatch_is_uncertain_and_never_retried(self):
         command = {"id": "command-4", "leaseToken": "lease-4", "idempotencyKey": "key-4",
-                   "payload": {"externalConversationId": "conversation-1", "body": "hello"}}
+                   "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "hello"}}
         adapter_calls = []
         completions = []
         def adapter(request):
@@ -618,7 +676,7 @@ class DeviceRuntimeTests(unittest.TestCase):
 
     def test_reused_idempotency_key_with_changed_payload_is_fenced(self):
         command = {"id": "command-5", "leaseToken": "lease-5", "idempotencyKey": "key-5",
-                   "payload": {"externalConversationId": "conversation-1", "body": "hello"}}
+                   "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "hello"}}
         adapter_calls = []
         completions = []
         relay = runtime.Relay(self.config, self.db,
@@ -626,7 +684,7 @@ class DeviceRuntimeTests(unittest.TestCase):
                               lambda method, path, payload=None: completions.append(payload) or {"ok": True})
         relay.process_command(command, "primary")
         changed = dict(command, id="command-6", leaseToken="lease-6",
-                       payload={"externalConversationId": "conversation-2", "body": "different"})
+                       payload={"externalConversationId": "primary:conversation-bbbbbbbb", "body": "different"})
         relay.process_command(changed, "primary")
         self.assertEqual(len(adapter_calls), 1)
         self.assertEqual(completions[-1]["error"], "device_idempotency_key_conflict")
@@ -678,9 +736,9 @@ class DeviceRuntimeTests(unittest.TestCase):
     def test_register_failure_does_not_starve_other_connector(self):
         self.config["connectors"] = [
             {"id": "connector-a", "token": "a" * 40, "profile": "primary",
-             "kind": "im", "accountLabel": "A", "displayName": "A"},
+             "kind": "qq", "accountLabel": "A", "displayName": "A"},
             {"id": "connector-b", "token": "b" * 40, "profile": "primary",
-             "kind": "im", "accountLabel": "B", "displayName": "B"},
+             "kind": "wechat", "accountLabel": "B", "displayName": "B"},
         ]
         attempted = []
         def http(method, path, payload=None):
@@ -696,9 +754,9 @@ class DeviceRuntimeTests(unittest.TestCase):
     def test_scan_failure_backs_off_only_failed_connector_and_retries_promptly(self):
         self.config["connectors"] = [
             {"id": "connector-a", "token": "a" * 40, "profile": "primary",
-             "kind": "im", "accountLabel": "A", "displayName": "A"},
+             "kind": "qq", "accountLabel": "A", "displayName": "A"},
             {"id": "connector-b", "token": "b" * 40, "profile": "primary",
-             "kind": "im", "accountLabel": "B", "displayName": "B"},
+             "kind": "wechat", "accountLabel": "B", "displayName": "B"},
         ]
         scanned = []
         now = [1000.0]
