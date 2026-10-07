@@ -1,0 +1,3 @@
+- [x] 固定设备产品 User-Agent 和 Accept 请求头，保留鉴权与连接器身份头。
+- [x] 增加经过 Request/opener 的真实请求头回归测试。
+- [x] 运行设备运行器测试，审查 diff 并提交。
