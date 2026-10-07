@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import worker, { hasConnectorRole, semanticCardBody } from './index.js';
+import worker, { hasConnectorRole, semanticCardBody } from '../cloudflare-worker/worker/index.js';
 
-const workerSource = readFileSync(new URL('./index.js', import.meta.url), 'utf8');
-const vueSource = readFileSync(new URL('../ui/src/App.vue', import.meta.url), 'utf8');
-const uiStyles = readFileSync(new URL('../ui/src/styles.css', import.meta.url), 'utf8');
-const winUiNotice = readFileSync(new URL('../ui/src/vendor/winui/NOTICE.md', import.meta.url), 'utf8');
-const secretScript = readFileSync(new URL('../../bridge/scripts/message-secrets.ps1', import.meta.url), 'utf8');
+const workerSource = readFileSync(new URL('../cloudflare-worker/worker/index.js', import.meta.url), 'utf8');
+const vueSource = readFileSync(new URL('../cloudflare-worker/ui/src/App.vue', import.meta.url), 'utf8');
+const uiStyles = readFileSync(new URL('../cloudflare-worker/ui/src/styles.css', import.meta.url), 'utf8');
+const fluentNotice = readFileSync(new URL('../cloudflare-worker/ui/public/vendor/fluent/NOTICE', import.meta.url), 'utf8');
+const fluentLicense = readFileSync(new URL('../cloudflare-worker/ui/public/vendor/fluent/LICENSE', import.meta.url), 'utf8');
+const secretScript = readFileSync(new URL('../bridge/scripts/message-secrets.ps1', import.meta.url), 'utf8');
 assert.doesNotMatch(workerSource, /UPDATE connector_instances SET state = 'online'/);
 assert.match(workerSource, /INSERT OR IGNORE INTO conversations/);
 assert.match(workerSource, /conversation_type/);
@@ -44,7 +45,8 @@ const assetBodies = new Map([
   ['/index.html', ['<!doctype html><html lang="zh-CN"><head><link rel="stylesheet" href="/assets/app.css"></head><body><div id="app"></div><script type="module" src="/assets/app.js"></script></body></html>', 'text/html; charset=utf-8']],
   ['/assets/app.js', ['console.log("message-center-vue")', 'text/javascript; charset=utf-8']],
   ['/assets/app.css', [':root{color-scheme:light dark}', 'text/css; charset=utf-8']],
-  ['/vendor/winui/NOTICE.md', [winUiNotice, 'text/markdown; charset=utf-8']],
+  ['/vendor/fluent/NOTICE', [fluentNotice, 'text/plain; charset=utf-8']],
+  ['/vendor/fluent/LICENSE', [fluentLicense, 'text/plain; charset=utf-8']],
 ]);
 const env = {
   ADMIN_TOKEN: adminToken,
@@ -244,7 +246,7 @@ assert.match(vueSource, /<dt>ID<\/dt><dd/);
 assert.match(vueSource, /<dt>模式<\/dt><dd/);
 assert.match(vueSource, /<dt>能力<\/dt>/);
 assert.match(vueSource, /自动恢复布局/);
-assert.match(vueSource, /role="switch"/);
+assert.match(vueSource, /FluentSwitch/);
 assert.match(vueSource, /expectedRevision/);
 assert.match(vueSource, /refresh: String\(Date\.now\(\)\)/);
 assert.match(vueSource, /visibilitychange/);
@@ -252,7 +254,8 @@ assert.match(vueSource, /pageshow/);
 assert.doesNotMatch(vueSource, /deliveryState|trustTier|\breceived\b|Cloudflare Worker/);
 assert.match(uiStyles, /--accent-base/);
 assert.match(uiStyles, /\.toggle-switch/);
-assert.match(winUiNotice, /Furry-Xiyi\/WinUIonWeb/);
+assert.match(fluentNotice, /Microsoft Corporation/);
+assert.match(fluentLicense, /Apache License/);
 assert.match(workerSource, /connector_layout_control/);
 assert.match(workerSource, /layout_revision_conflict/);
 assert.match(workerSource, /"layout_control"/);

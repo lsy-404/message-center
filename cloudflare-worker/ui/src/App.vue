@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
+import { FluentButton, FluentSwitch, FluentTheme } from '@platform-kit/fluent/vue'
 
 type LayoutAcknowledgement = {
   enabled: boolean
@@ -745,6 +746,7 @@ onUnmounted(() => {
 </script>
 
 <template>
+  <FluentTheme mode="system">
   <main class="mc-shell" :class="{ 'is-thread-open': mobileThread, 'is-instances-open': showInstances }">
     <aside class="nav-pane">
       <div class="brand" aria-label="Message Center">
@@ -791,7 +793,7 @@ onUnmounted(() => {
       </div>
 
       <div class="nav-footer">
-        <a class="license-link" href="/vendor/winui/NOTICE.md" target="_blank" rel="noreferrer">许可</a>
+        <a class="license-link" href="/vendor/fluent/NOTICE" target="_blank" rel="noreferrer">许可</a>
         <form method="post" action="/api/auth/logout">
           <button class="quiet-button logout-button" type="submit" aria-label="退出登录" title="退出登录">↪</button>
         </form>
@@ -804,7 +806,7 @@ onUnmounted(() => {
           <h1>收件箱</h1>
           <p>{{ filteredConversations.length }} 个会话 · {{ snapshot.connectors.length }} 个接入实例</p>
         </div>
-        <button class="quiet-button refresh-button" type="button" aria-label="刷新" title="刷新" @click="load(selectedId)">↻</button>
+        <FluentButton class="quiet-button refresh-button" type="button" aria-label="刷新" title="刷新" @click="load(selectedId)">↻</FluentButton>
       </header>
 
       <div class="conversation-list">
@@ -943,7 +945,7 @@ onUnmounted(() => {
                   :disabled="!canSendFiles || uploadingConversationIds.has(selectedId)" @change="uploadFiles">
               </label>
               <span v-if="!canSendFiles && canSendText" class="capability-hint">不支持发送附件</span>
-              <button class="accent-button" type="button" :disabled="!canSend" @click="send">发送</button>
+              <FluentButton class="accent-button" tone="primary" type="button" :disabled="!canSend" @click="send">发送</FluentButton>
             </div>
           </div>
         </footer>
@@ -987,18 +989,13 @@ onUnmounted(() => {
               <strong>自动恢复布局</strong>
               <span>{{ layoutControlStatus(connector) }}</span>
             </div>
-            <button
+            <FluentSwitch
               class="toggle-switch"
-              :class="{ checked: connectorLayoutControl(connector).enabled }"
-              type="button"
-              role="switch"
-              :aria-checked="connectorLayoutControl(connector).enabled"
+              :model-value="connectorLayoutControl(connector).enabled"
               :aria-label="`${connector.accountLabel} 自动恢复布局`"
               :disabled="updatingLayoutConnectorIds.has(connector.id)"
-              @click="setLayoutAutoRecovery(connector, !connectorLayoutControl(connector).enabled)"
-            >
-              <span class="toggle-knob" />
-            </button>
+              @change="setLayoutAutoRecovery(connector, $event)"
+            />
           </section>
         </article>
         <div v-if="!selectedConnector" class="empty-state"><span class="empty-glyph">□</span><p>尚无接入实例</p></div>
@@ -1009,4 +1006,5 @@ onUnmounted(() => {
   <Transition name="toast">
     <div v-if="toast" class="toast" role="status">{{ toast }}</div>
   </Transition>
+</FluentTheme>
 </template>
