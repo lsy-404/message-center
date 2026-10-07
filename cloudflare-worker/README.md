@@ -5,7 +5,7 @@
 ## 运行架构
 
 - `worker/index.js`：唯一生产运行时入口；不依赖 Pages、Sites、服务器或入站设备端口。
-- `ui/`：Vue 3 + Vite 前端。Worker 在认证后通过静态资产绑定返回带哈希的构建产物；页面与 API 均显式禁用缓存。收件箱在页面可见时每 5 秒拉取一次，重新聚焦、从浏览器历史恢复或重新联网时会立即刷新。
+- `ui/`：Vue 3 + Vite 前端。Worker 在认证后通过静态资产绑定返回带哈希的构建产物；页面与 API 均显式禁用缓存。收件箱在页面可见且联网时轮询，请求结束后才安排下一次刷新；失败时指数退避至最多 60 秒，页面隐藏或离线时暂停，恢复后立即刷新。
 - `worker/schema.sql`：D1 schema。`connector_instances` 是连接实例表，不对渠道类型设置唯一约束。
 - `connector_layout_control` 只服务于显式声明 `layout_control` 的单一设备 owner；云端使用 revision 做 CAS，设备本地动作另用持久化 generation 与 action ID 排序、去重。
 - `wrangler.jsonc`：本地开发与 Wrangler 生产部署配置。

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { FluentButton, FluentSwitch, FluentTheme } from '@platform-kit/fluent/vue'
+import { createInboxReadGate, createInboxRefreshLoop } from './inbox-refresh.mjs'
 
 type LayoutAcknowledgement = {
   enabled: boolean
@@ -109,8 +110,9 @@ const detailLoading = ref(false)
 const draft = ref('')
 const staged = ref<StagedAttachment[]>([])
 const toast = ref('')
-let loadRevision = 0
-let refreshTimer: number | undefined
+const inboxReads = createInboxReadGate()
+let inboxTimeout: number | undefined
+let refreshLoop: ReturnType<typeof createInboxRefreshLoop> | undefined
 let toastTimer: number | undefined
 let pendingScrollToBottomId: string | null = null
 const draftCache = new Map<string, string>()
@@ -418,14 +420,84 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   return body as T
 }
 
+function sameInbox(left: Snapshot, right: Snapshot) {
+  if (left.selectedConversationId !== right.selectedConversationId) return false
+  if (left.connectors.length !== right.connectors.length
+      || left.conversations.length !== right.conversations.length
+      || left.messages.length !== right.messages.length) return false
+  for (let index = 0; index < left.connectors.length; index += 1) {
+    const a = left.connectors[index]
+    const b = right.connectors[index]
+    if (a.id !== b.id || a.accountLabel !== b.accountLabel || a.displayName !== b.displayName
+        || a.channelLabel !== b.channelLabel || a.mode !== b.mode || a.state !== b.state
+        || a.lastSeenAt !== b.lastSeenAt || a.layoutControl?.enabled !== b.layoutControl?.enabled
+        || a.layoutControl?.revision !== b.layoutControl?.revision
+        || a.layoutControl?.updatedAt !== b.layoutControl?.updatedAt || a.layoutControl?.reason !== b.layoutControl?.reason
+        || a.layoutControl?.deviceGeneration !== b.layoutControl?.deviceGeneration
+        || a.layoutControl?.deviceActionId !== b.layoutControl?.deviceActionId
+        || a.layoutControl?.deviceActionRevision !== b.layoutControl?.deviceActionRevision
+        || a.layoutControl?.deviceActionEnabled !== b.layoutControl?.deviceActionEnabled
+        || a.layoutControl?.acknowledgement?.revision !== b.layoutControl?.acknowledgement?.revision
+        || a.layoutControl?.acknowledgement?.updatedAt !== b.layoutControl?.acknowledgement?.updatedAt
+        || a.layoutControl?.synchronized !== b.layoutControl?.synchronized
+        || a.capabilities.length !== b.capabilities.length
+        || a.capabilities.some((value, itemIndex) => value !== b.capabilities[itemIndex])) return false
+  }
+  for (let index = 0; index < left.conversations.length; index += 1) {
+    const a = left.conversations[index]
+    const b = right.conversations[index]
+    if (a.id !== b.id || a.title !== b.title || a.avatarPath !== b.avatarPath
+        || a.avatarLabel !== b.avatarLabel || a.connectorId !== b.connectorId
+        || a.connectorKind !== b.connectorKind || a.connectorChannelLabel !== b.connectorChannelLabel
+        || a.conversationType !== b.conversationType
+        || a.unreadCount !== b.unreadCount || a.lastMessagePreview !== b.lastMessagePreview
+        || a.lastMessageAt !== b.lastMessageAt || a.placement !== b.placement
+        || a.pinned !== b.pinned || a.connectorState !== b.connectorState
+        || a.capabilities.length !== b.capabilities.length
+        || a.capabilities.some((value, itemIndex) => value !== b.capabilities[itemIndex])) return false
+  }
+  for (let index = 0; index < left.messages.length; index += 1) {
+    const a = left.messages[index]
+    const b = right.messages[index]
+    if (a.id !== b.id || a.direction !== b.direction || a.senderName !== b.senderName
+        || a.body !== b.body || a.contentType !== b.contentType || a.occurredAt !== b.occurredAt
+        || a.attachments.length !== b.attachments.length) return false
+    for (let attachmentIndex = 0; attachmentIndex < a.attachments.length; attachmentIndex += 1) {
+      const file = a.attachments[attachmentIndex]
+      const nextFile = b.attachments[attachmentIndex]
+      if (file.id !== nextFile.id || file.fileName !== nextFile.fileName
+          || file.mimeType !== nextFile.mimeType || file.sizeBytes !== nextFile.sizeBytes
+          || file.downloadable !== nextFile.downloadable) return false
+    }
+  }
+  return true
+}
+
+function cancelInboxRead() {
+  if (inboxTimeout !== undefined) window.clearTimeout(inboxTimeout)
+  inboxTimeout = undefined
+  inboxReads.cancel()
+}
+
 async function load(conversationId = selectedId.value, silent = false, forceScrollToBottom = false) {
-  const revision = ++loadRevision
+  if (document.hidden || !navigator.onLine) {
+    if (!silent) detailLoading.value = false
+    loading.value = false
+    return
+  }
+  cancelInboxRead()
+  const request = inboxReads.begin(conversationId)
+  let timedOut = false
+  inboxTimeout = window.setTimeout(() => {
+    timedOut = true
+    request.controller.abort()
+  }, 20_000)
   if (!silent) detailLoading.value = Boolean(conversationId)
   const query = new URLSearchParams({ refresh: String(Date.now()) })
   if (conversationId) query.set('conversationId', conversationId)
   try {
-    const body = await api<Snapshot & { ok: boolean }>(`/api/inbox?${query}`)
-    if (revision !== loadRevision) return
+    const body = await api<Snapshot & { ok: boolean }>(`/api/inbox?${query}`, { signal: request.controller.signal })
+    if (!inboxReads.isCurrent(request, selectedId.value)) return
     const priorThread = document.querySelector<HTMLElement>('.message-scroll')
     const priorSelectedId = selectedId.value
     const scrollState = priorThread ? captureMessageScroll(priorThread) : null
@@ -438,8 +510,10 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
     }
     advanceAvatarRetries(body.conversations)
     body.connectors = mergeConnectorLayoutControls(body.connectors)
+    if (sameInbox(snapshot.value, body)) return
     snapshot.value = body
     await nextTick()
+    if (!inboxReads.isActive(request)) return
     const thread = document.querySelector<HTMLElement>('.message-scroll')
     const shouldForceScroll = forceScrollToBottom || pendingScrollToBottomId === nextSelectedId
     if (thread) {
@@ -450,8 +524,17 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
       }
     }
     if (shouldForceScroll && pendingScrollToBottomId === nextSelectedId) pendingScrollToBottomId = null
+  } catch (error) {
+    if (timedOut) throw new Error('加载超时，请稍后重试')
+    throw error
   } finally {
-    if (revision === loadRevision) {
+    const ownsRequest = inboxReads.isCurrent(request, request.conversationId)
+    if (ownsRequest) {
+      if (inboxTimeout !== undefined) window.clearTimeout(inboxTimeout)
+      inboxTimeout = undefined
+      inboxReads.finish(request)
+    }
+    if (ownsRequest) {
       loading.value = false
       detailLoading.value = false
     }
@@ -459,6 +542,7 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
 }
 
 async function selectConversation(conversation: Conversation, openMobileThread = true) {
+  cancelInboxRead()
   storeComposer()
   if (conversation.id !== selectedId.value) pendingScrollToBottomId = null
   selectedId.value = conversation.id
@@ -470,7 +554,9 @@ async function selectConversation(conversation: Conversation, openMobileThread =
   try {
     await load(conversation.id)
   } catch (error) {
-    notify(`详情加载失败：${error instanceof Error ? error.message : String(error)}`)
+    if (selectedId.value === conversation.id && !(error instanceof DOMException && error.name === 'AbortError')) {
+      notify(`详情加载失败：${error instanceof Error ? error.message : String(error)}`)
+    }
   }
 }
 
@@ -490,6 +576,7 @@ function selectFilter(id: string) {
     } else {
       storeComposer()
       pendingScrollToBottomId = null
+      cancelInboxRead()
       selectedId.value = ''
       restoreComposer('')
       snapshot.value.messages = []
@@ -716,31 +803,62 @@ function onComposerKeydown(event: KeyboardEvent) {
   }
 }
 
+function refreshAllowed() {
+  return !document.hidden && navigator.onLine
+}
+
 function onPageShow() {
-  void load(selectedId.value, true).catch(() => {})
+  if (refreshAllowed()) refreshLoop?.start(true)
 }
 
 function onVisibilityChange() {
-  if (!document.hidden) void load(selectedId.value, true).catch(() => {})
+  if (refreshAllowed()) refreshLoop?.start(true)
+  else {
+    refreshLoop?.stop()
+    cancelInboxRead()
+  }
 }
 
-onMounted(async () => {
-  try {
-    await load()
-  } catch (error) {
-    notify(`加载失败：${error instanceof Error ? error.message : String(error)}`)
-  }
-  refreshTimer = window.setInterval(() => {
-    if (!document.hidden) void load(selectedId.value, true).catch(() => {})
-  }, 5_000)
+function onOffline() {
+  refreshLoop?.stop()
+  cancelInboxRead()
+}
+
+function onOnline() {
+  if (refreshAllowed()) refreshLoop?.start(true)
+}
+
+onMounted(() => {
+  let firstLoad = true
+  refreshLoop = createInboxRefreshLoop(async () => {
+    if (inboxReads.isBusy()) return
+    try {
+      await load(selectedId.value, true)
+      firstLoad = false
+    } catch (error) {
+      if (firstLoad && !(error instanceof DOMException && error.name === 'AbortError')) {
+        notify(`加载失败：${error instanceof Error ? error.message : String(error)}`)
+        firstLoad = false
+      }
+      throw error
+    }
+  }, refreshAllowed)
+  refreshLoop.start(true)
   window.addEventListener('pageshow', onPageShow)
+  window.addEventListener('pagehide', onOffline)
+  window.addEventListener('online', onOnline)
+  window.addEventListener('offline', onOffline)
   document.addEventListener('visibilitychange', onVisibilityChange)
 })
 
 onUnmounted(() => {
-  if (refreshTimer) window.clearInterval(refreshTimer)
+  refreshLoop?.stop()
+  cancelInboxRead()
   if (toastTimer) window.clearTimeout(toastTimer)
   window.removeEventListener('pageshow', onPageShow)
+  window.removeEventListener('pagehide', onOffline)
+  window.removeEventListener('online', onOnline)
+  window.removeEventListener('offline', onOffline)
   document.removeEventListener('visibilitychange', onVisibilityChange)
 })
 </script>
