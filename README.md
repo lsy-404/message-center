@@ -39,6 +39,7 @@ pnpm run build
 Set-Location ..
 node --check worker/index.js
 node ../test/worker-smoke.test.mjs
+node ../test/inbox-refresh.test.mjs
 node worker/schema-test.mjs
 pnpm dlx wrangler deploy --dry-run
 
