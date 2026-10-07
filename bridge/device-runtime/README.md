@@ -4,7 +4,7 @@ This Python 3.9 standard-library relay connects a device directly to the Message
 
 ## Configuration
 
-Store a UTF-8 JSON configuration at a private local path with restrictive file permissions:
+Store a UTF-8 JSON configuration at a private local path with mode `0600`. Relative adapter and database paths resolve from the configuration file directory:
 
 ```json
 {
