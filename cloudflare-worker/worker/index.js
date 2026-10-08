@@ -1567,6 +1567,9 @@ async function ingestGroupTextBackups(request, env) {
         !Number.isFinite(Date.parse(item?.occurredAt)) || attachments.length > 20) {
       throw new Error("invalid_group_text_backup");
     }
+    if (item.senderId != null && item.senderId !== "" && !validShort(item.senderId)) {
+      throw new Error("invalid_group_sender");
+    }
     const attachmentMetadata = [];
     for (const attachment of attachments) {
       const externalId = String(attachment?.externalId || "");
@@ -1629,23 +1632,29 @@ async function ingestGroupTextBackups(request, env) {
     if (stored.conversation_external_id !== expectedConversationExternalId || stored.body !== entry.bodyText) {
       throw new Error("message_external_id_conflict");
     }
+    const senderId = typeof entry.item.senderId === "string" ? entry.item.senderId : "";
+    const senderName = typeof entry.item.senderName === "string" ? entry.item.senderName.trim().slice(0, 200) : "";
+    const hasSenderRefresh = Boolean(senderId && senderName);
     canonical.push({
       item: {
         ...entry.item,
         externalId,
         conversationExternalId: stored.conversation_external_id,
         conversationTitle: stored.conversation_title,
-        senderId: stored.sender_id,
-        senderName: stored.sender_name,
+        senderId: hasSenderRefresh ? senderId : stored.sender_id,
+        senderName: hasSenderRefresh ? senderName : stored.sender_name,
       },
       bodyText: stored.body,
       placement: stored.placement,
       occurredAt: stored.occurred_at,
       attachmentMetadata: entry.attachmentMetadata,
+      senderRefresh: hasSenderRefresh,
     });
   }
   let normalizedInserted = 0;
-  for (const { item, bodyText, placement, occurredAt, attachmentMetadata } of canonical) {
+  for (const { item, bodyText, placement, occurredAt, attachmentMetadata, senderRefresh } of canonical) {
+    const senderId = typeof item.senderId === "string" ? item.senderId : "";
+    const senderName = typeof item.senderName === "string" ? item.senderName.trim().slice(0, 200) : "";
     const conversationExternalId = String(item.conversationExternalId).slice(0, 500);
     let conversation = await env.DB.prepare(`
       SELECT id FROM conversations WHERE connector_id = ? AND external_id = ?
@@ -1745,6 +1754,18 @@ async function ingestGroupTextBackups(request, env) {
         }
       }
     }
+    if (senderRefresh && senderId && senderName) {
+      await env.DB.prepare(`
+        UPDATE group_text_backups SET sender_id = ?, sender_name = ?
+        WHERE connector_id = ? AND external_id = ? AND conversation_external_id = ?
+      `).bind(senderId, senderName, connectorId,
+        String(item.externalId).slice(0, 300), conversationExternalId).run();
+      await env.DB.prepare(`
+        UPDATE messages SET sender_id = ?, sender_name = ?
+        WHERE connector_id = ? AND external_id = ? AND conversation_id = ?
+      `).bind(senderId, senderName, connectorId,
+        String(item.externalId).slice(0, 300), conversation.id).run();
+    }
     // This is deliberately replayable: if a previous request committed the message but
     // failed while updating its conversation, the retry repairs the derived row.
     await env.DB.prepare(`
@@ -1820,11 +1841,13 @@ async function readGroupTextBackups(env, url) {
   const rows = await env.DB.prepare(`
     SELECT b.connector_id, b.conversation_external_id,
       COALESCE(p.display_name, b.conversation_title) AS conversation_title,
-      p.avatar_object_key, p.avatar_sha256, b.external_id, b.sender_id, b.sender_name, b.body,
+      p.avatar_object_key, p.avatar_sha256, a.sha256 AS sender_avatar_sha256,
+      b.external_id, b.sender_id, b.sender_name, b.body,
       b.placement, b.occurred_at, b.received_at
     FROM group_text_backups b
     LEFT JOIN conversation_profiles p ON p.connector_id = b.connector_id
       AND p.conversation_external_id = b.conversation_external_id
+      LEFT JOIN sender_avatars a ON a.connector_id = b.connector_id AND a.sender_id = b.sender_id
     ${where} ORDER BY b.occurred_at DESC LIMIT ?
   `).bind(...values, limit).all();
   const backups = (rows.results || []).map((row) => ({
@@ -1836,6 +1859,8 @@ async function readGroupTextBackups(env, url) {
     externalId: row.external_id,
     senderId: row.sender_id,
     senderName: row.sender_name,
+    senderAvatarPath: row.sender_avatar_sha256
+      ? `/api/sender-avatars/${row.connector_id}/${row.sender_id}?v=${encodeURIComponent(row.sender_avatar_sha256)}` : null,
     body: row.body,
     placement: row.placement,
     occurredAt: row.occurred_at,

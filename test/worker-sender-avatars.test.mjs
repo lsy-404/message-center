@@ -136,6 +136,34 @@ const noAvatarInboxResponse = await worker.fetch(new Request(
 assert.equal((await noAvatarInboxResponse.json()).messages[0].senderAvatarPath,
   `/api/sender-avatars/${connectorB}/sender:shared?v=${rows[1].sha256}`)
 
+for (const [connectorId, conversationId, senderId, externalId] of [
+  [connectorA, 'group-a', 'sender:shared', 'group-backup-a'],
+  [connectorA, 'group-a', 'sender-no-avatar', 'group-backup-no-avatar'],
+  [connectorB, 'group-b', 'sender:shared', 'group-backup-b'],
+]) {
+  database.prepare(`
+    INSERT INTO group_text_backups (
+      connector_id, conversation_external_id, conversation_title, external_id, sender_id,
+      sender_name, body, placement, occurred_at, received_at
+    ) VALUES (?, ?, 'Group', ?, ?, 'Sender', 'fixture', 'normal', ?, ?)
+  `).run(connectorId, conversationId, externalId, senderId, stamp, stamp)
+}
+const groupBackupsAResponse = await worker.fetch(new Request(
+  `https://message.example.com/api/group-text-backups?connectorId=${encodeURIComponent(connectorA)}`,
+  { headers: adminHeaders },
+), env, {})
+assert.equal(groupBackupsAResponse.status, 200)
+const groupBackupsA = await groupBackupsAResponse.json()
+assert.equal(groupBackupsA.backups.find((backup) => backup.externalId === 'group-backup-a').senderAvatarPath,
+  `/api/sender-avatars/${connectorA}/sender:shared?v=${rows[0].sha256}`)
+assert.equal(groupBackupsA.backups.find((backup) => backup.externalId === 'group-backup-no-avatar').senderAvatarPath, null)
+const groupBackupsBResponse = await worker.fetch(new Request(
+  `https://message.example.com/api/group-text-backups?connectorId=${encodeURIComponent(connectorB)}`,
+  { headers: adminHeaders },
+), env, {})
+assert.equal((await groupBackupsBResponse.json()).backups[0].senderAvatarPath,
+  `/api/sender-avatars/${connectorB}/sender:shared?v=${rows[1].sha256}`)
+
 const download = await worker.fetch(new Request(
   `https://message.example.com/api/sender-avatars/${connectorA}/sender:shared`,
   { headers: adminHeaders },
@@ -160,4 +188,4 @@ const unauthenticatedDownload = await worker.fetch(new Request(
 assert.equal(unauthenticatedDownload.status, 401)
 
 database.close()
-console.log('Sender avatar API, connector isolation, and inbox tests passed')
+console.log('Sender avatar API, connector isolation, inbox, and group backup tests passed')
