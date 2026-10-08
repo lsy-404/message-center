@@ -201,6 +201,8 @@ class Relay:
         self.flush_next_index = 0
         self.failures = {item["id"]: 0 for item in self.connectors}
         self.retry_at = {item["id"]: 0 for item in self.connectors}
+        self.heartbeat_failures = {item["id"]: 0 for item in self.connectors}
+        self.heartbeat_retry_at = {item["id"]: 0 for item in self.connectors}
 
     def media_directory_for(self, connector_id):
         if not any(item["id"] == connector_id for item in self.connectors):
@@ -227,6 +229,16 @@ class Relay:
     def succeeded(self, connector_id):
         self.failures[connector_id] = 0
         self.retry_at[connector_id] = 0
+
+    def heartbeat_failed(self, connector_id):
+        count = self.heartbeat_failures[connector_id] + 1
+        self.heartbeat_failures[connector_id] = count
+        self.heartbeat_retry_at[connector_id] = time.monotonic() + min(
+            15 * (2 ** min(count - 1, 2)), 60)
+
+    def heartbeat_succeeded(self, connector_id):
+        self.heartbeat_failures[connector_id] = 0
+        self.heartbeat_retry_at[connector_id] = 0
 
     def select_connector(self, connector):
         self.connector = connector["id"]
@@ -687,7 +699,7 @@ class Relay:
                     self.failed(connector_id)
                 finally:
                     self.cleanup_unreferenced_media()
-            if self.eligible(connector_id):
+            if time.monotonic() >= self.heartbeat_retry_at[connector_id]:
                 try:
                     self.http_call("POST", "/api/connectors/heartbeat", {
                         "connectorId": self.connector,
@@ -695,7 +707,9 @@ class Relay:
                         time.monotonic() - self.last_scan[connector_id] <= self.scan_interval[connector_id] + 30
                         else "offline"})
                 except Exception:
-                    self.failed(connector_id)
+                    self.heartbeat_failed(connector_id)
+                else:
+                    self.heartbeat_succeeded(connector_id)
         for connector in self.connectors:
             self.select_connector(connector)
             connector_id = self.connector

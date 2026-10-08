@@ -27,3 +27,4 @@
 | 020 | [BugFix] Adapter operation deadlines | Give scans and sends bounded operation-specific subprocess budgets | Prevent the relay from killing native scans or sends before bounded helper cleanup completes | ✅ Complete; local commit only |
 | 020 | [BugFix] 群聊备份发言人头像 | 群聊文本备份读取接口返回发言人头像路径 | QQ 群聊备份详情缺少已同步的发言人头像 | ✅ 已完成 |
 | 021 | [BugFix] 群备份重复资料刷新 | 对同一群聊消息的安全重放刷新缺失或旧 sender ID | 头像到达晚于消息入库时 inbox JOIN 无法命中 | ✅ 已完成 |
+| 022 | [BugFix] 持续心跳退避 | 将设备心跳与扫描/命令退避隔离，并为心跳网络错误设置有界退避 | connector 级共享退避会在操作失败后抑制心跳并让 lastSeenAt 过期 | ✅ 已完成，本地提交 |
