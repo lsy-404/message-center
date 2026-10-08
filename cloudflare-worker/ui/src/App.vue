@@ -70,6 +70,7 @@ type Message = {
   id: string
   direction: 'inbound' | 'outbound' | string
   senderName: string
+  senderAvatarPath?: string | null
   body: string
   contentType: string
   occurredAt: string
@@ -391,8 +392,11 @@ function imageLoaded(event: Event) {
   avatarRetryStates.value = next
 }
 
-function advanceAvatarRetries(conversations: Conversation[]) {
-  const activePaths = new Set(conversations.map((item) => item.avatarPath).filter((path): path is string => Boolean(path)))
+function advanceAvatarRetries(conversations: Conversation[], messages: Message[]) {
+  const activePaths = new Set([
+    ...conversations.map((item) => item.avatarPath),
+    ...messages.map((item) => item.senderAvatarPath),
+  ].filter((path): path is string => Boolean(path)))
   const now = Date.now()
   const next = new Map(avatarRetryStates.value)
   let changed = false
@@ -483,6 +487,7 @@ function sameInbox(left: Snapshot, right: Snapshot) {
     const a = left.messages[index]
     const b = right.messages[index]
     if (a.id !== b.id || a.direction !== b.direction || a.senderName !== b.senderName
+        || a.senderAvatarPath !== b.senderAvatarPath
         || a.body !== b.body || a.contentType !== b.contentType || a.occurredAt !== b.occurredAt
         || a.attachments.length !== b.attachments.length) return false
     for (let attachmentIndex = 0; attachmentIndex < a.attachments.length; attachmentIndex += 1) {
@@ -537,7 +542,7 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
     if ([...loadedAttachmentImages.value].some((key) => !currentImageKeys.has(key))) {
       loadedAttachmentImages.value = new Set([...loadedAttachmentImages.value].filter((key) => currentImageKeys.has(key)))
     }
-    advanceAvatarRetries(body.conversations)
+    advanceAvatarRetries(body.conversations, body.messages)
     body.connectors = mergeConnectorLayoutControls(body.connectors)
     if (sameInbox(snapshot.value, body)) return
     snapshot.value = body
@@ -1038,6 +1043,21 @@ onUnmounted(() => {
             class="message-row"
             :class="message.direction"
           >
+            <span class="avatar message-avatar">
+              <span>{{ initials(message.senderName) }}</span>
+              <img
+                v-if="message.senderAvatarPath"
+                :key="avatarKey(message.senderAvatarPath)"
+                :src="avatarSource(message.senderAvatarPath)"
+                :data-avatar-path="message.senderAvatarPath"
+                :data-avatar-revision="avatarRevision(message.senderAvatarPath)"
+                alt=""
+                loading="lazy"
+                decoding="async"
+                @load="imageLoaded"
+                @error="imageFailed"
+              >
+            </span>
             <div class="message-block">
               <p class="message-meta">{{ message.senderName }} · {{ formatStamp(message.occurredAt) }}</p>
               <div class="message-bubble">
