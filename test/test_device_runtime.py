@@ -1,5 +1,6 @@
 import importlib.util
 import http.server
+import json
 import os
 import sqlite3
 import tempfile
@@ -138,6 +139,40 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.config["connectors"][0]["kind"] = "wechat"
         relay.scan_profile("primary")
         self.assertEqual(captured[1]["driver"], "wechat")
+
+    def test_default_relay_adapter_uses_scan_operation_deadline(self):
+        result = {"ok": True, "health": "offline", "active": False,
+                  "cursor": None, "messages": []}
+        with patch.object(runtime, "run_adapter", return_value=result) as run:
+            relay = runtime.Relay(self.config, self.db)
+            relay.scan_profile("primary")
+        request = run.call_args.args[1]
+        self.assertEqual(request["op"], "scan")
+        self.assertEqual(run.call_args.kwargs["timeout"], runtime.ADAPTER_SCAN_TIMEOUT)
+        self.assertEqual(runtime.ADAPTER_SCAN_TIMEOUT, 60)
+
+    def test_send_adapter_timeout_uses_longer_deadline_and_remains_uncertain(self):
+        command = {"id": "command-timeout", "leaseToken": "lease-timeout",
+                   "idempotencyKey": "key-timeout",
+                   "payload": {"externalConversationId": "primary:conversation-aaaaaaaa",
+                               "body": "synthetic"}}
+        with patch.object(runtime, "run_adapter", side_effect=RuntimeError("adapter_timeout")) as run:
+            relay = runtime.Relay(
+                self.config, self.db,
+                http_call=lambda method, path, payload=None: {"ok": True},
+            )
+            relay.process_command(command, "primary")
+        request = run.call_args.args[1]
+        self.assertEqual(request["op"], "send")
+        self.assertEqual(run.call_args.kwargs["timeout"], runtime.ADAPTER_SEND_TIMEOUT)
+        self.assertEqual(runtime.ADAPTER_SEND_TIMEOUT, 90)
+        state, result, retryable = self.db.execute(
+            "SELECT state,result,retryable FROM command_ledger WHERE connector_id=? AND idempotency_key=?",
+            ("connector-a", "key-timeout"),
+        ).fetchone()
+        self.assertEqual(state, "done")
+        self.assertEqual(json.loads(result), {"uncertain": True, "error": "device_send_outcome_uncertain"})
+        self.assertEqual(retryable, 0)
 
     def test_attachment_without_staging_contract_does_not_commit_cursor(self):
         old = runtime.compact({"next": "old"})
