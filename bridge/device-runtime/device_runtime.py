@@ -32,6 +32,8 @@ STAGING_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
 IMAGE_MIME = re.compile(r"^image/[a-z0-9.+-]{1,100}$", re.IGNORECASE)
 DEFAULT_OUTBOX_BYTES = 128 * 1024 * 1024
 MAX_DELIVERIES_PER_PASS = 5
+ADAPTER_SCAN_TIMEOUT = 60
+ADAPTER_SEND_TIMEOUT = 90
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -154,11 +156,22 @@ def run_adapter(path, request, timeout=30):
     return value
 
 
+def adapter_timeout_for_request(request):
+    operation = request.get("op") if isinstance(request, dict) else None
+    if operation == "scan":
+        return ADAPTER_SCAN_TIMEOUT
+    if operation == "send":
+        return ADAPTER_SEND_TIMEOUT
+    raise ValueError("unsupported_adapter_operation")
+
+
 class Relay:
     def __init__(self, config, db=None, adapter_call=None, http_call=None):
         self.config = config
         self.db = db or open_database(config["database"])
-        self.adapter_call = adapter_call or (lambda req: run_adapter(config["adapter"], req))
+        self.adapter_call = adapter_call or (
+            lambda req: run_adapter(config["adapter"], req,
+                                    timeout=adapter_timeout_for_request(req)))
         self.http_call = http_call or self.request
         self.base = config["serviceUrl"].rstrip("/")
         if not self.base.startswith("https://"):
