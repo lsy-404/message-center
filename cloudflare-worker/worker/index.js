@@ -1820,11 +1820,13 @@ async function readGroupTextBackups(env, url) {
   const rows = await env.DB.prepare(`
     SELECT b.connector_id, b.conversation_external_id,
       COALESCE(p.display_name, b.conversation_title) AS conversation_title,
-      p.avatar_object_key, p.avatar_sha256, b.external_id, b.sender_id, b.sender_name, b.body,
+      p.avatar_object_key, p.avatar_sha256, a.sha256 AS sender_avatar_sha256,
+      b.external_id, b.sender_id, b.sender_name, b.body,
       b.placement, b.occurred_at, b.received_at
     FROM group_text_backups b
     LEFT JOIN conversation_profiles p ON p.connector_id = b.connector_id
       AND p.conversation_external_id = b.conversation_external_id
+      LEFT JOIN sender_avatars a ON a.connector_id = b.connector_id AND a.sender_id = b.sender_id
     ${where} ORDER BY b.occurred_at DESC LIMIT ?
   `).bind(...values, limit).all();
   const backups = (rows.results || []).map((row) => ({
@@ -1836,6 +1838,8 @@ async function readGroupTextBackups(env, url) {
     externalId: row.external_id,
     senderId: row.sender_id,
     senderName: row.sender_name,
+    senderAvatarPath: row.sender_avatar_sha256
+      ? `/api/sender-avatars/${row.connector_id}/${row.sender_id}?v=${encodeURIComponent(row.sender_avatar_sha256)}` : null,
     body: row.body,
     placement: row.placement,
     occurredAt: row.occurred_at,
