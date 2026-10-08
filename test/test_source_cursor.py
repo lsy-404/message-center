@@ -139,5 +139,21 @@ class SourceCursorTests(unittest.TestCase):
                 None, "conversation-a", "21", records(*range(21, 0, -1)))
 
 
+    def test_conversation_bound_is_256_and_cursor_size_bound_is_unchanged(self):
+        state = {"initialized": True, "committedHead": None, "sweepHead": None, "before": None}
+        cursor = {"version": 1, "conversations": {
+            f"conversation-{index}": dict(state) for index in range(256)
+        }}
+        self.assertEqual(256, len(source_cursor._copy_cursor(cursor)["conversations"]))
+        self.assertEqual(65_536, source_cursor.MAX_CURSOR_BYTES)
+        source_cursor._check_size(cursor)
+        with self.assertRaisesRegex(source_cursor.SourceCursorError, "invalid_cursor"):
+            source_cursor._copy_cursor({"version": 1, "conversations": {
+                f"conversation-{index}": dict(state) for index in range(257)
+            }})
+        with self.assertRaisesRegex(source_cursor.SourceCursorError, "too_many_conversations"):
+            source_cursor.initialize_baseline(cursor, "conversation-256", None, [])
+
+
 if __name__ == "__main__":
     unittest.main()
