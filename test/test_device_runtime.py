@@ -872,6 +872,86 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(len(heartbeat_payloads), 2)
         self.assertTrue(all(item["state"] == "offline" for item in heartbeat_payloads))
 
+    def test_outbox_ack_keeps_heartbeat_online_without_opening_command_gate(self):
+        for index in range(runtime.MAX_DELIVERIES_PER_PASS + 1):
+            self.db.execute(
+                "INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,1)",
+                ("connector-a", "primary", "queued-" + str(index), "{}"),
+            )
+        self.db.commit()
+        calls = []
+
+        def http(method, path, payload=None):
+            calls.append((method, path, payload))
+            return {"ok": True, "received": 1, "suppressed": 0, "commands": []}
+
+        relay = runtime.Relay(self.config, self.db, lambda _request: {}, http)
+        with patch.object(runtime.time, "monotonic", return_value=1000.0):
+            relay.pass_once()
+
+        heartbeat = next(payload for _method, path, payload in calls if path.endswith("/heartbeat"))
+        self.assertEqual(heartbeat["state"], "online")
+        self.assertFalse(relay.health["connector-a"])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
+        self.assertFalse(any(method == "GET" and path.startswith("/api/connectors/commands")
+                             for method, path, _payload in calls))
+
+    def test_failed_outbox_delivery_does_not_extend_offline_heartbeat(self):
+        self.db.execute(
+            "INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,1)",
+            ("connector-a", "primary", "queued", "{}"),
+        )
+        self.db.commit()
+        calls = []
+
+        def http(method, path, payload=None):
+            calls.append((method, path, payload))
+            if path.endswith("/events"):
+                raise OSError("relay unavailable")
+            return {"ok": True, "commands": []}
+
+        relay = runtime.Relay(self.config, self.db, lambda _request: {}, http)
+        with patch.object(runtime.time, "monotonic", return_value=1000.0):
+            relay.pass_once()
+
+        heartbeat = next(payload for _method, path, payload in calls if path.endswith("/heartbeat"))
+        self.assertEqual(heartbeat["state"], "offline")
+        self.assertFalse(relay.health["connector-a"])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
+        self.assertFalse(any(method == "GET" and path.startswith("/api/connectors/commands")
+                             for method, path, _payload in calls))
+
+    def test_outbox_progress_is_attributed_only_to_acknowledged_connector(self):
+        self.config["connectors"] = [
+            {"id": "connector-a", "token": "a" * 40, "profile": "primary",
+             "kind": "qq", "accountLabel": "A", "displayName": "A"},
+            {"id": "connector-b", "token": "b" * 40, "profile": "primary",
+             "kind": "wechat", "accountLabel": "B", "displayName": "B"},
+        ]
+        for connector_id in ("connector-a", "connector-b"):
+            for index in range(runtime.MAX_DELIVERIES_PER_PASS + 1):
+                self.db.execute(
+                    "INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,1)",
+                    (connector_id, "primary", connector_id + "-" + str(index), "{}"),
+                )
+        self.db.commit()
+        heartbeats = {}
+
+        def http(method, path, payload=None):
+            if path.endswith("/events") and payload["connectorId"] == "connector-b":
+                raise OSError("connector B unavailable")
+            if path.endswith("/heartbeat"):
+                heartbeats[payload["connectorId"]] = payload["state"]
+            return {"ok": True, "received": 1, "suppressed": 0, "commands": []}
+
+        relay = runtime.Relay(self.config, self.db, lambda _request: {}, http)
+        with patch.object(runtime.time, "monotonic", return_value=1000.0):
+            relay.pass_once()
+
+        self.assertEqual(heartbeats, {"connector-a": "online", "connector-b": "offline"})
+        self.assertFalse(relay.health["connector-a"])
+        self.assertFalse(relay.health["connector-b"])
+
     def test_heartbeat_failure_uses_independent_bounded_backoff(self):
         heartbeat_calls = []
         now = [1000.0]
