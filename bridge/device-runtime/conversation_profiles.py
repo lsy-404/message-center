@@ -1,6 +1,8 @@
 """Bounded HTTPS synchronization for conversation profile metadata."""
 
+import base64
 import datetime
+import hashlib
 import json
 import re
 import urllib.error
@@ -9,6 +11,8 @@ import urllib.request
 
 
 MAX_PROFILES = 20
+MAX_AVATAR_BYTES = 128 * 1024
+MAX_AVATAR_BATCH_BYTES = 128 * 1024
 MAX_RESPONSE = 1024 * 1024
 REQUEST_TIMEOUT = 20
 CONVERSATION_ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._:-]{0,199}\Z")
@@ -56,7 +60,42 @@ def _timestamp(value):
     return parsed.astimezone(datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def _prepare_profile(profile):
+def _decode_avatar(profile, remaining_bytes):
+    if "avatarBase64" not in profile:
+        return None, None
+    encoded = profile["avatarBase64"]
+    if not isinstance(encoded, str):
+        raise ProfileSyncError("invalid_profile_avatar")
+    if encoded == "":
+        return None, None
+    encoded_limit = 4 * ((min(MAX_AVATAR_BYTES, remaining_bytes) + 2) // 3)
+    if not remaining_bytes or len(encoded) > encoded_limit:
+        raise ProfileSyncError("profile_avatar_too_large")
+    try:
+        encoded_bytes = encoded.encode("ascii")
+        avatar = base64.b64decode(encoded_bytes, validate=True)
+    except (UnicodeEncodeError, ValueError) as exc:
+        raise ProfileSyncError("invalid_profile_avatar") from exc
+    if (not avatar or len(avatar) > MAX_AVATAR_BYTES or len(avatar) > remaining_bytes or
+            base64.b64encode(avatar).decode("ascii") != encoded):
+        if avatar and (len(avatar) > MAX_AVATAR_BYTES or len(avatar) > remaining_bytes):
+            raise ProfileSyncError("profile_avatar_too_large")
+        raise ProfileSyncError("invalid_profile_avatar")
+
+    if avatar.startswith(b"\x89PNG\r\n\x1a\n"):
+        content_type = "image/png"
+    elif avatar.startswith(b"\xff\xd8\xff"):
+        content_type = "image/jpeg"
+    elif avatar.startswith((b"GIF87a", b"GIF89a")):
+        content_type = "image/gif"
+    elif len(avatar) >= 12 and avatar[:4] == b"RIFF" and avatar[8:12] == b"WEBP":
+        content_type = "image/webp"
+    else:
+        raise ProfileSyncError("invalid_profile_avatar")
+    return avatar, content_type
+
+
+def _prepare_profile(profile, remaining_avatar_bytes=MAX_AVATAR_BATCH_BYTES):
     if not isinstance(profile, dict):
         raise ProfileSyncError("invalid_profile_metadata")
     conversation_id = profile.get("conversationExternalId")
@@ -112,27 +151,38 @@ def _prepare_profile(profile):
     if last_message_at is not None:
         headers["x-conversation-last-at"] = _timestamp(last_message_at)
 
-    return conversation_id, headers
+    avatar, content_type = _decode_avatar(profile, remaining_avatar_bytes)
+    return conversation_id, headers, avatar, content_type
 
 
 def sync_profiles(relay, profiles):
     """PUT up to twenty profiles; any failure propagates to the scan caller."""
     if not isinstance(profiles, list) or len(profiles) > MAX_PROFILES:
         raise ProfileSyncError("invalid_profile_batch")
-    prepared = [_prepare_profile(profile) for profile in profiles]
+    prepared = []
+    remaining_avatar_bytes = MAX_AVATAR_BATCH_BYTES
+    for profile in profiles:
+        item = _prepare_profile(profile, remaining_avatar_bytes)
+        if item[2] is not None:
+            remaining_avatar_bytes -= len(item[2])
+        prepared.append(item)
     if not prepared:
         return 0
 
     opener = urllib.request.build_opener(NoRedirect())
     base = relay.base.rstrip("/")
     headers_base = relay.headers()
-    for conversation_id, profile_headers in prepared:
+    for conversation_id, profile_headers, avatar, content_type in prepared:
         headers = dict(headers_base)
         headers.update(profile_headers)
-        headers["Content-Length"] = "0"
+        body = avatar if avatar is not None else b""
+        headers["Content-Length"] = str(len(body))
+        if avatar is not None:
+            headers["Content-Type"] = content_type
+            headers["x-content-sha256"] = hashlib.sha256(avatar).hexdigest()
         request = urllib.request.Request(
             base + "/api/connectors/conversation-profiles/" + conversation_id,
-            data=b"",
+            data=body,
             headers=headers,
             method="PUT",
         )

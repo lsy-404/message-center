@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -169,6 +171,78 @@ class ConversationProfileTests(unittest.TestCase):
                 profiles_module.sync_profiles(FakeRelay(), [
                     {"conversationExternalId": "group-1", "displayName": "Group"}
                 ])
+
+    def test_valid_png_avatar_puts_raw_bytes_with_worker_headers(self):
+        avatar = b"\x89PNG\r\n\x1a\nsynthetic-png"
+        profile = {
+            "conversationExternalId": "group-1",
+            "displayName": "Group",
+            "avatarBase64": base64.b64encode(avatar).decode("ascii"),
+        }
+        result, opener = self.request_with([profile])
+        request = opener.requests[0]
+        self.assertEqual(result, 1)
+        self.assertEqual(request.data, avatar)
+        self.assertEqual(request.get_header("Content-type"), "image/png")
+        self.assertEqual(request.get_header("Content-length"), str(len(avatar)))
+        self.assertEqual(request.get_header("X-content-sha256"), hashlib.sha256(avatar).hexdigest())
+
+    def test_missing_and_empty_avatar_keep_metadata_only_put(self):
+        profiles = [
+            {"conversationExternalId": "group-1", "displayName": "Group 1"},
+            {"conversationExternalId": "group-2", "displayName": "Group 2", "avatarBase64": ""},
+        ]
+        result, opener = self.request_with(profiles)
+        self.assertEqual(result, 2)
+        for request in opener.requests:
+            self.assertEqual(request.data, b"")
+            self.assertEqual(request.get_header("Content-length"), "0")
+            self.assertIsNone(request.get_header("Content-type"))
+            self.assertIsNone(request.get_header("X-content-sha256"))
+
+    def test_avatar_base64_is_strict_and_full_batch_is_prevalidated(self):
+        avatar = b"\x89PNG\r\n\x1a\nsynthetic-png"
+        profiles = [
+            {"conversationExternalId": "group-1", "displayName": "Group 1",
+             "avatarBase64": base64.b64encode(avatar).decode("ascii")},
+            {"conversationExternalId": "group-2", "displayName": "Group 2", "avatarBase64": "%%%="},
+        ]
+        with patch.object(profiles_module.urllib.request, "build_opener") as build:
+            with self.assertRaisesRegex(profiles_module.ProfileSyncError, "invalid_profile_avatar"):
+                profiles_module.sync_profiles(FakeRelay(), profiles)
+            build.assert_not_called()
+
+    def test_avatar_per_image_and_batch_decoded_caps_are_enforced_before_network(self):
+        def png(size):
+            return b"\x89PNG\r\n\x1a\n" + b"x" * (size - 8)
+
+        oversized_image = {
+            "conversationExternalId": "group-1", "displayName": "Group",
+            "avatarBase64": base64.b64encode(png(profiles_module.MAX_AVATAR_BYTES + 1)).decode("ascii"),
+        }
+        over_batch = [
+            {"conversationExternalId": "group-1", "displayName": "Group 1",
+             "avatarBase64": base64.b64encode(png(64 * 1024)).decode("ascii")},
+            {"conversationExternalId": "group-2", "displayName": "Group 2",
+             "avatarBase64": base64.b64encode(png(64 * 1024 + 1)).decode("ascii")},
+        ]
+        for profiles in ([oversized_image], over_batch):
+            with self.subTest(count=len(profiles)), patch.object(
+                profiles_module.urllib.request, "build_opener"
+            ) as build:
+                with self.assertRaisesRegex(profiles_module.ProfileSyncError, "profile_avatar_too_large"):
+                    profiles_module.sync_profiles(FakeRelay(), profiles)
+                build.assert_not_called()
+
+    def test_invalid_avatar_magic_is_rejected_before_network(self):
+        profile = {
+            "conversationExternalId": "group-1", "displayName": "Group",
+            "avatarBase64": base64.b64encode(b"not-an-image").decode("ascii"),
+        }
+        with patch.object(profiles_module.urllib.request, "build_opener") as build:
+            with self.assertRaisesRegex(profiles_module.ProfileSyncError, "invalid_profile_avatar"):
+                profiles_module.sync_profiles(FakeRelay(), [profile])
+            build.assert_not_called()
 
 
 if __name__ == "__main__":
