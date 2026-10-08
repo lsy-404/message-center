@@ -756,7 +756,7 @@ main(int argc, char **argv)
   if (helper.hard_timeout)
     output[@"cleanupIncomplete"] = @YES;
   if (helper.binary_output.enabled) {
-    output[@"binaryWritten"] = @(success && helper.binary_written);
+    output[@"binaryWritten"] = (success && helper.binary_written) ? @YES : @NO;
     if (success)
       output[@"binaryByteCount"] = @(helper.binary_byte_count);
   }
