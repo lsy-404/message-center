@@ -1,5 +1,5 @@
 # Message Center
-> 最后更新：2026-10-07
+> 最后更新：2026-10-08
 
 ## 项目目标
 设备主动通过 HTTPS 连接云端统一消息中心，日常运行不依赖个人电脑、USB 或同一局域网。旧 iPad 的采集需限制并发、内存与扫描工作量，并支持断线恢复。
@@ -17,7 +17,14 @@ Cloudflare Worker、D1、R2；Vue 前端与 @platform-kit/fluent；通用连接�
 见 [local.instructions.md](local.instructions.md)。
 
 ## 当前验证状态
-- 收件箱渠道导航与实例管理入口已合并；图片正文只在对应图片成功显示后按数量移除独立 `[图片]` 行。
-- 会话头像与独立发言人头像 API/UI 已集成并部署验证；会话目录查询上限为 512，界面每页渲染 100 项并支持全量搜索，设备游标上限为 256。消息详情查询上限仍为 300。
-- QQ 与微信均已完成真实接收采集；微信维持 receive-only。发送 UI 曾由用户打开到精确目标，授权测试文本发送一次并经后续截图确认；这不代表普通云命令发送路径已完整验证。
-- 原生 SplitView 下的一次短时验证中，30.86 秒内 QQ 扫描 20 条消息、3 个发言人头像和 1 个会话头像；微信扫描 3 条消息、1 个发言人头像和 1 个会话头像。两端当时均 online、outbox 为 0，未发生 cloud command dispatch，receiver 正常恢复。该结果仅证明短时功能路径。
+- Worker 已部署集成版本 `1c72da3a-1bc7-426f-a79d-d1f4f078aa50`。收件箱导航、图片占位处理、会话与发言人头像、发送状态及有界列表已集成；Fluent 本地化、类型检查、构建与 Playwright 验证通过。
+- 公开自动化验证记录：Node 测试 19 项与 Worker schema 检查通过；集成根测试 102 项通过。另有一轮公开根测试 71 项通过、1 项平台专属跳过。
+- 设备 runtime 的独立心跳退避及本轮 outbox ACK 在线进展已安装；ACK 只影响 heartbeat 展示，命令轮询仍要求 source health 与扫描新鲜度。
+- 有界 helper 二进制输出的严格布尔回执修正已安装，图片导出通过尺寸与完整性校验；不在公开项目记录中描述私有适配器实现。
+- QQ 与微信接收和图片采集均已验证。微信发送已启用；一条早先遗留待发消息及原载荷保留为人工复核，API 查询确认未执行。唯一一次授权目标发送在 Worker 显示 delivered，随后原生最新页只读回读确认新的本人文本记录，接收器已恢复。
+- QQ 授权 UI 操作有截图确认；普通 QQ 云命令发送路径仍未完整验证，不得据此重发或宣称已验证。
+- 最近受控入站采集持续 44.24 秒：QQ/微信均 healthy，outbox 为 0、command ledger 为 1，期间没有新 command dispatch，接收器恢复。两端发言人头像 GET 返回 200，MIME、预算及 SHA 校验通过。
+- 最近收件箱目录快照为 313 个会话、165 个群聊、52 个头像；头像覆盖仍不完整。
+- 原生 SplitView 的复核中，两侧 application state 为 0、视口各为 507×768。只读 daemon 快照 outbox 与错误日志均为 0，RSS 为 18,672 KiB，进程限制为 64 MiB。CPU 样本来自重启扫描阶段，不代表稳定负载。
+- 普通 daemon 后续快照中 QQ/微信均 online；receiver 无需手动 collect 即完成同步。Windows 旧 relay 任务处于 Disabled 且没有匹配进程，临时 Vite preview 已关闭，daily device-to-cloud 链路不依赖电脑常驻 relay。
+- 所有在线、队列及 SplitView 记录均为受控时间点快照；长期运行和锁屏状态尚未验证。

@@ -4,8 +4,8 @@
 | 编号 | 任务名称 | 任务描述 | 变更动机 | 状态 |
 | :--: | :-- | :-- | :-- | :-- |
 | 001 | [Feature] 独立设备与云端体验 | 恢复设备连接、轻量采集、稳定读写与 Fluent UI | 取消电脑服务依赖并适配旧设备 | 🔄 进行中 |
-| 002 | [Feature] Fluent界面 | Fluent 主题、旧 iPad 视口与有界刷新 | 统一主题并减轻绘制和网络负载 | ✅ 已完成，Safari 实机待验证 |
-| 003 | [Feature] 设备直连 | 有界持久化队列与串行设备运行器 | 消除桌面运行依赖 | 🔄 设备接收已常驻，发送待目标核对 |
+| 002 | [Feature] Fluent界面 | Fluent 主题、旧 iPad 视口与有界刷新 | 统一主题并减轻绘制和网络负载 | ✅ 已完成；本地化、类型检查、构建与 Playwright 通过，长期/锁屏行为待验证 |
+| 003 | [Feature] 设备直连 | 有界持久化队列与串行设备运行器 | 消除桌面运行依赖 | 🔄 双端接收已验证；微信授权发送一次端到端验证通过；QQ普通云命令仍待验证 |
 | 004 | [BugFix] HTTP 客户端请求头 | 为设备 HTTPS 请求声明产品 UA 与 JSON 接受类型 | Cloudflare 对默认 Python UA 返回 403 | ✅ 已完成 |
 | 005 | [Feature] 设备原生会话 helper | 有界设备注入会话与构建交付 | 消除桌面注入依赖 | ✅ 已完成，实机已验证 |
 | 006 | [Feature] 有界增量游标 | 为源适配器提供按会话冻结 head、向旧分页的通用游标状态机 | 防止最新页快照跨过未读历史 | ✅ 已完成，设备真实分页已验证 |
@@ -13,12 +13,12 @@
 | 008 | [BugFix] 消息路由与只读接收 | 普通群聊文本走备份接口，支持禁用未验证的发送命令 | 防止已抑制消息被错误确认并允许安全接收部署 | ✅ 已完成 |
 | 009 | [Feature] 有限内存启动器 | 为接收进程自身设置有限内存预算 | 解决默认6 MB导致的启动失败 | ✅ 已完成，实机启动与扫描已验证 |
 | 010 | [BugFix] 完成设备采集 | 恢复卡住的源连接并完成当前发现集合增量上传 | 前台保持时仍需确认全部会话与队列收尾 | ✅ 已完成，17会话无未完成增量 |
-| 011 | [BugFix] 内容显示与双端接入 | 修复群聊、乱码、图片，接入微信及发送 | 完成设备与云端的真实使用路径 | 🔄 QQ/微信接收与图片已实测；授权 UI 单次发送已观察，云端命令发送仍未完整验证 |
+| 011 | [BugFix] 内容显示与双端接入 | 修复群聊、乱码、图片，接入微信及发送 | 完成设备与云端的真实使用路径 | 🔄 双端接收与图片已验证；微信授权云命令一次端到端验证通过；QQ普通云命令未验证 |
 | 012 | [BugFix] 群聊与媒体显示 | 修复大群详情 SQL 变量超限并支持图片内联呈现 | 用户反馈云 UI 中群聊未加载、文本乱码、图片缺失 | ✅ 群聊 GET 与图片响应已修复；源端乱码和缺图另有根因 |
 | 013 | [Feature] 有界图片接收 | 设备侧流式暂存并上传图片，云端绑定至普通与群后台消息 | 在旧 iPad 上支持图片而不把整图载入内存 | ✅ 已完成 |
 | 014 | [Feature] 设备会话资料刷新 | 新增有界 HTTPS 客户端同步会话名称与概要元数据 | 修正云端旧标题并持续同步会话资料 | ✅ 已集成runtime；资料同步实机通过 |
 | 015 | [BugFix] 媒体可靠补录 | 按 connector 隔离暂存文件并支持同消息附件补录 | 避免文件名碰撞与旧文本消息无法补图 | ✅ 已完成 |
-| 016 | [Feature] 设备驱动请求路由 | 将connector kind透传至适配器扫描和已授权发送命令 | 打通QQ/微信私有适配器与直接设备运行时 | ✅ 已集成并通过双端接收验证；云端命令发送仍未完整验证 |
+| 016 | [Feature] 设备驱动请求路由 | 将connector kind透传至适配器扫描和已授权发送命令 | 打通QQ/微信私有适配器与直接设备运行时 | ✅ 已集成并通过双端接收验证；微信授权发送已端到端验证；QQ普通云命令未验证 |
 | 017 | [BugFix] 收件箱导航与图片正文 | 合并渠道与实例入口，并在可显示图片附件存在时隐藏图片占位符 | 避免QQ/微信导航重复和图片重复提示 | ✅ 已完成 |
 | 018 | [Feature] 消息发言人头像 | 在每条消息旁显示发言人头像或首字占位，支持头像资料后到更新 | 用户需要通过头像识别消息发言人 | ✅ 已完成 |
 | 017 | [Feature] 有界会话头像同步 | 在设备会话资料同步中验证并上传小型头像数据 | 让消息中心会话目录显示来源头像，同时限制旧 iPad 内存与网络开销 | ✅ 已集成并部署验证 |
@@ -27,8 +27,10 @@
 | 020 | [BugFix] Adapter operation deadlines | Give scans and sends bounded operation-specific subprocess budgets | Prevent the relay from killing native scans or sends before bounded helper cleanup completes | ✅ Complete; local commit only |
 | 020 | [BugFix] 群聊备份发言人头像 | 群聊文本备份读取接口返回发言人头像路径 | QQ 群聊备份详情缺少已同步的发言人头像 | ✅ 已完成 |
 | 021 | [BugFix] 群备份重复资料刷新 | 对同一群聊消息的安全重放刷新缺失或旧 sender ID | 头像到达晚于消息入库时 inbox JOIN 无法命中 | ✅ 已完成 |
-| 022 | [BugFix] 持续心跳退避 | 将设备心跳与扫描/命令退避隔离，并为心跳网络错误设置有界退避 | connector 级共享退避会在操作失败后抑制心跳并让 lastSeenAt 过期 | ✅ 已完成，本地提交 |
-| 023 | [Feature] Helper 二进制输出 | 为单次 Frida 结果提供有界继承文件描述符输出 | 旧设备无法从运行时直接读取应用容器媒体文件 | ✅ 已完成，本地提交 |
-| 024 | [BugFix] 隔离旧发送命令 | 在 connector 开启 send_text 时隔离原有待发与租约命令 | 防止微信 receive-only 期间遗留的旧命令在启用发送后自动执行 | ✅ 已完成，本地提交 |
-| 025 | [Feature] 显示发送状态 | 在出站消息中显示等待、成功、失败和待确认状态 | 避免把排队或结果不确定的消息误认为已发送 | ✅ 已完成，本地提交 |
-| 024 | [BugFix] Outbox delivery heartbeat progress | Let successful current-pass delivery keep its connector heartbeat online during source backlog catch-up | Source backlog can outlast the scan freshness window despite relay ACK progress | 🔄 进行中 |
+| 022 | [BugFix] 持续心跳退避 | 将设备心跳与扫描/命令退避隔离，并为心跳网络错误设置有界退避 | connector 级共享退避会在操作失败后抑制心跳并让 lastSeenAt 过期 | ✅ 已集成并安装 |
+| 023 | [Feature] Helper 二进制输出 | 为单次 Frida 结果提供有界继承文件描述符输出 | 旧设备无法从运行时直接读取应用容器媒体文件 | ✅ 已部署并通过有界图片导出完整性验证 |
+| 024 | [BugFix] 隔离旧发送命令 | 在 connector 开启 send_text 时隔离原有待发与租约命令 | 防止启用发送时旧命令自动执行 | ✅ 已部署；遗留待发消息保留为人工复核且 API 确认未执行 |
+| 025 | [Feature] 显示发送状态 | 在出站消息中显示等待、成功、失败和待确认状态 | 避免把排队或结果不确定的消息误认为已发送 | ✅ 已部署，Fluent 状态显示验证通过 |
+| 024 | [BugFix] Outbox delivery heartbeat progress | Let successful current-pass delivery keep its connector heartbeat online during source backlog catch-up | Source backlog can outlast the scan freshness window despite relay ACK progress | ✅ 已集成并安装；命令门控仍要求 source health 与扫描新鲜度 |
+
+| 026 | [Chore] Verification status reconciliation | Reconcile public audit summaries with deployed integration and current validation evidence | Remove stale local-only and receive-only status while preserving explicit validation limits | ✅ 已完成 |
