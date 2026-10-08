@@ -469,7 +469,56 @@ async function registerConnector(request, env) {
     throw new Error("invalid_connector_capabilities");
   }
   const stamp = now();
-  await env.DB.prepare(`
+  const registrationStatements = [];
+  if (capabilities.includes("send_text")) {
+    const transitionId = crypto.randomUUID();
+    const pendingReview = JSON.stringify({ error: "capability_enabled_old_command_review",
+      dispatched: false, transitionId });
+    const leasedReview = JSON.stringify({ error: "capability_enabled_old_lease_review",
+      uncertain: true, transitionId });
+    registrationStatements.push(env.DB.prepare(`
+      UPDATE commands SET state = 'manual_review',
+        result_json = CASE state WHEN 'pending' THEN ? ELSE ? END,
+        lease_token = NULL, lease_expires_at = NULL, completed_at = ?
+      WHERE connector_id = ? AND state IN ('pending', 'leased')
+        AND EXISTS (
+          SELECT 1 FROM connector_instances c
+          WHERE c.id = commands.connector_id
+            AND NOT EXISTS (
+              SELECT 1 FROM json_each(c.capabilities_json) WHERE value = 'send_text'
+            )
+        )
+    `).bind(pendingReview, leasedReview, stamp, id));
+    registrationStatements.push(env.DB.prepare(`
+      UPDATE messages SET delivery_state = 'manual_review'
+      WHERE direction = 'outbound' AND delivery_state = 'queued'
+        AND id IN (
+          SELECT message_id FROM commands
+          WHERE connector_id = ? AND state = 'manual_review'
+            AND completed_at = ? AND result_json IN (?, ?)
+        )
+    `).bind(id, stamp, pendingReview, leasedReview));
+    registrationStatements.push(env.DB.prepare(`
+      UPDATE attachments SET state = 'manual_review'
+      WHERE state = 'queued' AND message_id IN (
+        SELECT message_id FROM commands
+        WHERE connector_id = ? AND state = 'manual_review'
+          AND completed_at = ? AND result_json IN (?, ?)
+      )
+    `).bind(id, stamp, pendingReview, leasedReview));
+    registrationStatements.push(env.DB.prepare(`
+      INSERT INTO audit_log (occurred_at, actor, action, target_id, details_json)
+      SELECT ?, ?, 'connector_send_commands_manual_review', ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM commands
+        WHERE connector_id = ? AND state = 'manual_review'
+          AND completed_at = ? AND result_json IN (?, ?)
+      )
+    `).bind(stamp, `connector:${id}`, id,
+      JSON.stringify({ reason: "send_capability_enabled" }),
+      id, stamp, pendingReview, leasedReview));
+  }
+  registrationStatements.push(env.DB.prepare(`
     INSERT INTO connector_instances (
       id, kind, channel_label, account_label, display_name, note, mode, state, capabilities_json,
       configuration_json, last_seen_at, created_at, updated_at
@@ -480,7 +529,8 @@ async function registerConnector(request, env) {
   `).bind(
     id, kind, channelLabel.slice(0, 80), accountLabel.slice(0, 200), displayName.slice(0, 200), note.slice(0, 1000), mode,
     JSON.stringify(capabilities), stamp, stamp,
-  ).run();
+  ));
+  await env.DB.batch(registrationStatements);
   await audit(env, `connector:${id}`, "connector_registered", id, { kind, accountLabel, capabilities });
   return json({ ok: true, connectorId: id, capabilities }, 201);
 }
