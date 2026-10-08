@@ -563,8 +563,8 @@ class Relay:
                     pass
             self.succeeded(connector_id)
             self.flush_next_index = (index + 1) % count
-            return True
-        return False
+            return connector_id
+        return None
 
     def complete(self, command, result):
         self.http_call("POST", "/api/connectors/commands/" + urllib.parse.quote(command["id"], safe="") + "/complete",
@@ -676,10 +676,13 @@ class Relay:
                 self.failed(connector["id"])
 
     def pass_once(self):
+        delivered_connectors = set()
         for _ in range(MAX_DELIVERIES_PER_PASS):
             try:
-                if not self.flush_one():
+                connector_id = self.flush_one()
+                if not connector_id:
                     break
+                delivered_connectors.add(connector_id)
             except Exception:
                 break
         pending_connectors = {row[0] for row in self.db.execute("SELECT DISTINCT connector_id FROM outbox")}
@@ -700,12 +703,14 @@ class Relay:
                 finally:
                     self.cleanup_unreferenced_media()
             if time.monotonic() >= self.heartbeat_retry_at[connector_id]:
+                source_fresh = (self.health[connector_id] and
+                                time.monotonic() - self.last_scan[connector_id] <=
+                                self.scan_interval[connector_id] + 30)
+                heartbeat_state = "online" if connector_id in delivered_connectors or source_fresh else "offline"
                 try:
                     self.http_call("POST", "/api/connectors/heartbeat", {
                         "connectorId": self.connector,
-                        "state": "online" if self.health[connector_id] and
-                        time.monotonic() - self.last_scan[connector_id] <= self.scan_interval[connector_id] + 30
-                        else "offline"})
+                        "state": heartbeat_state})
                 except Exception:
                     self.heartbeat_failed(connector_id)
                 else:

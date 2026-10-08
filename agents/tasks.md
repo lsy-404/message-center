@@ -31,3 +31,4 @@
 | 023 | [Feature] Helper 二进制输出 | 为单次 Frida 结果提供有界继承文件描述符输出 | 旧设备无法从运行时直接读取应用容器媒体文件 | ✅ 已完成，本地提交 |
 | 024 | [BugFix] 隔离旧发送命令 | 在 connector 开启 send_text 时隔离原有待发与租约命令 | 防止微信 receive-only 期间遗留的旧命令在启用发送后自动执行 | ✅ 已完成，本地提交 |
 | 025 | [Feature] 显示发送状态 | 在出站消息中显示等待、成功、失败和待确认状态 | 避免把排队或结果不确定的消息误认为已发送 | ✅ 已完成，本地提交 |
+| 024 | [BugFix] Outbox delivery heartbeat progress | Let successful current-pass delivery keep its connector heartbeat online during source backlog catch-up | Source backlog can outlast the scan freshness window despite relay ACK progress | 🔄 进行中 |
