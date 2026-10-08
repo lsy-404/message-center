@@ -190,6 +190,19 @@ CREATE INDEX IF NOT EXISTS idx_conversation_profiles_updated
 CREATE INDEX IF NOT EXISTS idx_conversation_profiles_native_order
   ON conversation_profiles(connector_id, is_pinned, placement);
 
+CREATE TABLE IF NOT EXISTS sender_avatars (
+  connector_id TEXT NOT NULL,
+  sender_id TEXT NOT NULL,
+  object_key TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL CHECK(size_bytes > 0 AND size_bytes <= 131072),
+  sha256 TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (connector_id, sender_id),
+  FOREIGN KEY (connector_id) REFERENCES connector_instances(id)
+);
+CREATE INDEX IF NOT EXISTS idx_sender_avatars_object_key ON sender_avatars(object_key);
+
 CREATE TABLE IF NOT EXISTS maintenance_state (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL,

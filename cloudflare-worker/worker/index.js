@@ -20,6 +20,7 @@ const SESSION_SECONDS = 12 * 60 * 60;
 const LOGIN_CSRF_SECONDS = 10 * 60;
 const STAGED_FILE_SECONDS = 24 * 60 * 60;
 const UNBOUND_INBOUND_FILE_SECONDS = 48 * 60 * 60;
+const MAX_SENDER_AVATAR_BYTES = 128 * 1024;
 const ENCODER = new TextEncoder();
 
 function json(value, status = 200, headers = {}) {
@@ -1050,6 +1051,136 @@ async function downloadConversationAvatar(env, connectorId, conversationExternal
   return new Response(object.body, { headers });
 }
 
+async function upsertSenderAvatar(request, env, ctx, senderId) {
+  const connectorId = request.headers.get("x-connector-id") || "";
+  if (!await hasConnectorRole(request, env, connectorId)) return fail("unauthorized", 401);
+  if (!validShort(senderId)) throw new Error("invalid_sender_id");
+  const connector = await connectorRow(env, connectorId);
+  if (!connector) throw new Error("connector_not_found");
+
+  const announced = Number(request.headers.get("content-length") || 0);
+  if (!Number.isInteger(announced) || announced < 1 || announced > MAX_SENDER_AVATAR_BYTES) {
+    throw new Error("invalid_sender_avatar_size");
+  }
+  const buffer = await request.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  if (bytes.length !== announced || bytes.length > MAX_SENDER_AVATAR_BYTES) {
+    throw new Error("invalid_sender_avatar_size");
+  }
+  const mimeType = imageMime(bytes);
+  const expectedSha256 = request.headers.get("x-content-sha256") || "";
+  const sha256 = await sha256Hex(buffer);
+  if (!mimeType || !/^[a-f0-9]{64}$/.test(expectedSha256) || expectedSha256 !== sha256) {
+    throw new Error("invalid_sender_avatar");
+  }
+
+  const previous = await env.DB.prepare(`
+    SELECT object_key, mime_type, size_bytes, sha256
+    FROM sender_avatars WHERE connector_id = ? AND sender_id = ?
+  `).bind(connectorId, senderId).first();
+  let objectKey = "";
+  let uploadedKey = null;
+  if (previous?.sha256 === sha256 && Number(previous.size_bytes) === bytes.length) {
+    objectKey = previous.object_key;
+    if (!await env.FILES.head(objectKey)) {
+      await env.FILES.put(objectKey, buffer, {
+          httpMetadata: { contentType: mimeType }, customMetadata: { sha256 }, sha256,
+      });
+    }
+  } else {
+    const matching = await env.DB.prepare(`
+      SELECT object_key FROM sender_avatars
+      WHERE connector_id = ? AND sha256 = ? AND size_bytes = ? LIMIT 1
+    `).bind(connectorId, sha256, bytes.length).first();
+    if (matching?.object_key) {
+      objectKey = matching.object_key;
+      if (!await env.FILES.head(objectKey)) {
+        await env.FILES.put(objectKey, buffer, {
+          httpMetadata: { contentType: mimeType }, customMetadata: { sha256 }, sha256,
+        });
+      }
+    } else {
+      objectKey = `sender-avatars/${connectorId}/${crypto.randomUUID()}`;
+      await env.FILES.put(objectKey, buffer, {
+        httpMetadata: { contentType: mimeType }, customMetadata: { sha256 }, sha256,
+      });
+      uploadedKey = objectKey;
+    }
+  }
+
+  try {
+    await env.DB.prepare(`
+      INSERT INTO sender_avatars (
+        connector_id, sender_id, object_key, mime_type, size_bytes, sha256, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(connector_id, sender_id) DO UPDATE SET
+        object_key = excluded.object_key,
+        mime_type = excluded.mime_type,
+        size_bytes = excluded.size_bytes,
+        sha256 = excluded.sha256,
+        updated_at = excluded.updated_at
+    `).bind(connectorId, senderId, objectKey, mimeType, bytes.length, sha256, now()).run();
+  } catch (error) {
+    let committed;
+    let verificationSucceeded = false;
+    try {
+      committed = await env.DB.prepare(`
+        SELECT object_key FROM sender_avatars WHERE connector_id = ? AND sender_id = ?
+      `).bind(connectorId, senderId).first();
+      verificationSucceeded = true;
+    } catch { /* Preserve an ambiguous R2 object for the orphan sweep. */ }
+    if (!uploadedKey || committed?.object_key !== uploadedKey) {
+      if (uploadedKey && verificationSucceeded) {
+        const reference = await env.DB.prepare(
+          "SELECT 1 AS present FROM sender_avatars WHERE object_key = ? LIMIT 1",
+        ).bind(uploadedKey).first().catch(() => ({ present: true }));
+        if (!reference) await env.FILES.delete(uploadedKey).catch(() => {});
+      }
+      throw error;
+    }
+  }
+
+  if (previous?.object_key && previous.object_key !== objectKey) {
+    const oldKey = previous.object_key;
+    ctx.waitUntil((async () => {
+      const referenced = await env.DB.prepare(
+        "SELECT 1 AS present FROM sender_avatars WHERE object_key = ? LIMIT 1",
+      ).bind(oldKey).first();
+      if (!referenced) await env.FILES.delete(oldKey);
+    })().catch((error) => {
+      console.error(JSON.stringify({ event: "superseded_sender_avatar_cleanup_failed",
+        message: error instanceof Error ? error.message : String(error) }));
+    }));
+  }
+  return json({ ok: true, senderId, mimeType, sizeBytes: bytes.length, sha256 }, 201);
+}
+
+async function downloadSenderAvatar(request, env, connectorId, senderId) {
+  if (!validId(connectorId) || !validShort(senderId)) return fail("sender_avatar_not_found", 404);
+  const row = await env.DB.prepare(`
+    SELECT object_key, mime_type, size_bytes, sha256
+    FROM sender_avatars WHERE connector_id = ? AND sender_id = ?
+  `).bind(connectorId, senderId).first();
+  if (!row?.object_key) return fail("sender_avatar_not_found", 404);
+
+  const etag = `"${row.sha256}"`;
+  const headers = new Headers({
+    "content-type": row.mime_type,
+    "content-length": String(row.size_bytes),
+    "cache-control": "private, max-age=300",
+    "vary": "Cookie, Authorization",
+    "etag": etag,
+    "x-content-type-options": "nosniff",
+  });
+  const validators = (request.headers.get("if-none-match") || "").split(",").map((value) => value.trim());
+  if (validators.includes("*") || validators.includes(etag) || validators.includes(`W/${etag}`)) {
+    return new Response(null, { status: 304, headers });
+  }
+  const object = await env.FILES.get(row.object_key);
+  if (!object) return fail("sender_avatar_not_found", 404);
+  return new Response(object.body, { headers });
+}
+
 export function semanticCardBody(value) {
   return /^\[(?:转账|拍一拍|卡片)\](?:\s|$)/u.test(String(value || ""));
 }
@@ -1772,10 +1903,12 @@ async function readInbox(env, selectedConversationId) {
   let messages = [];
   if (selected) {
     const messageResult = await env.DB.prepare(`
-      SELECT * FROM (
+      SELECT m.*, a.sha256 AS sender_avatar_sha256 FROM (
         SELECT * FROM messages WHERE conversation_id = ?
         ORDER BY occurred_at DESC, created_at DESC LIMIT 300
-      ) ORDER BY occurred_at ASC, created_at ASC
+      ) m LEFT JOIN sender_avatars a
+        ON a.connector_id = m.connector_id AND a.sender_id = m.sender_id
+      ORDER BY m.occurred_at ASC, m.created_at ASC
     `).bind(selected).all();
     const ids = (messageResult.results || []).map((row) => row.id);
     const attachmentMap = new Map();
@@ -1799,6 +1932,8 @@ async function readInbox(env, selectedConversationId) {
     messages = (messageResult.results || []).map((row) => ({
       id: row.id, conversationId: row.conversation_id, direction: row.direction,
       senderName: row.sender_name, body: row.body, contentType: row.content_type,
+      senderAvatarPath: row.sender_avatar_sha256
+        ? `/api/sender-avatars/${row.connector_id}/${row.sender_id}?v=${encodeURIComponent(row.sender_avatar_sha256)}` : null,
       deliveryState: row.delivery_state, queueClass: row.queue_class, occurredAt: row.occurred_at,
       attachments: attachmentMap.get(row.id) || [],
     }));
@@ -2024,6 +2159,14 @@ async function cleanupOrphanConversationAvatars(env) {
   `).all();
   const retained = new Set((references.results || []).map((row) => row.avatar_object_key));
   await cleanupOrphanObjectPrefix(env, "conversation-avatars/", retained, "orphan_avatar_cleanup_failed");
+}
+
+async function cleanupOrphanSenderAvatars(env) {
+  const references = await env.DB.prepare(`
+    SELECT object_key FROM sender_avatars
+  `).all();
+  const retained = new Set((references.results || []).map((row) => row.object_key));
+  await cleanupOrphanObjectPrefix(env, "sender-avatars/", retained, "orphan_sender_avatar_cleanup_failed");
 }
 
 async function cleanupOrphanAttachmentObjects(env) {
@@ -2888,6 +3031,7 @@ export default {
       cleanupStagedFiles(env),
       cleanupUnboundInboundFiles(env),
       cleanupOrphanConversationAvatars(env),
+      cleanupOrphanSenderAvatars(env),
       cleanupOrphanAttachmentObjects(env),
     ]));
   },
@@ -2930,6 +3074,12 @@ export default {
       if (connectorProfile && request.method === "PUT") {
         return await upsertConversationProfile(request, env, ctx, connectorProfile[1]);
       }
+      const connectorSenderAvatar = url.pathname.match(
+        /^\/api\/connectors\/sender-avatars\/([a-zA-Z0-9._:-]+)$/,
+      );
+      if (connectorSenderAvatar && request.method === "PUT") {
+        return await upsertSenderAvatar(request, env, ctx, connectorSenderAvatar[1]);
+      }
       const completion = url.pathname.match(/^\/api\/connectors\/commands\/([a-zA-Z0-9._:-]+)\/complete$/);
       if (completion && request.method === "POST") return await completeCommand(request, env, completion[1]);
       const fileDownload = url.pathname.match(/^\/api\/files\/([a-zA-Z0-9._:-]+)$/);
@@ -2951,6 +3101,12 @@ export default {
       );
       if (avatarDownload && request.method === "GET") {
         return await downloadConversationAvatar(env, avatarDownload[1], avatarDownload[2]);
+      }
+      const senderAvatarDownload = url.pathname.match(
+        /^\/api\/sender-avatars\/([a-zA-Z0-9._:-]+)\/([a-zA-Z0-9._:-]+)$/,
+      );
+      if (senderAvatarDownload && request.method === "GET") {
+        return await downloadSenderAvatar(request, env, senderAvatarDownload[1], senderAvatarDownload[2]);
       }
       if (url.pathname === "/api/inbox" && request.method === "GET") {
         return json({ ok: true, ...(await readInbox(env, url.searchParams.get("conversationId"))) });

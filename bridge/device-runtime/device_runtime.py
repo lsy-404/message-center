@@ -17,7 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from conversation_profiles import sync_profiles
+from conversation_profiles import sync_profiles, sync_sender_avatars
 
 if os.name == "posix":
     import fcntl
@@ -377,6 +377,7 @@ class Relay:
         if len(candidate.encode("utf-8")) > 65536:
             raise RuntimeError("cursor_too_large")
         sync_profiles(self, result.get("conversationProfiles", []))
+        sync_sender_avatars(self, result.get("senderAvatars", []))
         self.db.execute("BEGIN IMMEDIATE")
         try:
             current = self.count_bytes(self.connector)
