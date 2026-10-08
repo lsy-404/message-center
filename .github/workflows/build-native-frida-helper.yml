@@ -8,6 +8,7 @@ on:
       - "bridge/device/native-runtime-launcher/**"
       - ".github/workflows/build-native-frida-helper.yml"
       - "test/device-native-runtime-launcher.test.c"
+      - "test/device-native-helper-binary-output.test.c"
 
 permissions:
   contents: read
@@ -55,6 +56,16 @@ jobs:
             -o "$RUNNER_TEMP/device-native-runtime-launcher-test"
           "$RUNNER_TEMP/device-native-runtime-launcher-test"
 
+      - name: Test bounded binary output descriptor contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang -std=c11 -Wall -Wextra -Werror \
+            test/device-native-helper-binary-output.test.c \
+            bridge/device/native-frida-helper/binary-output.c \
+            -o "$RUNNER_TEMP/device-native-helper-binary-output-test"
+          "$RUNNER_TEMP/device-native-helper-binary-output-test"
+
       - name: Build iOS 15+ arm64 helper
         shell: bash
         run: |
@@ -69,9 +80,14 @@ jobs:
             -o "$out/main.o"
           xcrun --sdk iphoneos clang \
             -arch arm64 -miphoneos-version-min=15.0 -isysroot "$sdk" \
-            "$out/main.o" "$FRIDA_DEVKIT/libfrida-core.a" \
+            -std=c11 -Wall -Wextra -Werror \
+            -c bridge/device/native-frida-helper/binary-output.c \
+            -o "$out/binary-output.o"
+          xcrun --sdk iphoneos clang \
+            -arch arm64 -miphoneos-version-min=15.0 -isysroot "$sdk" \
+            "$out/main.o" "$out/binary-output.o" "$FRIDA_DEVKIT/libfrida-core.a" \
             -lbsm -ldl -lm -lresolv \
-            -Wl,-framework,Foundation,-framework,CoreGraphics,-framework,UIKit \
+            -Wl,-framework,Foundation,-framework,CoreFoundation,-framework,CoreGraphics,-framework,UIKit \
             -o "$out/native-frida-helper"
           xcrun --sdk iphoneos clang \
             -arch arm64 -miphoneos-version-min=15.0 -isysroot "$sdk" \
@@ -131,6 +147,8 @@ jobs:
           otool -l "$out/native-frida-helper" | grep -A5 -m1 LC_BUILD_VERSION
           otool -l "$out/native-runtime-launcher" | grep -A5 -m1 LC_BUILD_VERSION
           cp bridge/device/native-frida-helper/main.m "$out/main.m"
+          cp bridge/device/native-frida-helper/binary-output.c "$out/binary-output.c"
+          cp bridge/device/native-frida-helper/binary-output.h "$out/binary-output.h"
           cp bridge/device/native-frida-helper/README.md "$out/README.md"
           cp bridge/device/native-runtime-launcher/main.c "$out/native-runtime-launcher.c"
           cp bridge/device/native-runtime-launcher/README.md "$out/native-runtime-launcher-README.md"
@@ -138,7 +156,7 @@ jobs:
           printf '%s\n' \
             "Frida 16.3.3 iOS arm64 devkit SHA-256: C31AA39618A6996BF43A472F2F48E3E4C2CC72EEE101A1ED6820192CBF58BDEC" \
             "Frida source tag: 16.3.3" > "$out/BUILD-PROVENANCE.txt"
-          (cd "$out" && shasum --algorithm 256 native-frida-helper main.o main.m README.md native-runtime-launcher native-runtime-launcher.c native-runtime-launcher-README.md FRIDA-COPYING BUILD-PROVENANCE.txt > SHA256SUMS.txt)
+          (cd "$out" && shasum --algorithm 256 native-frida-helper main.o binary-output.o main.m binary-output.c binary-output.h README.md native-runtime-launcher native-runtime-launcher.c native-runtime-launcher-README.md FRIDA-COPYING BUILD-PROVENANCE.txt > SHA256SUMS.txt)
 
       - name: Upload build artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

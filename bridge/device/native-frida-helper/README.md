@@ -17,6 +17,16 @@ cat authorized-script.js | native-frida-helper --pid 1234 --stdin
 
 The script must send one JSON-serializable result with Frida's `send(value)`. The helper treats the first `send` as the completed result and returns one JSON object on stdout. It does not expose script text, Frida log messages, or script error details. Failures identify a stable stage and code. `dispatch` is `not_started` only when script loading has not begun; after loading begins without a returned result it is `unknown`.
 
+For one bounded binary result, pass both `--binary-output-fd <fd>` and `--max-binary-bytes <bytes>`. The inherited descriptor must be greater than 2 and refer to an empty regular file opened for writing at offset zero. The maximum is from 1 byte through 50 MiB. The script sends one JSON payload with `ok: true` and an integer `byteCount`, plus the raw bytes as Frida's second `send` argument:
+
+```javascript
+send({ ok: true, byteCount: imageBytes.byteLength }, imageBytes);
+```
+
+`imageBytes` must be an `ArrayBuffer`.
+
+The declared count must match the non-empty binary attachment. With binary output enabled, a send without bytes, an invalid count, a second observed send, or a failed write fails closed; the helper truncates the descriptor on failure and never writes the image bytes to stdout. Without both flags, a Frida message carrying binary data is rejected. A successful response retains the payload at `result` and adds `binaryWritten: true` and `binaryByteCount`; callers must also verify the descriptor size against both counts before accepting the file.
+
 ## Device installation
 
 Install the executable in the jailbreak's program directory, not under a user library or application-data directory:
