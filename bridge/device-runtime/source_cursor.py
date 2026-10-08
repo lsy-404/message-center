@@ -4,7 +4,7 @@ import copy
 import json
 
 
-MAX_CONVERSATIONS = 200
+MAX_CONVERSATIONS = 256
 MAX_SOURCE_ID_LENGTH = 256
 MAX_CURSOR_BYTES = 65_536
 
@@ -20,6 +20,9 @@ def _conversation_id(value):
 
 
 def _check_size(cursor):
+    conversations = cursor.get("conversations") if isinstance(cursor, dict) else None
+    if not isinstance(conversations, dict) or len(conversations) > MAX_CONVERSATIONS:
+        raise SourceCursorError("too_many_conversations")
     try:
         size = len(json.dumps(cursor, ensure_ascii=False, separators=(",", ":"),
                               allow_nan=False).encode("utf-8"))

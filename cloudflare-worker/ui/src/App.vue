@@ -1,7 +1,15 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
-import { FluentButton, FluentSwitch, FluentTheme } from '@platform-kit/fluent/vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { FluentButton, FluentField, FluentSwitch, FluentTheme } from '@platform-kit/fluent/vue'
 import { createInboxReadGate, createInboxRefreshLoop } from './inbox-refresh.mjs'
+import {
+  CONVERSATION_PAGE_SIZE,
+  conversationPageCount,
+  filterConversations,
+  nextConversationPage,
+  pageConversations,
+  previousConversationPage,
+} from './conversation-list.mjs'
 
 type LayoutAcknowledgement = {
   enabled: boolean
@@ -104,6 +112,9 @@ const snapshot = ref<Snapshot>(emptySnapshot())
 const selectedId = ref('')
 const activeFilter = ref('all')
 const activeConnectorId = ref('')
+const conversationSearch = ref('')
+const conversationPage = ref(0)
+const conversationListElement = ref<HTMLElement | null>(null)
 const showInstances = ref(false)
 const mobileThread = ref(false)
 const loading = ref(true)
@@ -149,15 +160,25 @@ const filters = computed(() => {
   ]
 })
 
-const filteredConversations = computed(() => {
-  return snapshot.value.conversations.filter((item) => {
-    if (activeConnectorId.value && item.connectorId !== activeConnectorId.value) return false
-    if (activeFilter.value === 'all') return true
-    return channelLabel(item) === activeFilter.value.slice('channel:'.length)
-  })
-})
-
-const conversationRows = computed<ConversationListItem[]>(() => filteredConversations.value.map((conversation) => ({
+const filteredConversations = computed(() => filterConversations(snapshot.value.conversations, {
+  connectorId: activeConnectorId.value,
+  channelLabel: activeFilter.value === 'all' ? '' : activeFilter.value.slice('channel:'.length),
+  query: conversationSearch.value,
+  getChannelLabel: channelLabel,
+}))
+const visibleConversations = computed(() => pageConversations(
+  filteredConversations.value,
+  conversationPage.value,
+  CONVERSATION_PAGE_SIZE,
+))
+const totalConversationPages = computed(() => conversationPageCount(filteredConversations.value.length))
+const conversationRangeStart = computed(() => filteredConversations.value.length
+  ? conversationPage.value * CONVERSATION_PAGE_SIZE + 1 : 0)
+const conversationRangeEnd = computed(() => Math.min(
+  (conversationPage.value + 1) * CONVERSATION_PAGE_SIZE,
+  filteredConversations.value.length,
+))
+const conversationRows = computed<ConversationListItem[]>(() => visibleConversations.value.map((conversation) => ({
   id: conversation.id,
   title: conversation.title,
   avatarLabel: conversation.avatarLabel,
@@ -168,6 +189,13 @@ const conversationRows = computed<ConversationListItem[]>(() => filteredConversa
   placement: conversation.placement,
   pinned: conversation.pinned,
 })))
+
+watch([activeFilter, activeConnectorId, conversationSearch], async () => {
+  conversationPage.value = 0
+  await nextTick()
+  conversationListElement.value?.scrollTo(0, 0)
+})
+
 const hasKnownConversationActivity = computed(() => Boolean(
   selectedConversation.value?.lastMessageAt || selectedConversation.value?.lastMessagePreview?.trim(),
 ))
@@ -595,6 +623,14 @@ async function selectConversation(conversation: Conversation, openMobileThread =
   }
 }
 
+function showNextConversationPage() {
+  conversationPage.value = nextConversationPage(conversationPage.value, filteredConversations.value.length)
+}
+
+function showPreviousConversationPage() {
+  conversationPage.value = previousConversationPage(conversationPage.value)
+}
+
 function selectConversationById(conversationId: string) {
   const conversation = snapshot.value.conversations.find((item) => item.id === conversationId)
   if (conversation) void selectConversation(conversation)
@@ -957,7 +993,20 @@ onUnmounted(() => {
         <FluentButton class="quiet-button refresh-button" type="button" aria-label="刷新" title="刷新" @click="load(selectedId)">↻</FluentButton>
       </header>
 
-      <div class="conversation-list">
+      <div ref="conversationListElement" class="conversation-list">
+        <div class="conversation-list-tools">
+          <div class="conversation-search">
+            <FluentField
+              v-model="conversationSearch"
+              label="搜索会话"
+              type="search"
+              placeholder="名称或最近消息"
+            />
+          </div>
+          <span class="conversation-list-count" aria-live="polite">
+            {{ conversationRows.length }} / {{ filteredConversations.length }}
+          </span>
+        </div>
         <button
           v-for="conversation in conversationRows"
           :key="conversation.id"
@@ -1003,9 +1052,18 @@ onUnmounted(() => {
           <span v-if="conversation.unreadCount" class="unread-count">{{ conversation.unreadCount }}</span>
         </button>
 
+        <div v-if="totalConversationPages > 1" class="conversation-pager">
+          <FluentButton type="button" :disabled="conversationPage === 0" @click="showPreviousConversationPage">上一页</FluentButton>
+          <span>{{ conversationRangeStart }}–{{ conversationRangeEnd }} / {{ filteredConversations.length }}</span>
+          <FluentButton
+            type="button"
+            :disabled="conversationPage >= totalConversationPages - 1"
+            @click="showNextConversationPage"
+          >下一页</FluentButton>
+        </div>
         <div v-if="!filteredConversations.length && !loading" class="empty-state">
           <span class="empty-glyph">□</span>
-          <p>暂无会话</p>
+          <p>{{ conversationSearch.trim() ? '没有匹配的会话' : '暂无会话' }}</p>
         </div>
         <div v-if="loading" class="loading-state"><span class="spinner" />正在载入</div>
       </div>

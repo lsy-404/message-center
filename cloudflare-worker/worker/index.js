@@ -1876,7 +1876,7 @@ async function readInbox(env, selectedConversationId) {
     FROM conversations c JOIN connector_instances k ON k.id = c.connector_id
     LEFT JOIN conversation_profiles p ON p.connector_id = c.connector_id
       AND p.conversation_external_id = c.external_id
-    ORDER BY COALESCE(p.is_pinned, 0) DESC, COALESCE(c.last_message_at, c.created_at) DESC LIMIT 300
+    ORDER BY COALESCE(p.is_pinned, 0) DESC, COALESCE(c.last_message_at, c.created_at) DESC LIMIT 512
   `).all();
   const connectors = (connectorsResult.results || []).map((row) => ({
     id: row.id, kind: row.kind, channelLabel: row.channel_label || row.kind,
