@@ -82,6 +82,7 @@ type Message = {
   body: string
   contentType: string
   occurredAt: string
+  deliveryState?: string | null
   attachments: Attachment[]
 }
 
@@ -269,6 +270,16 @@ function initials(value?: string | null) {
 
 function statusLabel(state?: string | null) {
   return state === 'online' ? '在线' : '离线'
+}
+
+function deliveryStateLabel(message: Message) {
+  if (message.direction !== 'outbound') return ''
+  return ({
+    queued: '等待发送',
+    delivered: '已发送',
+    failed: '发送失败',
+    uncertain: '待确认（不可自动重发）',
+  } as Record<string, string>)[message.deliveryState || ''] || ''
 }
 
 function formatListTime(value?: string | null) {
@@ -517,6 +528,7 @@ function sameInbox(left: Snapshot, right: Snapshot) {
     if (a.id !== b.id || a.direction !== b.direction || a.senderName !== b.senderName
         || a.senderAvatarPath !== b.senderAvatarPath
         || a.body !== b.body || a.contentType !== b.contentType || a.occurredAt !== b.occurredAt
+        || a.deliveryState !== b.deliveryState
         || a.attachments.length !== b.attachments.length) return false
     for (let attachmentIndex = 0; attachmentIndex < a.attachments.length; attachmentIndex += 1) {
       const file = a.attachments[attachmentIndex]
@@ -1117,7 +1129,10 @@ onUnmounted(() => {
               >
             </span>
             <div class="message-block">
-              <p class="message-meta">{{ message.senderName }} · {{ formatStamp(message.occurredAt) }}</p>
+              <p class="message-meta">
+                {{ message.senderName }} · {{ formatStamp(message.occurredAt) }}
+                <span v-if="deliveryStateLabel(message)" class="message-delivery-state">{{ deliveryStateLabel(message) }}</span>
+              </p>
               <div class="message-bubble">
                 <p v-if="messageBody(message)">{{ messageBody(message) }}</p>
                 <div v-for="file in message.attachments" :key="file.id" class="attachment">
