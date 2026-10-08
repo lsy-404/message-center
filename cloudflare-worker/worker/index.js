@@ -1567,6 +1567,9 @@ async function ingestGroupTextBackups(request, env) {
         !Number.isFinite(Date.parse(item?.occurredAt)) || attachments.length > 20) {
       throw new Error("invalid_group_text_backup");
     }
+    if (item.senderId != null && item.senderId !== "" && !validShort(item.senderId)) {
+      throw new Error("invalid_group_sender");
+    }
     const attachmentMetadata = [];
     for (const attachment of attachments) {
       const externalId = String(attachment?.externalId || "");
@@ -1629,23 +1632,29 @@ async function ingestGroupTextBackups(request, env) {
     if (stored.conversation_external_id !== expectedConversationExternalId || stored.body !== entry.bodyText) {
       throw new Error("message_external_id_conflict");
     }
+    const senderId = typeof entry.item.senderId === "string" ? entry.item.senderId : "";
+    const senderName = typeof entry.item.senderName === "string" ? entry.item.senderName.trim().slice(0, 200) : "";
+    const hasSenderRefresh = Boolean(senderId && senderName);
     canonical.push({
       item: {
         ...entry.item,
         externalId,
         conversationExternalId: stored.conversation_external_id,
         conversationTitle: stored.conversation_title,
-        senderId: stored.sender_id,
-        senderName: stored.sender_name,
+        senderId: hasSenderRefresh ? senderId : stored.sender_id,
+        senderName: hasSenderRefresh ? senderName : stored.sender_name,
       },
       bodyText: stored.body,
       placement: stored.placement,
       occurredAt: stored.occurred_at,
       attachmentMetadata: entry.attachmentMetadata,
+      senderRefresh: hasSenderRefresh,
     });
   }
   let normalizedInserted = 0;
-  for (const { item, bodyText, placement, occurredAt, attachmentMetadata } of canonical) {
+  for (const { item, bodyText, placement, occurredAt, attachmentMetadata, senderRefresh } of canonical) {
+    const senderId = typeof item.senderId === "string" ? item.senderId : "";
+    const senderName = typeof item.senderName === "string" ? item.senderName.trim().slice(0, 200) : "";
     const conversationExternalId = String(item.conversationExternalId).slice(0, 500);
     let conversation = await env.DB.prepare(`
       SELECT id FROM conversations WHERE connector_id = ? AND external_id = ?
@@ -1744,6 +1753,18 @@ async function ingestGroupTextBackups(request, env) {
           throw new Error("group_backup_attachment_not_linked");
         }
       }
+    }
+    if (senderRefresh && senderId && senderName) {
+      await env.DB.prepare(`
+        UPDATE group_text_backups SET sender_id = ?, sender_name = ?
+        WHERE connector_id = ? AND external_id = ? AND conversation_external_id = ?
+      `).bind(senderId, senderName, connectorId,
+        String(item.externalId).slice(0, 300), conversationExternalId).run();
+      await env.DB.prepare(`
+        UPDATE messages SET sender_id = ?, sender_name = ?
+        WHERE connector_id = ? AND external_id = ? AND conversation_id = ?
+      `).bind(senderId, senderName, connectorId,
+        String(item.externalId).slice(0, 300), conversation.id).run();
     }
     // This is deliberately replayable: if a previous request committed the message but
     // failed while updating its conversation, the retry repairs the derived row.

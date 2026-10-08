@@ -157,6 +157,114 @@ assert.equal(linkedGroup.state, 'received')
 const updatedGroup = database.prepare("SELECT metadata_json, content_type FROM messages WHERE external_id = 'message-group'").get()
 assert.equal(JSON.parse(updatedGroup.metadata_json).attachments[0].externalId, 'file-group')
 assert.equal(updatedGroup.content_type, 'mixed')
+const originalGroupState = database.prepare(`
+  SELECT b.sender_id AS backup_sender_id, b.sender_name AS backup_sender_name,
+    b.body AS backup_body, b.occurred_at AS backup_occurred_at,
+    m.id AS message_id, m.sender_id, m.sender_name, m.body, m.occurred_at,
+    m.metadata_json
+  FROM group_text_backups b JOIN messages m
+    ON m.connector_id = b.connector_id AND m.external_id = b.external_id
+  WHERE b.external_id = 'message-group'
+`).get()
+assert.equal(originalGroupState.backup_sender_id, null)
+assert.equal(originalGroupState.sender_id, null)
+const messageCountBeforeSenderRefresh = database.prepare("SELECT COUNT(*) AS count FROM messages WHERE connector_id = ?").get(connectorId).count
+const refreshedGroup = await postGroupBackup({
+  ...groupBase,
+  senderId: 'member:canonical',
+  senderName: 'Canonical sender',
+  occurredAt: '2026-10-07T12:10:00.000Z',
+  attachments: [groupAttachment],
+})
+assert.equal(refreshedGroup.status, 200)
+const refreshedGroupState = database.prepare(`
+  SELECT b.sender_id AS backup_sender_id, b.sender_name AS backup_sender_name,
+    b.body AS backup_body, b.occurred_at AS backup_occurred_at,
+    m.id AS message_id, m.sender_id, m.sender_name, m.body, m.occurred_at,
+    m.metadata_json
+  FROM group_text_backups b JOIN messages m
+    ON m.connector_id = b.connector_id AND m.external_id = b.external_id
+  WHERE b.external_id = 'message-group'
+`).get()
+assert.equal(refreshedGroupState.backup_sender_id, 'member:canonical')
+assert.equal(refreshedGroupState.sender_id, 'member:canonical')
+assert.equal(refreshedGroupState.backup_sender_name, 'Canonical sender')
+assert.equal(refreshedGroupState.sender_name, 'Canonical sender')
+assert.equal(refreshedGroupState.message_id, originalGroupState.message_id)
+assert.equal(refreshedGroupState.backup_body, originalGroupState.backup_body)
+assert.equal(refreshedGroupState.body, originalGroupState.body)
+assert.equal(refreshedGroupState.backup_occurred_at, originalGroupState.backup_occurred_at)
+assert.equal(refreshedGroupState.occurred_at, originalGroupState.occurred_at)
+assert.equal(JSON.parse(refreshedGroupState.metadata_json).attachments.length, 1)
+assert.equal(database.prepare("SELECT COUNT(*) AS count FROM messages WHERE connector_id = ?").get(connectorId).count,
+  messageCountBeforeSenderRefresh)
+database.prepare(`
+  UPDATE group_text_backups SET sender_id = 'member:legacy-backup', sender_name = 'Legacy backup name'
+  WHERE external_id = 'message-group'
+`).run()
+const noSenderRefresh = await postGroupBackup({
+  ...groupBase,
+  senderName: 'Name without sender ID',
+  occurredAt: '2026-10-07T12:20:00.000Z',
+})
+assert.equal(noSenderRefresh.status, 200)
+const preservedSender = database.prepare(`
+  SELECT b.sender_id AS backup_sender_id, b.sender_name AS backup_sender_name,
+    m.sender_id, m.sender_name
+  FROM group_text_backups b JOIN messages m
+    ON m.connector_id = b.connector_id AND m.external_id = b.external_id
+  WHERE b.external_id = 'message-group'
+`).get()
+assert.equal(preservedSender.backup_sender_id, 'member:legacy-backup')
+assert.equal(preservedSender.sender_id, 'member:canonical')
+assert.equal(preservedSender.backup_sender_name, 'Legacy backup name')
+assert.equal(preservedSender.sender_name, 'Canonical sender')
+
+const aliasBase = {
+  ...groupBase,
+  externalId: 'message-group-alias',
+  senderId: 'member:old-alias',
+  senderName: 'Old sender',
+}
+assert.equal((await postGroupBackup(aliasBase)).status, 200)
+const aliasMessageCountBeforeRefresh = database.prepare(
+  "SELECT COUNT(*) AS count FROM messages WHERE connector_id = ?",
+).get(connectorId).count
+const aliasRefreshed = await postGroupBackup({
+  ...aliasBase,
+  senderId: 'member:canonical-new',
+  senderName: 'New sender',
+})
+assert.equal(aliasRefreshed.status, 200)
+const aliasState = database.prepare(`
+  SELECT b.sender_id AS backup_sender_id, m.sender_id, b.sender_name AS backup_sender_name, m.sender_name
+  FROM group_text_backups b JOIN messages m
+    ON m.connector_id = b.connector_id AND m.external_id = b.external_id
+  WHERE b.external_id = 'message-group-alias'
+`).get()
+assert.equal(aliasState.backup_sender_id, 'member:canonical-new')
+assert.equal(aliasState.sender_id, 'member:canonical-new')
+assert.equal(aliasState.backup_sender_name, 'New sender')
+assert.equal(aliasState.sender_name, 'New sender')
+assert.equal(database.prepare("SELECT COUNT(*) AS count FROM messages WHERE connector_id = ?").get(connectorId).count,
+  aliasMessageCountBeforeRefresh)
+const aliasCollision = await postGroupBackup({
+  ...aliasBase,
+  conversationExternalId: 'different-group',
+  conversationTitle: 'Different group',
+  senderId: 'member:collision',
+  senderName: 'Collision sender',
+})
+assert.equal(aliasCollision.status, 400)
+const aliasAfterCollision = database.prepare(`
+  SELECT b.conversation_external_id, b.sender_id AS backup_sender_id, m.sender_id
+  FROM group_text_backups b JOIN messages m
+    ON m.connector_id = b.connector_id AND m.external_id = b.external_id
+  WHERE b.external_id = 'message-group-alias'
+`).get()
+assert.equal(aliasAfterCollision.conversation_external_id, 'conversation-group')
+assert.equal(aliasAfterCollision.backup_sender_id, 'member:canonical-new')
+assert.equal(aliasAfterCollision.sender_id, 'member:canonical-new')
 const attemptedGroupMove = await postGroupBackup({ ...groupBase, externalId: 'message-group-other', attachments: [groupAttachment] })
 assert.equal(attemptedGroupMove.status, 400)
 assert.equal(database.prepare("SELECT message_id FROM attachments WHERE external_id = 'file-group'").get().message_id, groupMessage.id)
