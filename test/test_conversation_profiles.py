@@ -244,6 +244,53 @@ class ConversationProfileTests(unittest.TestCase):
                 profiles_module.sync_profiles(FakeRelay(), [profile])
             build.assert_not_called()
 
+    def test_sender_avatar_put_uses_raw_bytes_and_connector_auth_headers(self):
+        avatar = b"\x89PNG\r\n\x1a\nsynthetic-sender"
+        item = {"senderId": "qq:sender-1", "avatarBase64": base64.b64encode(avatar).decode("ascii")}
+        opener = FakeOpener([FakeResponse("")])
+        with patch.object(profiles_module.urllib.request, "build_opener", return_value=opener) as build:
+            self.assertEqual(profiles_module.sync_sender_avatars(FakeRelay(), [item]), 1)
+        self.assertIsInstance(build.call_args.args[0], profiles_module.NoRedirect)
+        request = opener.requests[0]
+        self.assertEqual(request.full_url, "https://worker.example/api/connectors/sender-avatars/qq:sender-1")
+        self.assertEqual(request.get_method(), "PUT")
+        self.assertEqual(request.data, avatar)
+        self.assertEqual(request.get_header("Content-type"), "image/png")
+        self.assertEqual(request.get_header("Content-length"), str(len(avatar)))
+        self.assertEqual(request.get_header("X-content-sha256"), hashlib.sha256(avatar).hexdigest())
+        self.assertEqual(request.get_header("Authorization"), "Bearer " + "x" * 40)
+        self.assertEqual(request.get_header("X-connector-id"), "connector-test")
+
+    def test_sender_avatar_empty_batch_or_empty_images_do_not_open_network(self):
+        for avatars in ([], [{"senderId": "sender-1", "avatarBase64": ""}],
+                        [{"senderId": "sender-1"}]):
+            with self.subTest(avatars=avatars), patch.object(
+                profiles_module.urllib.request, "build_opener"
+            ) as build:
+                self.assertEqual(profiles_module.sync_sender_avatars(FakeRelay(), avatars), 0)
+                build.assert_not_called()
+
+    def test_sender_avatar_batches_are_fully_validated_and_bounded_before_network(self):
+        png = lambda size: b"\x89PNG\r\n\x1a\n" + b"x" * (size - 8)
+        invalid_batches = [
+            [{"senderId": "sender-1", "avatarBase64": "%%%="}],
+            [{"senderId": "sender-1", "avatarBase64": base64.b64encode(b"not-image").decode()}],
+            [{"senderId": "bad/id", "avatarBase64": base64.b64encode(png(12)).decode()}],
+            [{"senderId": "sender-1", "avatarBase64": base64.b64encode(png(profiles_module.MAX_AVATAR_BYTES + 1)).decode()}],
+            [
+                {"senderId": "sender-1", "avatarBase64": base64.b64encode(png(64 * 1024)).decode()},
+                {"senderId": "sender-2", "avatarBase64": base64.b64encode(png(64 * 1024 + 1)).decode()},
+            ],
+            [{"senderId": "sender-%d" % index} for index in range(profiles_module.MAX_PROFILES + 1)],
+        ]
+        for avatars in invalid_batches:
+            with self.subTest(count=len(avatars)), patch.object(
+                profiles_module.urllib.request, "build_opener"
+            ) as build:
+                with self.assertRaises(profiles_module.ProfileSyncError):
+                    profiles_module.sync_sender_avatars(FakeRelay(), avatars)
+                build.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

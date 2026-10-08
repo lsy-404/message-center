@@ -205,3 +205,57 @@ def sync_profiles(relay, profiles):
         if not isinstance(result, dict) or result.get("ok") is not True:
             raise ProfileSyncError("profile_update_rejected")
     return len(prepared)
+
+
+def sync_sender_avatars(relay, avatars):
+    """PUT bounded sender images; callers commit their source cursor only on success."""
+    if not isinstance(avatars, list) or len(avatars) > MAX_PROFILES:
+        raise ProfileSyncError("invalid_sender_avatar_batch")
+    prepared = []
+    remaining_avatar_bytes = MAX_AVATAR_BATCH_BYTES
+    for item in avatars:
+        if not isinstance(item, dict):
+            raise ProfileSyncError("invalid_sender_avatar")
+        sender_id = item.get("senderId")
+        if not isinstance(sender_id, str) or not CONVERSATION_ID.fullmatch(sender_id):
+            raise ProfileSyncError("invalid_sender_id")
+        avatar, content_type = _decode_avatar(item, remaining_avatar_bytes)
+        if avatar is not None:
+            remaining_avatar_bytes -= len(avatar)
+            prepared.append((sender_id, avatar, content_type))
+    if not prepared:
+        return 0
+
+    opener = urllib.request.build_opener(NoRedirect())
+    base = relay.base.rstrip("/")
+    headers_base = relay.headers()
+    for sender_id, avatar, content_type in prepared:
+        headers = dict(headers_base)
+        headers["Content-Length"] = str(len(avatar))
+        headers["Content-Type"] = content_type
+        headers["x-content-sha256"] = hashlib.sha256(avatar).hexdigest()
+        request = urllib.request.Request(
+            base + "/api/connectors/sender-avatars/" + sender_id,
+            data=avatar,
+            headers=headers,
+            method="PUT",
+        )
+        try:
+            with opener.open(request, timeout=REQUEST_TIMEOUT) as response:
+                if response.geturl() != request.full_url:
+                    raise ProfileSyncError("sender_avatar_redirect_refused")
+                raw = response.read(MAX_RESPONSE + 1)
+                if len(raw) > MAX_RESPONSE:
+                    raise ProfileSyncError("sender_avatar_response_too_large")
+        except ProfileSyncError:
+            raise
+        except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
+            raise ProfileSyncError("sender_avatar_request_failed") from exc
+
+        try:
+            result = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ProfileSyncError("sender_avatar_invalid_response") from exc
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            raise ProfileSyncError("sender_avatar_update_rejected")
+    return len(prepared)

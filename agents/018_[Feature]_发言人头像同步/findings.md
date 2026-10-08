@@ -1,0 +1,10 @@
+# Findings
+
+- Existing conversation avatars provide a Worker pattern for magic-byte validation, digest checking, R2 writes, D1 upsert, and deferred cleanup. Sender images need their own connector-scoped table so group members do not become conversations.
+- The profile sync client now validates canonical base64 and caps per-image and batch decoded bytes at 128 KiB before networking; sender sync should reuse this path with its own identifier/header and endpoint.
+- The device runtime synchronizes profile metadata before beginning the transaction that commits the scan cursor and outbox. Sender avatar sync must happen at the same pre-commit boundary so a failure leaves cursor state unadvanced.
+- No UI, private adapter, device, secret, or live Cloudflare access is in scope.
+- Official references reviewed: [Workers best practices](https://developers.cloudflare.com/workers/best-practices/workers-best-practices/), [D1 Worker API](https://developers.cloudflare.com/d1/worker-api/d1-database/), [R2 Workers API](https://developers.cloudflare.com/r2/api/workers/workers-api-reference/), and [Workers execution context](https://developers.cloudflare.com/workers/runtime-apis/context/). R2 `put/get/delete` and context `waitUntil` follow the same existing avatar lifecycle pattern; all SQL uses bound statements.
+- The Worker inbox page already fetches a maximum of 300 messages. A `LEFT JOIN` keyed by `(connector_id, sender_id)` can populate `senderAvatarPath` without extra queries and leaves missing images explicitly null.
+- Sender uploads are raw bytes and require exact Content-Length, recognized image magic, and matching SHA-256. Object reuse is connector-scoped; downloads use the existing session-gated Worker branch and private cache headers with a content digest ETag.
+- Runtime sender image entries use the shared strict base64/magic validator and 128 KiB total decoded batch budget. Network sync happens before `BEGIN IMMEDIATE`, so rejected or failed uploads cannot advance the durable source cursor or spool events.

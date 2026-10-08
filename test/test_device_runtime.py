@@ -59,6 +59,27 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM cursors").fetchone()[0], 1)
 
+    def test_sender_avatar_sync_failure_preserves_cursor_and_outbox(self):
+        result = {"ok": True, "health": "online", "cursor": {"next": "2"},
+                  "messages": [self.event("new-1")], "senderAvatars": [{"senderId": "sender-1"}]}
+        relay = runtime.Relay(self.config, self.db, lambda _: result)
+        with patch.object(runtime, "sync_profiles", return_value=0), patch.object(
+            runtime, "sync_sender_avatars", side_effect=RuntimeError("offline")
+        ) as sync_avatars:
+            with self.assertRaisesRegex(RuntimeError, "offline"):
+                relay.scan_profile("primary")
+        sync_avatars.assert_called_once_with(relay, result["senderAvatars"])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM cursors").fetchone()[0], 0)
+
+        with patch.object(runtime, "sync_profiles", return_value=0), patch.object(
+            runtime, "sync_sender_avatars", return_value=1
+        ) as sync_avatars:
+            relay.scan_profile("primary")
+        sync_avatars.assert_called_once_with(relay, result["senderAvatars"])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM cursors").fetchone()[0], 1)
+
     def test_offline_spool_survives_restart_and_response_loss_reuses_event_id(self):
         calls = []
         def scan(_request):
