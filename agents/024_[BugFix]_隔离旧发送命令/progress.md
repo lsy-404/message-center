@@ -6,3 +6,5 @@
 - 新增真实 SQLite 测试覆盖 pending/过期及活动 lease、重复并行注册、新命令不被隔离、初次启用、未启用发送及事务回滚。
 - `node --test test/*.test.mjs`：17 项通过；`node cloudflare-worker/worker/schema-test.mjs`：通过。
 - 未合并、推送或部署；root 接手后续集成。
+
+- 根审阅后，消息与附件状态改用既有 `uncertain` 值；pending 的 command result 明确未 dispatch，避免把它误写为原生发送不确定。

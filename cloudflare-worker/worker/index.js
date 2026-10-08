@@ -490,7 +490,7 @@ async function registerConnector(request, env) {
         )
     `).bind(pendingReview, leasedReview, stamp, id));
     registrationStatements.push(env.DB.prepare(`
-      UPDATE messages SET delivery_state = 'manual_review'
+      UPDATE messages SET delivery_state = 'uncertain'
       WHERE direction = 'outbound' AND delivery_state = 'queued'
         AND id IN (
           SELECT message_id FROM commands
@@ -499,7 +499,7 @@ async function registerConnector(request, env) {
         )
     `).bind(id, stamp, pendingReview, leasedReview));
     registrationStatements.push(env.DB.prepare(`
-      UPDATE attachments SET state = 'manual_review'
+      UPDATE attachments SET state = 'uncertain'
       WHERE state = 'queued' AND message_id IN (
         SELECT message_id FROM commands
         WHERE connector_id = ? AND state = 'manual_review'

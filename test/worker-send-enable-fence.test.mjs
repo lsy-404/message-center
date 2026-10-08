@@ -171,12 +171,12 @@ test('enabling send_text quarantines preexisting pending and leased commands wit
 
   for (const message of [pending, expiredLease, activeLease]) {
     assert.equal(database.prepare('SELECT delivery_state FROM messages WHERE id = ?')
-      .get(message.messageId).delivery_state, 'manual_review');
+      .get(message.messageId).delivery_state, 'uncertain');
     assert.equal(database.prepare('SELECT body FROM messages WHERE id = ?')
       .get(message.messageId).body, `body-${message.commandId.slice('command-'.length)}`);
   }
   assert.equal(database.prepare('SELECT state FROM attachments WHERE id = ?')
-    .get('attachment-old-pending').state, 'manual_review');
+    .get('attachment-old-pending').state, 'uncertain');
   assert.equal(database.prepare('SELECT delivery_state FROM messages WHERE id = ?')
     .get(completed.messageId).delivery_state, 'delivered');
   assert.equal(database.prepare(`
@@ -264,9 +264,9 @@ test('registration batch rolls back command review if message state update fails
   const pending = seedMessageAndCommand(database, conversationId, connectorId,
     'rollback', 'pending');
   database.exec(`
-    CREATE TRIGGER reject_manual_review BEFORE UPDATE OF delivery_state ON messages
-    WHEN NEW.delivery_state = 'manual_review'
-    BEGIN SELECT RAISE(ABORT, 'message_review_rejected'); END
+      CREATE TRIGGER reject_manual_review BEFORE UPDATE OF delivery_state ON messages
+      WHEN NEW.delivery_state = 'uncertain'
+      BEGIN SELECT RAISE(ABORT, 'message_review_rejected'); END
   `);
 
   const response = await register(harness);
