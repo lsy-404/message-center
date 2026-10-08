@@ -4,3 +4,5 @@
 - `cloudflare-worker/ui/src/App.vue` 的 `Message` 类型未声明该字段；`sameInbox` 逐消息比较也未比较它，因此仅状态变化的刷新会保留旧快照。
 - 消息行有 Fluent 风格的 `message-meta` 文本区，可在出站消息元信息中增加小型状态文字，不需要新交互或轮询。
 - `test/ui-navigation-media.cjs` 已用 Playwright 真实渲染 Vue 页面并模拟 inbox 刷新，适合增加状态行为断言。
+
+- Integrated Node smoke test originally banned the internal deliveryState identifier across all Vue source. Narrowed this obsolete assertion to reject raw message.deliveryState interpolation while allowing the localized implementation; full root Node suite passed 19 tests.
