@@ -24,7 +24,7 @@
 | 017 | [Feature] 有界会话头像同步 | 在设备会话资料同步中验证并上传小型头像数据 | 让消息中心会话目录显示来源头像，同时限制旧 iPad 内存与网络开销 | ✅ 已集成并部署验证 |
 | 018 | [Feature] 发言人头像同步 | 为消息发言人创建独立头像存储、上传/下载路由，并在 inbox 批量返回头像地址 | 用户希望消息旁显示说话人的头像，且成员身份不应变成会话目录项 | ✅ 已集成并部署验证 |
 | 019 | [Feature] 有界收件箱容量 | 扩大会话游标及 inbox 上限，并给完整列表增加有界渲染和全量搜索 | 微信会话超过 200/300 后设备游标和云端收件箱会丢失尾部会话 | ✅ 已完成 |
-| 020 | [BugFix] Adapter operation deadlines | Give scans and sends bounded operation-specific subprocess budgets | Prevent the relay from killing native scans or sends before bounded helper cleanup completes | ✅ Complete; local commit only |
+| 020 | [BugFix] Adapter operation deadlines | Give scans and sends bounded operation-specific subprocess budgets | Prevent the relay from killing native scans or sends before bounded helper cleanup completes | ✅ 已集成安装并通过实机测试 |
 | 020 | [BugFix] 群聊备份发言人头像 | 群聊文本备份读取接口返回发言人头像路径 | QQ 群聊备份详情缺少已同步的发言人头像 | ✅ 已完成 |
 | 021 | [BugFix] 群备份重复资料刷新 | 对同一群聊消息的安全重放刷新缺失或旧 sender ID | 头像到达晚于消息入库时 inbox JOIN 无法命中 | ✅ 已完成 |
 | 022 | [BugFix] 持续心跳退避 | 将设备心跳与扫描/命令退避隔离，并为心跳网络错误设置有界退避 | connector 级共享退避会在操作失败后抑制心跳并让 lastSeenAt 过期 | ✅ 已集成并安装 |
