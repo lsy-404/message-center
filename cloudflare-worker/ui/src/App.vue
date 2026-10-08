@@ -102,8 +102,8 @@ const emptySnapshot = (): Snapshot => ({ connectors: [], conversations: [], mess
 const snapshot = ref<Snapshot>(emptySnapshot())
 const selectedId = ref('')
 const activeFilter = ref('all')
+const activeConnectorId = ref('')
 const showInstances = ref(false)
-const selectedConnectorId = ref('')
 const mobileThread = ref(false)
 const loading = ref(true)
 const detailLoading = ref(false)
@@ -131,10 +131,6 @@ const selectedConversation = computed(() =>
 const selectedConversationConnector = computed(() =>
   snapshot.value.connectors.find((item) => item.id === selectedConversation.value?.connectorId) ?? null,
 )
-const selectedConnector = computed(() =>
-  snapshot.value.connectors.find((item) => item.id === selectedConnectorId.value) ?? null,
-)
-
 const filters = computed(() => {
   const labels = new Map<string, string>()
   for (const conversation of snapshot.value.conversations) {
@@ -152,9 +148,11 @@ const filters = computed(() => {
 })
 
 const filteredConversations = computed(() => {
-  if (activeFilter.value === 'all') return snapshot.value.conversations
-  const label = activeFilter.value.slice('channel:'.length)
-  return snapshot.value.conversations.filter((item) => channelLabel(item) === label)
+  return snapshot.value.conversations.filter((item) => {
+    if (activeConnectorId.value && item.connectorId !== activeConnectorId.value) return false
+    if (activeFilter.value === 'all') return true
+    return channelLabel(item) === activeFilter.value.slice('channel:'.length)
+  })
 })
 
 const conversationRows = computed<ConversationListItem[]>(() => filteredConversations.value.map((conversation) => ({
@@ -308,6 +306,12 @@ function isImage(file: Attachment) {
 
 function isVideo(file: Attachment) {
   return Boolean(file.downloadable && file.mimeType?.startsWith('video/'))
+}
+
+function messageBody(message: Message) {
+  const body = message.body || ''
+  if (!message.attachments.some(isImage)) return body
+  return body.replace(/[ \t]*\[图片\][ \t]*/g, ' ').replace(/^[ \t]+|[ \t]+$/gm, '')
 }
 
 function filePath(file: Attachment) {
@@ -565,8 +569,9 @@ function selectConversationById(conversationId: string) {
   if (conversation) void selectConversation(conversation)
 }
 
-function selectFilter(id: string) {
+function selectFilter(id: string, connectorId = '') {
   activeFilter.value = id
+  activeConnectorId.value = connectorId
   showInstances.value = false
   mobileThread.value = false
   if (!filteredConversations.value.some((conversation) => conversation.id === selectedId.value)) {
@@ -585,8 +590,7 @@ function selectFilter(id: string) {
   }
 }
 
-function showConnectorInstances(connectorId: string) {
-  selectedConnectorId.value = connectorId
+function showConnectorManagement() {
   showInstances.value = true
   mobileThread.value = false
 }
@@ -889,24 +893,19 @@ onUnmounted(() => {
           </button>
         </div>
 
-        <div class="nav-section connector-nav">
-          <p class="nav-label">接入实例</p>
+        <div class="nav-section management-nav">
           <button
-            v-for="connector in snapshot.connectors"
-            :key="connector.id"
-            class="nav-item connector-item"
-            :class="{ active: showInstances && selectedConnectorId === connector.id }"
+            class="nav-item"
+            :class="{ active: showInstances }"
             type="button"
-            @click="showConnectorInstances(connector.id)"
+            aria-label="接入管理"
+            title="接入管理"
+            @click="showConnectorManagement"
           >
-            <span class="nav-glyph">{{ initials(channelLabel(connector)) }}</span>
-            <span class="nav-copy connector-copy">
-              <strong>{{ connector.accountLabel }}</strong>
-              <small>{{ channelLabel(connector) }} · {{ connector.id }}</small>
-            </span>
-            <span class="presence-dot" :class="connector.state" :title="statusLabel(connector.state)" />
+            <span class="nav-glyph">⚙</span>
+            <span class="nav-copy">接入管理</span>
+            <span class="nav-count">{{ snapshot.connectors.length }}</span>
           </button>
-          <p v-if="!snapshot.connectors.length && !loading" class="nav-empty">尚无接入</p>
         </div>
       </div>
 
@@ -1016,7 +1015,7 @@ onUnmounted(() => {
             <div class="message-block">
               <p class="message-meta">{{ message.senderName }} · {{ formatStamp(message.occurredAt) }}</p>
               <div class="message-bubble">
-                <p v-if="message.body">{{ message.body }}</p>
+                <p v-if="messageBody(message)">{{ messageBody(message) }}</p>
                 <div v-for="file in message.attachments" :key="file.id" class="attachment">
                   <img v-if="isImage(file)" class="attachment-image" :src="filePath(file)" :alt="file.fileName" loading="lazy">
                   <video v-else-if="isVideo(file)" class="attachment-video" :src="filePath(file)" controls preload="metadata" />
@@ -1078,10 +1077,13 @@ onUnmounted(() => {
     <section v-else class="instances-pane">
       <header class="instances-header">
         <button class="quiet-button" type="button" aria-label="返回收件箱" title="返回收件箱" @click="showInstances = false">←</button>
-        <h1>接入实例</h1>
+        <div>
+          <h1>接入管理</h1>
+          <p>{{ snapshot.connectors.length }} 个账号</p>
+        </div>
       </header>
       <div class="instance-grid">
-        <article v-for="connector in selectedConnector ? [selectedConnector] : []" :key="connector.id" class="instance-card">
+        <article v-for="connector in snapshot.connectors" :key="connector.id" class="instance-card">
           <header>
             <div>
               <p>{{ channelLabel(connector) }}</p>
@@ -1115,8 +1117,16 @@ onUnmounted(() => {
               @change="setLayoutAutoRecovery(connector, $event)"
             />
           </section>
+          <footer class="instance-actions">
+            <FluentButton
+              class="quiet-button"
+              type="button"
+              :disabled="!snapshot.conversations.some((conversation) => conversation.connectorId === connector.id)"
+              @click="selectFilter(`channel:${channelLabel(connector)}`, connector.id)"
+            >查看此账号会话</FluentButton>
+          </footer>
         </article>
-        <div v-if="!selectedConnector" class="empty-state"><span class="empty-glyph">□</span><p>尚无接入实例</p></div>
+        <div v-if="!snapshot.connectors.length && !loading" class="empty-state"><span class="empty-glyph">□</span><p>尚无接入实例</p></div>
       </div>
     </section>
   </main>

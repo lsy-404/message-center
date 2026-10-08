@@ -172,11 +172,7 @@ button { color: inherit; }
   text-align: center;
 }
 
-.connector-nav { min-height: 0; overflow: visible; }
-.connector-item { min-height: 48px; }
-.connector-copy { display: flex; flex-direction: column; gap: 1px; }
-.connector-copy strong { overflow: hidden; color: var(--text-primary); font-size: 12px; font-weight: 500; text-overflow: ellipsis; }
-.connector-copy small { overflow: hidden; color: var(--text-tertiary); font-size: 9px; text-overflow: ellipsis; }
+.management-nav { margin-top: 16px; padding-top: 8px; border-top: 1px solid var(--stroke-divider); }
 .nav-empty { padding: 5px 10px; color: var(--text-tertiary); font-size: 11px; }
 
 .presence-dot {
@@ -442,6 +438,7 @@ button { color: inherit; }
   background: var(--app-bg);
 }
 .instances-header { position: sticky; z-index: 2; top: 0; gap: 10px; padding: 10px 20px; }
+.instances-header p { margin: 3px 0 0; color: var(--text-tertiary); font-size: 11px; }
 .instance-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; padding: 20px; }
 .instance-card { overflow: hidden; border: 1px solid var(--card-stroke); border-radius: 7px; background: var(--card-bg); box-shadow: 0 1px 2px rgba(0, 0, 0, .06); box-shadow: 0 1px 2px color-mix(in srgb, black 6%, transparent); }
 .instance-card > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 15px; border-bottom: 1px solid var(--stroke-divider); background: var(--card-bg-secondary); }
@@ -457,6 +454,7 @@ button { color: inherit; }
 .instance-control-copy { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
 .instance-control-copy strong { color: var(--text-primary); font-size: 12px; font-weight: 500; }
 .instance-control-copy span { color: var(--text-tertiary); font-size: 10px; }
+.instance-actions { display: flex; justify-content: flex-end; padding: 0 15px 14px; }
 .toggle-switch { flex: 0 0 auto; }
 
 .toast { position: fixed; z-index: 20; right: 18px; bottom: 18px; max-width: min(380px, calc(100vw - 36px)); padding: 9px 12px; border: 1px solid var(--stroke-surface-flyout); border-radius: 6px; color: var(--text-primary); background: var(--flyout-bg); box-shadow: 0 8px 24px rgba(0, 0, 0, .2); box-shadow: 0 8px 24px color-mix(in srgb, black 20%, transparent); font-size: 12px; }
@@ -498,7 +496,6 @@ button:focus-visible, a:focus-visible, textarea:focus-visible { outline: 2px sol
   .brand strong, .nav-label, .nav-copy, .nav-count { display: none; }
   .nav-item { justify-content: center; padding-inline: 4px; }
   .nav-item.active::before { top: 8px; bottom: 8px; }
-  .connector-item { min-height: 42px; }
   .nav-footer { justify-content: center; }
   .license-link { display: none; }
   .conversation-pane { grid-row: 1; grid-column: 2; }
