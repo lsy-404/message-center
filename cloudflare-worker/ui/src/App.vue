@@ -70,6 +70,7 @@ type Message = {
   id: string
   direction: 'inbound' | 'outbound' | string
   senderName: string
+  senderAvatarPath?: string | null
   body: string
   contentType: string
   occurredAt: string
@@ -102,8 +103,8 @@ const emptySnapshot = (): Snapshot => ({ connectors: [], conversations: [], mess
 const snapshot = ref<Snapshot>(emptySnapshot())
 const selectedId = ref('')
 const activeFilter = ref('all')
+const activeConnectorId = ref('')
 const showInstances = ref(false)
-const selectedConnectorId = ref('')
 const mobileThread = ref(false)
 const loading = ref(true)
 const detailLoading = ref(false)
@@ -122,6 +123,7 @@ const sendingConversationIds = ref(new Set<string>())
 const uploadingConversationIds = ref(new Set<string>())
 const updatingLayoutConnectorIds = ref(new Set<string>())
 const avatarRetryStates = ref(new Map<string, AvatarRetryState>())
+const loadedAttachmentImages = ref(new Set<string>())
 const AVATAR_RETRY_BASE_MS = 5_000
 const AVATAR_RETRY_MAX_MS = 60_000
 
@@ -131,10 +133,6 @@ const selectedConversation = computed(() =>
 const selectedConversationConnector = computed(() =>
   snapshot.value.connectors.find((item) => item.id === selectedConversation.value?.connectorId) ?? null,
 )
-const selectedConnector = computed(() =>
-  snapshot.value.connectors.find((item) => item.id === selectedConnectorId.value) ?? null,
-)
-
 const filters = computed(() => {
   const labels = new Map<string, string>()
   for (const conversation of snapshot.value.conversations) {
@@ -152,9 +150,11 @@ const filters = computed(() => {
 })
 
 const filteredConversations = computed(() => {
-  if (activeFilter.value === 'all') return snapshot.value.conversations
-  const label = activeFilter.value.slice('channel:'.length)
-  return snapshot.value.conversations.filter((item) => channelLabel(item) === label)
+  return snapshot.value.conversations.filter((item) => {
+    if (activeConnectorId.value && item.connectorId !== activeConnectorId.value) return false
+    if (activeFilter.value === 'all') return true
+    return channelLabel(item) === activeFilter.value.slice('channel:'.length)
+  })
 })
 
 const conversationRows = computed<ConversationListItem[]>(() => filteredConversations.value.map((conversation) => ({
@@ -310,6 +310,30 @@ function isVideo(file: Attachment) {
   return Boolean(file.downloadable && file.mimeType?.startsWith('video/'))
 }
 
+function messageBody(message: Message) {
+  let loadedCount = message.attachments.filter((file) =>
+    isImage(file) && loadedAttachmentImages.value.has(`${message.id}:${file.id}`),
+  ).length
+  if (!loadedCount) return message.body || ''
+  return (message.body || '').split(/\r?\n/).filter((line) => {
+    if (loadedCount > 0 && /^[ \t]*\[图片\][ \t]*$/.test(line)) {
+      loadedCount -= 1
+      return false
+    }
+    return true
+  }).join('\n')
+}
+
+function setAttachmentImageLoaded(message: Message, file: Attachment, loaded: boolean) {
+  const key = `${message.id}:${file.id}`
+  const currentlyLoaded = loadedAttachmentImages.value.has(key)
+  if (currentlyLoaded === loaded) return
+  const next = new Set(loadedAttachmentImages.value)
+  if (loaded) next.add(key)
+  else next.delete(key)
+  loadedAttachmentImages.value = next
+}
+
 function filePath(file: Attachment) {
   return `/api/files/${encodeURIComponent(file.id)}`
 }
@@ -368,8 +392,11 @@ function imageLoaded(event: Event) {
   avatarRetryStates.value = next
 }
 
-function advanceAvatarRetries(conversations: Conversation[]) {
-  const activePaths = new Set(conversations.map((item) => item.avatarPath).filter((path): path is string => Boolean(path)))
+function advanceAvatarRetries(conversations: Conversation[], messages: Message[]) {
+  const activePaths = new Set([
+    ...conversations.map((item) => item.avatarPath),
+    ...messages.map((item) => item.senderAvatarPath),
+  ].filter((path): path is string => Boolean(path)))
   const now = Date.now()
   const next = new Map(avatarRetryStates.value)
   let changed = false
@@ -460,6 +487,7 @@ function sameInbox(left: Snapshot, right: Snapshot) {
     const a = left.messages[index]
     const b = right.messages[index]
     if (a.id !== b.id || a.direction !== b.direction || a.senderName !== b.senderName
+        || a.senderAvatarPath !== b.senderAvatarPath
         || a.body !== b.body || a.contentType !== b.contentType || a.occurredAt !== b.occurredAt
         || a.attachments.length !== b.attachments.length) return false
     for (let attachmentIndex = 0; attachmentIndex < a.attachments.length; attachmentIndex += 1) {
@@ -508,7 +536,13 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
       selectedId.value = nextSelectedId
       restoreComposer(nextSelectedId)
     }
-    advanceAvatarRetries(body.conversations)
+    const currentImageKeys = new Set(body.messages.flatMap((message) =>
+      message.attachments.filter(isImage).map((file) => `${message.id}:${file.id}`),
+    ))
+    if ([...loadedAttachmentImages.value].some((key) => !currentImageKeys.has(key))) {
+      loadedAttachmentImages.value = new Set([...loadedAttachmentImages.value].filter((key) => currentImageKeys.has(key)))
+    }
+    advanceAvatarRetries(body.conversations, body.messages)
     body.connectors = mergeConnectorLayoutControls(body.connectors)
     if (sameInbox(snapshot.value, body)) return
     snapshot.value = body
@@ -549,6 +583,7 @@ async function selectConversation(conversation: Conversation, openMobileThread =
   restoreComposer(conversation.id)
   mobileThread.value = openMobileThread
   showInstances.value = false
+  loadedAttachmentImages.value = new Set()
   detailLoading.value = true
   snapshot.value.messages = []
   try {
@@ -565,8 +600,9 @@ function selectConversationById(conversationId: string) {
   if (conversation) void selectConversation(conversation)
 }
 
-function selectFilter(id: string) {
+function selectFilter(id: string, connectorId = '') {
   activeFilter.value = id
+  activeConnectorId.value = connectorId
   showInstances.value = false
   mobileThread.value = false
   if (!filteredConversations.value.some((conversation) => conversation.id === selectedId.value)) {
@@ -585,8 +621,7 @@ function selectFilter(id: string) {
   }
 }
 
-function showConnectorInstances(connectorId: string) {
-  selectedConnectorId.value = connectorId
+function showConnectorManagement() {
   showInstances.value = true
   mobileThread.value = false
 }
@@ -889,24 +924,19 @@ onUnmounted(() => {
           </button>
         </div>
 
-        <div class="nav-section connector-nav">
-          <p class="nav-label">接入实例</p>
+        <div class="nav-section management-nav">
           <button
-            v-for="connector in snapshot.connectors"
-            :key="connector.id"
-            class="nav-item connector-item"
-            :class="{ active: showInstances && selectedConnectorId === connector.id }"
+            class="nav-item"
+            :class="{ active: showInstances }"
             type="button"
-            @click="showConnectorInstances(connector.id)"
+            aria-label="接入管理"
+            title="接入管理"
+            @click="showConnectorManagement"
           >
-            <span class="nav-glyph">{{ initials(channelLabel(connector)) }}</span>
-            <span class="nav-copy connector-copy">
-              <strong>{{ connector.accountLabel }}</strong>
-              <small>{{ channelLabel(connector) }} · {{ connector.id }}</small>
-            </span>
-            <span class="presence-dot" :class="connector.state" :title="statusLabel(connector.state)" />
+            <span class="nav-glyph">⚙</span>
+            <span class="nav-copy">接入管理</span>
+            <span class="nav-count">{{ snapshot.connectors.length }}</span>
           </button>
-          <p v-if="!snapshot.connectors.length && !loading" class="nav-empty">尚无接入</p>
         </div>
       </div>
 
@@ -1013,12 +1043,35 @@ onUnmounted(() => {
             class="message-row"
             :class="message.direction"
           >
+            <span class="avatar message-avatar">
+              <span>{{ initials(message.senderName) }}</span>
+              <img
+                v-if="message.senderAvatarPath"
+                :key="avatarKey(message.senderAvatarPath)"
+                :src="avatarSource(message.senderAvatarPath)"
+                :data-avatar-path="message.senderAvatarPath"
+                :data-avatar-revision="avatarRevision(message.senderAvatarPath)"
+                alt=""
+                loading="lazy"
+                decoding="async"
+                @load="imageLoaded"
+                @error="imageFailed"
+              >
+            </span>
             <div class="message-block">
               <p class="message-meta">{{ message.senderName }} · {{ formatStamp(message.occurredAt) }}</p>
               <div class="message-bubble">
-                <p v-if="message.body">{{ message.body }}</p>
+                <p v-if="messageBody(message)">{{ messageBody(message) }}</p>
                 <div v-for="file in message.attachments" :key="file.id" class="attachment">
-                  <img v-if="isImage(file)" class="attachment-image" :src="filePath(file)" :alt="file.fileName" loading="lazy">
+                  <img
+                    v-if="isImage(file)"
+                    class="attachment-image"
+                    :src="filePath(file)"
+                    :alt="file.fileName"
+                    loading="lazy"
+                    @load="setAttachmentImageLoaded(message, file, true)"
+                    @error="setAttachmentImageLoaded(message, file, false)"
+                  >
                   <video v-else-if="isVideo(file)" class="attachment-video" :src="filePath(file)" controls preload="metadata" />
                   <a v-else-if="file.downloadable" class="attachment-link" :href="filePath(file)">
                     <span class="file-icon">▤</span>
@@ -1078,10 +1131,13 @@ onUnmounted(() => {
     <section v-else class="instances-pane">
       <header class="instances-header">
         <button class="quiet-button" type="button" aria-label="返回收件箱" title="返回收件箱" @click="showInstances = false">←</button>
-        <h1>接入实例</h1>
+        <div>
+          <h1>接入管理</h1>
+          <p>{{ snapshot.connectors.length }} 个账号</p>
+        </div>
       </header>
       <div class="instance-grid">
-        <article v-for="connector in selectedConnector ? [selectedConnector] : []" :key="connector.id" class="instance-card">
+        <article v-for="connector in snapshot.connectors" :key="connector.id" class="instance-card">
           <header>
             <div>
               <p>{{ channelLabel(connector) }}</p>
@@ -1115,8 +1171,16 @@ onUnmounted(() => {
               @change="setLayoutAutoRecovery(connector, $event)"
             />
           </section>
+          <footer class="instance-actions">
+            <FluentButton
+              class="quiet-button"
+              type="button"
+              :disabled="!snapshot.conversations.some((conversation) => conversation.connectorId === connector.id)"
+              @click="selectFilter(`channel:${channelLabel(connector)}`, connector.id)"
+            >查看此账号会话</FluentButton>
+          </footer>
         </article>
-        <div v-if="!selectedConnector" class="empty-state"><span class="empty-glyph">□</span><p>尚无接入实例</p></div>
+        <div v-if="!snapshot.connectors.length && !loading" class="empty-state"><span class="empty-glyph">□</span><p>尚无接入实例</p></div>
       </div>
     </section>
   </main>
