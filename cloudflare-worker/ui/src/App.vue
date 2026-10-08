@@ -122,6 +122,7 @@ const sendingConversationIds = ref(new Set<string>())
 const uploadingConversationIds = ref(new Set<string>())
 const updatingLayoutConnectorIds = ref(new Set<string>())
 const avatarRetryStates = ref(new Map<string, AvatarRetryState>())
+const loadedAttachmentImages = ref(new Set<string>())
 const AVATAR_RETRY_BASE_MS = 5_000
 const AVATAR_RETRY_MAX_MS = 60_000
 
@@ -309,9 +310,27 @@ function isVideo(file: Attachment) {
 }
 
 function messageBody(message: Message) {
-  const body = message.body || ''
-  if (!message.attachments.some(isImage)) return body
-  return body.replace(/[ \t]*\[图片\][ \t]*/g, ' ').replace(/^[ \t]+|[ \t]+$/gm, '')
+  let loadedCount = message.attachments.filter((file) =>
+    isImage(file) && loadedAttachmentImages.value.has(`${message.id}:${file.id}`),
+  ).length
+  if (!loadedCount) return message.body || ''
+  return (message.body || '').split(/\r?\n/).filter((line) => {
+    if (loadedCount > 0 && /^[ \t]*\[图片\][ \t]*$/.test(line)) {
+      loadedCount -= 1
+      return false
+    }
+    return true
+  }).join('\n')
+}
+
+function setAttachmentImageLoaded(message: Message, file: Attachment, loaded: boolean) {
+  const key = `${message.id}:${file.id}`
+  const currentlyLoaded = loadedAttachmentImages.value.has(key)
+  if (currentlyLoaded === loaded) return
+  const next = new Set(loadedAttachmentImages.value)
+  if (loaded) next.add(key)
+  else next.delete(key)
+  loadedAttachmentImages.value = next
 }
 
 function filePath(file: Attachment) {
@@ -512,6 +531,12 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
       selectedId.value = nextSelectedId
       restoreComposer(nextSelectedId)
     }
+    const currentImageKeys = new Set(body.messages.flatMap((message) =>
+      message.attachments.filter(isImage).map((file) => `${message.id}:${file.id}`),
+    ))
+    if ([...loadedAttachmentImages.value].some((key) => !currentImageKeys.has(key))) {
+      loadedAttachmentImages.value = new Set([...loadedAttachmentImages.value].filter((key) => currentImageKeys.has(key)))
+    }
     advanceAvatarRetries(body.conversations)
     body.connectors = mergeConnectorLayoutControls(body.connectors)
     if (sameInbox(snapshot.value, body)) return
@@ -553,6 +578,7 @@ async function selectConversation(conversation: Conversation, openMobileThread =
   restoreComposer(conversation.id)
   mobileThread.value = openMobileThread
   showInstances.value = false
+  loadedAttachmentImages.value = new Set()
   detailLoading.value = true
   snapshot.value.messages = []
   try {
@@ -1017,7 +1043,15 @@ onUnmounted(() => {
               <div class="message-bubble">
                 <p v-if="messageBody(message)">{{ messageBody(message) }}</p>
                 <div v-for="file in message.attachments" :key="file.id" class="attachment">
-                  <img v-if="isImage(file)" class="attachment-image" :src="filePath(file)" :alt="file.fileName" loading="lazy">
+                  <img
+                    v-if="isImage(file)"
+                    class="attachment-image"
+                    :src="filePath(file)"
+                    :alt="file.fileName"
+                    loading="lazy"
+                    @load="setAttachmentImageLoaded(message, file, true)"
+                    @error="setAttachmentImageLoaded(message, file, false)"
+                  >
                   <video v-else-if="isVideo(file)" class="attachment-video" :src="filePath(file)" controls preload="metadata" />
                   <a v-else-if="file.downloadable" class="attachment-link" :href="filePath(file)">
                     <span class="file-icon">▤</span>

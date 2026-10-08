@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict')
-const { chromium } = require('F:/Development/lsy-404@CASSIE/node_modules/playwright')
+const { chromium } = require('playwright')
 
 async function main() {
   const browser = await chromium.launch({ headless: true })
@@ -29,17 +29,21 @@ async function main() {
       connectors,
       conversations,
       messages: [
-        { id: 'image-message', direction: 'inbound', senderName: '测试联系人', body: '描述 [图片] 后续文字', contentType: 'text', occurredAt: new Date().toISOString(), attachments: [{ id: 'image-1', fileName: 'image.png', mimeType: 'image/png', downloadable: true }] },
+        { id: 'image-message', direction: 'inbound', senderName: '测试联系人', body: '描述\n[图片]\n后续文字\n[图片]\n教程里写[图片]作为占位', contentType: 'text', occurredAt: new Date().toISOString(), attachments: [
+          { id: 'image-loaded', fileName: 'image-loaded.gif', mimeType: 'image/gif', downloadable: true },
+          { id: 'image-failed', fileName: 'image-failed.gif', mimeType: 'image/gif', downloadable: true },
+        ] },
         { id: 'text-message', direction: 'inbound', senderName: '测试联系人', body: '[图片]', contentType: 'text', occurredAt: new Date().toISOString(), attachments: [] },
         { id: 'pending-message', direction: 'inbound', senderName: '测试联系人', body: '[图片]', contentType: 'text', occurredAt: new Date().toISOString(), attachments: [{ id: 'pending-1', fileName: 'pending.png', mimeType: 'image/png', downloadable: false }] },
       ],
     }
     await page.route('**/api/inbox**', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(payload) }))
-    await page.route('**/api/files/image-1', (route) => route.fulfill({
+    await page.route('**/api/files/image-loaded', (route) => route.fulfill({
       status: 200,
-      contentType: 'image/png',
-      body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/nWQAAAAASUVORK5CYII=', 'base64'),
+      contentType: 'image/gif',
+      body: Buffer.from('R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=', 'base64'),
     }))
+    await page.route('**/api/files/image-failed', (route) => route.fulfill({ status: 404, body: 'missing' }))
     await page.goto('http://127.0.0.1:5173/', { waitUntil: 'networkidle' })
 
     assert.equal(await page.locator('.nav-section:first-child .nav-item').count(), 3, 'all + two channel entries')
@@ -47,9 +51,17 @@ async function main() {
     assert.equal(await page.locator('.nav-pane').evaluate((element) => element.textContent.includes('qq-account-1')), false, 'connector IDs stay out of navigation')
 
     await page.locator('.conversation-row').first().click()
-    const imageBody = page.locator('.message-row').filter({ has: page.locator('img.attachment-image') }).locator('.message-bubble p')
-    await imageBody.waitFor()
-    assert.equal(await imageBody.textContent(), '描述 后续文字', 'remove only the image marker and preserve surrounding text')
+    await page.locator('img.attachment-image').evaluateAll((images) => images.forEach((image) => { image.loading = 'eager' }))
+    await page.waitForFunction(() => {
+      const image = Array.from(document.querySelectorAll('img.attachment-image')).find((item) => item.alt === 'image-loaded.gif')
+      return image?.complete && image.naturalWidth > 0
+    })
+    await page.waitForFunction(() => {
+      const image = Array.from(document.querySelectorAll('img.attachment-image')).find((item) => item.alt === 'image-failed.gif')
+      return image?.complete && image.naturalWidth === 0
+    })
+    const imageBody = page.locator('.message-row').filter({ hasText: '教程里写' }).locator('.message-bubble p')
+    assert.equal(await imageBody.textContent(), '描述\n后续文字\n[图片]\n教程里写[图片]作为占位', 'hide one standalone marker only after one image loads; keep the failed and literal markers')
     assert.equal(await page.locator('.message-row').nth(1).locator('.message-bubble p').textContent(), '[图片]', 'keep marker when there is no image attachment')
     assert.equal(await page.locator('.message-row').nth(2).locator('.message-bubble p').textContent(), '[图片]', 'keep marker for a pending image')
     assert.equal(await page.locator('.message-row').nth(2).locator('.attachment').textContent(), '▤pending.png等待上传')
