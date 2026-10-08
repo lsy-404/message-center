@@ -10,3 +10,4 @@
 - Targeted validation passed: Node syntax checks and sender-avatar Worker test; conversation profile tests 14 passed; device runtime tests 41 passed, 1 platform-specific skip.
 - Full root Python discovery passed: 63 tests, 1 platform-specific skip. Existing Worker smoke, schema, inbox refresh, large-group inbox, attachment backfill, and sender-avatar Worker tests all passed.
 - `git diff --check` passed; source/test diff scan found no prohibited task-number or model/coauthor markers. New root Worker test is globally ignored and must be explicitly force-added.
+- 已集成并部署验证。
