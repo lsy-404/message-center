@@ -1,10 +1,13 @@
 #import <Foundation/Foundation.h>
+#import <CoreFoundation/CoreFoundation.h>
 
 #include "frida-core.h"
+#include "binary-output.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -31,6 +34,8 @@ typedef struct {
   FridaScript *script;
   gchar *script_source;
   gchar *result_json;
+  BinaryOutput binary_output;
+  guint64 binary_byte_count;
   const gchar *stage;
   const gchar *error_stage;
   const gchar *error_code;
@@ -44,12 +49,38 @@ typedef struct {
   gboolean cleanup_started;
   gboolean load_started;
   gboolean result_received;
+  gboolean binary_written;
   gboolean timed_out;
   gboolean hard_timeout;
 } Helper;
 
 static void start_cleanup(Helper *helper);
 static void fail(Helper *helper, const gchar *stage, const gchar *code);
+
+static void
+reject_response(Helper *helper, const gchar *code)
+{
+  helper->response_error_code = code;
+  fail(helper, "result", code);
+  if (helper->operation_in_flight)
+    g_cancellable_cancel(helper->operation_cancel);
+  else
+    start_cleanup(helper);
+}
+
+static gboolean
+parse_binary_byte_count(id value, guint64 maximum, guint64 *count)
+{
+  if (![value isKindOfClass:[NSNumber class]] || count == NULL ||
+      CFGetTypeID((__bridge CFTypeRef) value) == CFBooleanGetTypeID())
+    return FALSE;
+  double numeric = [value doubleValue];
+  if (!isfinite(numeric) || numeric < 1 || numeric > (double) maximum ||
+      floor(numeric) != numeric)
+    return FALSE;
+  *count = [value unsignedLongLongValue];
+  return *count >= 1 && *count <= maximum;
+}
 
 static void
 set_stage(Helper *helper, const gchar *stage)
@@ -219,8 +250,23 @@ on_script_message(FridaScript *script, const gchar *message, GBytes *data,
   NSString *type;
 
   (void) script;
-  (void) data;
-  if (helper->cleanup_started || helper->result_received || message == NULL)
+  if (message == NULL)
+    return;
+  if (helper->result_received) {
+    if (helper->binary_output.enabled) {
+      fail(helper, "result", "duplicate_send");
+      if (binary_output_reset(&helper->binary_output) != BINARY_OUTPUT_OK)
+        helper->cleanup_code = "binary_output_reset_failed";
+      helper->binary_written = FALSE;
+      helper->binary_byte_count = 0;
+      if (helper->operation_in_flight)
+        g_cancellable_cancel(helper->operation_cancel);
+      else
+        start_cleanup(helper);
+    }
+    return;
+  }
+  if (helper->cleanup_started)
     return;
 
   length = strnlen(message, MAX_INPUT_BYTES + 1);
@@ -242,17 +288,48 @@ on_script_message(FridaScript *script, const gchar *message, GBytes *data,
   if ([type isEqualToString:@"send"]) {
     id payload = envelope[@"payload"];
     if (payload == nil) {
-      helper->response_error_code = "invalid_response";
+      reject_response(helper, "invalid_response");
+      return;
+    }
+    guint64 declared_bytes = 0;
+    gsize binary_length = data == NULL ? 0 : g_bytes_get_size(data);
+    if (helper->binary_output.enabled) {
+      id success_value = [payload isKindOfClass:[NSDictionary class]] ? payload[@"ok"] : nil;
+      id byte_count_value = [payload isKindOfClass:[NSDictionary class]]
+          ? payload[@"byteCount"] : nil;
+      if (![success_value isKindOfClass:[NSNumber class]] ||
+          CFGetTypeID((__bridge CFTypeRef) success_value) != CFBooleanGetTypeID() ||
+          ![success_value boolValue] || data == NULL || binary_length == 0 ||
+          !parse_binary_byte_count(byte_count_value,
+              helper->binary_output.max_bytes, &declared_bytes) ||
+          declared_bytes != binary_length) {
+        reject_response(helper, "invalid_binary_response");
+        return;
+      }
+    } else if (data != NULL) {
+      reject_response(helper, "binary_output_not_enabled");
       return;
     }
     NSError *serialize_error = nil;
     NSData *payload_data = [NSJSONSerialization dataWithJSONObject:payload
         options:NSJSONWritingFragmentsAllowed error:&serialize_error];
     if (payload_data == nil) {
-      helper->response_error_code = "invalid_response";
+      reject_response(helper, "invalid_response");
     } else if (payload_data.length > MAX_RESULT_BYTES) {
-      helper->response_error_code = "response_too_large";
+      reject_response(helper, "response_too_large");
     } else {
+      if (helper->binary_output.enabled) {
+        gsize bytes_length = 0;
+        gconstpointer bytes = g_bytes_get_data(data, &bytes_length);
+        BinaryOutputStatus status = binary_output_write(&helper->binary_output,
+            bytes, bytes_length);
+        if (status != BINARY_OUTPUT_OK) {
+          reject_response(helper, binary_output_status_name(status));
+          return;
+        }
+        helper->binary_written = TRUE;
+        helper->binary_byte_count = declared_bytes;
+      }
       helper->result_json = g_strndup(payload_data.bytes, payload_data.length);
       helper->result_received = TRUE;
     }
@@ -555,6 +632,8 @@ main(int argc, char **argv)
   guint64 pid = 0;
   guint64 timeout_ms = DEFAULT_TIMEOUT_MS;
   const char *script_path = NULL;
+  const char *binary_fd_value = NULL;
+  const char *binary_max_value = NULL;
   gboolean use_stdin = FALSE;
 
   for (int i = 1; i < argc; i++) {
@@ -571,6 +650,12 @@ main(int argc, char **argv)
       }
     } else if (strcmp(argv[i], "--script") == 0 && i + 1 < argc) {
       script_path = argv[++i];
+    } else if (strcmp(argv[i], "--binary-output-fd") == 0 && i + 1 < argc &&
+        binary_fd_value == NULL) {
+      binary_fd_value = argv[++i];
+    } else if (strcmp(argv[i], "--max-binary-bytes") == 0 && i + 1 < argc &&
+        binary_max_value == NULL) {
+      binary_max_value = argv[++i];
     } else if (strcmp(argv[i], "--stdin") == 0) {
       use_stdin = TRUE;
     } else {
@@ -582,6 +667,21 @@ main(int argc, char **argv)
   if (pid == 0 || (use_stdin == (script_path != NULL))) {
     write_input_error("invalid_arguments");
     return 2;
+  }
+
+  BinaryOutput binary_output = {0};
+  BinaryOutputStatus binary_status = binary_output_parse(binary_fd_value,
+      binary_max_value, &binary_output);
+  if (binary_status != BINARY_OUTPUT_OK) {
+    write_input_error(binary_output_status_name(binary_status));
+    return 2;
+  }
+  if (binary_output.enabled) {
+    binary_status = binary_output_validate(&binary_output);
+    if (binary_status != BINARY_OUTPUT_OK) {
+      write_input_error(binary_output_status_name(binary_status));
+      return 2;
+    }
   }
 
   guint8 *script_bytes = NULL;
@@ -616,20 +716,30 @@ main(int argc, char **argv)
 
   Helper helper = {0};
   helper.pid = (guint) pid;
+  helper.binary_output = binary_output;
   helper.script_source = g_strdup([script_source UTF8String]);
   frida_init();
   begin(&helper, (guint) timeout_ms);
 
   NSMutableDictionary *output = [NSMutableDictionary dictionary];
   BOOL success = helper.error_code == NULL && helper.result_received &&
-      helper.cleanup_code == NULL && !helper.hard_timeout;
+      helper.cleanup_code == NULL && !helper.hard_timeout &&
+      (!helper.binary_output.enabled || helper.binary_written);
+  if (helper.binary_output.enabled && !success) {
+    BinaryOutputStatus reset_status = binary_output_reset(&helper.binary_output);
+    if (reset_status != BINARY_OUTPUT_OK && helper.error_code == NULL)
+      fail(&helper, "binary_output", binary_output_status_name(reset_status));
+    helper.binary_written = FALSE;
+    helper.binary_byte_count = 0;
+  }
   output[@"ok"] = @(success);
   output[@"stage"] = [NSString stringWithUTF8String:success ? "complete" :
       (helper.error_stage != NULL ? helper.error_stage : "cleanup")];
   output[@"dispatch"] = [NSString stringWithUTF8String:
       helper.result_received ? "confirmed" :
       (helper.load_started ? "unknown" : "not_started")];
-  if (helper.result_received && helper.result_json != NULL) {
+  if (helper.result_received && helper.result_json != NULL &&
+      (!helper.binary_output.enabled || success)) {
     NSData *result_data = [[NSData alloc] initWithBytes:helper.result_json
         length:strlen(helper.result_json)];
     NSError *parse_error = nil;
@@ -645,6 +755,11 @@ main(int argc, char **argv)
     output[@"cleanupCode"] = [NSString stringWithUTF8String:helper.cleanup_code];
   if (helper.hard_timeout)
     output[@"cleanupIncomplete"] = @YES;
+  if (helper.binary_output.enabled) {
+    output[@"binaryWritten"] = @(success && helper.binary_written);
+    if (success)
+      output[@"binaryByteCount"] = @(helper.binary_byte_count);
+  }
   write_json(output);
 
   if (!helper.hard_timeout) {

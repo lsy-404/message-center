@@ -5,6 +5,8 @@ import test from 'node:test';
 const source = await readFile(new URL('../bridge/device/native-frida-helper/main.m', import.meta.url), 'utf8');
 const docs = await readFile(new URL('../bridge/device/native-frida-helper/README.md', import.meta.url), 'utf8');
 const workflow = await readFile(new URL('../.github/workflows/build-native-frida-helper.yml', import.meta.url), 'utf8');
+const binaryOutput = await readFile(new URL('../bridge/device/native-frida-helper/binary-output.c', import.meta.url), 'utf8');
+const binaryOutputHeader = await readFile(new URL('../bridge/device/native-frida-helper/binary-output.h', import.meta.url), 'utf8');
 
 test('helper accepts bounded script input and only the local Frida server', () => {
   assert.match(source, /MAX_INPUT_BYTES \(1024 \* 1024\)/);
@@ -24,9 +26,28 @@ test('helper reports uncertain dispatch after script loading starts', () => {
 
 test('helper latches the first valid send and reserves space for JSON envelopes', () => {
   assert.match(source, /MAX_RESULT_BYTES \(MAX_INPUT_BYTES - 4096\)/);
-  assert.match(source, /helper->cleanup_started \|\| helper->result_received \|\| message == NULL/);
+  assert.match(source, /if \(helper->result_received\)/);
   assert.match(source, /payload_data\.length > MAX_RESULT_BYTES/);
   assert.match(source, /data\.length > MAX_INPUT_BYTES/);
+});
+
+test('binary output is opt-in, single-result, bounded, and excludes payload bytes from stdout', () => {
+  assert.match(source, /--binary-output-fd/);
+  assert.match(source, /--max-binary-bytes/);
+  assert.match(source, /g_bytes_get_size\(data\)/);
+  assert.match(source, /g_bytes_get_data\(data, &bytes_length\)/);
+  assert.match(source, /declared_bytes != binary_length/);
+  assert.match(source, /binary_output_write\(/);
+  assert.match(source, /binary_output_reset\(/);
+  assert.match(source, /if \(helper->result_received\)/);
+  assert.match(source, /if \(helper->cleanup_started\)/);
+  assert.match(source, /binaryWritten/);
+  assert.match(binaryOutputHeader, /BINARY_OUTPUT_MAX_BYTES \(50u \* 1024u \* 1024u\)/);
+  assert.match(binaryOutput, /S_ISREG\(metadata\.st_mode\)/);
+  assert.match(binaryOutput, /metadata\.st_size != 0/);
+  assert.match(binaryOutput, /O_ACCMODE\) == O_RDONLY/);
+  assert.match(binaryOutput, /errno == EINTR/);
+  assert.match(docs, /caller.*verify the descriptor size/i);
 });
 
 test('build is manual with a narrow source trigger, pinned devkit, and artifact output', () => {
@@ -38,6 +59,7 @@ test('build is manual with a narrow source trigger, pinned devkit, and artifact 
   assert.match(workflow, /C31AA39618A6996BF43A472F2F48E3E4C2CC72EEE101A1ED6820192CBF58BDEC/);
   assert.match(workflow, /actions\/upload-artifact/);
   assert.match(workflow, /miphoneos-version-min=15\.0/);
+  assert.match(workflow, /-framework,CoreFoundation/);
   assert.match(workflow, /permissions:\s+contents: read/);
   assert.match(workflow, /ldid -Cadhoc -S/);
   assert.match(workflow, /every CodeDirectory must carry CS_ADHOC/);
