@@ -7,3 +7,4 @@
 - 新增 `test/ui-navigation-media.cjs`，覆盖多账号导航、账号会话筛选、混合正文、无附件占位与待上传状态。
 - `pnpm run check` 与 `pnpm run build` 均通过；`node test/ui-navigation-media.cjs` 通过合成浏览器夹具。
 - 本地提交为 `3526c77`（`Fix inbox navigation and image placeholders`）；原有未跟踪 `work/` 保持未暂存。
+- 已集成并部署验证。图片加载失败时仍保留正文占位提示；成功加载时仅按成功显示的图片数量移除独立占位行。
