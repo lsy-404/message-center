@@ -850,6 +850,64 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(len(scans), 2)
         self.assertEqual(len([call for call in calls if call[1].endswith("/heartbeat")]), 3)
 
+    def test_scan_failure_still_sends_offline_heartbeat_during_connector_backoff(self):
+        heartbeat_payloads = []
+        now = [1000.0]
+
+        def adapter(_request):
+            raise OSError("adapter unavailable")
+
+        def http(method, path, payload=None):
+            if path.endswith("/heartbeat"):
+                heartbeat_payloads.append(payload)
+            return {"ok": True, "commands": []}
+
+        relay = runtime.Relay(self.config, self.db, adapter, http)
+        with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]):
+            relay.pass_once()
+            self.assertGreater(relay.retry_at["connector-a"], now[0])
+            now[0] += 1
+            relay.pass_once()
+
+        self.assertEqual(len(heartbeat_payloads), 2)
+        self.assertTrue(all(item["state"] == "offline" for item in heartbeat_payloads))
+
+    def test_heartbeat_failure_uses_independent_bounded_backoff(self):
+        heartbeat_calls = []
+        now = [1000.0]
+
+        def adapter(_request):
+            return {"ok": True, "health": "online", "active": False,
+                    "cursor": None, "messages": []}
+
+        def http(method, path, payload=None):
+            if path.endswith("/heartbeat"):
+                heartbeat_calls.append(now[0])
+                if len(heartbeat_calls) == 1:
+                    raise OSError("heartbeat unavailable")
+            return {"ok": True, "commands": []}
+
+        relay = runtime.Relay(self.config, self.db, adapter, http)
+        with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]):
+            relay.pass_once()
+            self.assertEqual(relay.retry_at["connector-a"], 0)
+            self.assertEqual(relay.heartbeat_retry_at["connector-a"], now[0] + 15)
+            now[0] += 5
+            relay.pass_once()
+            self.assertEqual(heartbeat_calls, [1000.0])
+            now[0] += 10
+            relay.pass_once()
+
+        self.assertEqual(heartbeat_calls, [1000.0, 1015.0])
+        self.assertEqual(relay.heartbeat_retry_at["connector-a"], 0)
+        self.assertEqual(relay.heartbeat_failures["connector-a"], 0)
+        with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]):
+            expected_delays = [15, 30, 60, 60]
+            for delay in expected_delays:
+                relay.heartbeat_failed("connector-a")
+                self.assertEqual(relay.heartbeat_retry_at["connector-a"] - now[0], delay)
+                now[0] += delay
+
     def test_pending_more_scan_uses_fifteen_seconds_then_returns_to_active_or_idle_interval(self):
         scans = []
         now = [1000.0]
