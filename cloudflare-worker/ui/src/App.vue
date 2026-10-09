@@ -3,6 +3,11 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { FluentButton, FluentField, FluentSwitch, FluentTheme } from '@platform-kit/fluent/vue'
 import { createInboxReadGate, createInboxRefreshLoop } from './inbox-refresh.mjs'
 import {
+  clearPendingSendRequestKey,
+  getPendingSendRequestKey,
+  isAcceptedSendResponse,
+} from './send-request-key.mjs'
+import {
   CONVERSATION_PAGE_SIZE,
   conversationPageCount,
   filterConversations,
@@ -130,7 +135,6 @@ let toastTimer: number | undefined
 let pendingScrollToBottomId: string | null = null
 const draftCache = new Map<string, string>()
 const stagedCache = new Map<string, StagedAttachment[]>()
-const sendRequestCache = new Map<string, { fingerprint: string; id: string }>()
 const sendingConversationIds = ref(new Set<string>())
 const uploadingConversationIds = ref(new Set<string>())
 const updatingLayoutConnectorIds = ref(new Set<string>())
@@ -832,23 +836,31 @@ async function send() {
   const targetConversationId = conversation.id
   const sentDraft = draft.value
   const sentFiles = [...staged.value]
-  const fingerprint = JSON.stringify([sentDraft, sentFiles.map((file) => file.id)])
-  const cachedRequest = sendRequestCache.get(targetConversationId)
-  const clientRequestId = cachedRequest?.fingerprint === fingerprint
-    ? cachedRequest.id : `web-${crypto.randomUUID()}`
-  sendRequestCache.set(targetConversationId, { fingerprint, id: clientRequestId })
   sendingConversationIds.value = new Set([...sendingConversationIds.value, targetConversationId])
   try {
-    await api('/api/messages/send', {
+    const pendingRequest = await getPendingSendRequestKey(
+      targetConversationId, sentDraft, sentFiles.map((file) => file.id),
+    )
+    const accepted = await api<{
+      ok: boolean
+      messageId?: string
+      commandId?: string
+    }>('/api/messages/send', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         conversationId: conversation.id,
         body: sentDraft,
         attachmentIds: sentFiles.map((file) => file.id),
-        clientRequestId,
+        clientRequestId: pendingRequest.clientRequestId,
       }),
     })
+    if (!isAcceptedSendResponse(accepted)) throw new Error('send_acceptance_unconfirmed')
+    try {
+      clearPendingSendRequestKey(pendingRequest.fingerprint, pendingRequest.clientRequestId)
+    } catch {
+      // The accepted command remains recoverable with this request key.
+    }
   } catch (error) {
     notify(`发送失败：${error instanceof Error ? error.message : String(error)}`)
     return
@@ -857,7 +869,6 @@ async function send() {
     remaining.delete(targetConversationId)
     sendingConversationIds.value = remaining
   }
-  if (sendRequestCache.get(targetConversationId)?.id === clientRequestId) sendRequestCache.delete(targetConversationId)
   if (draftCache.get(targetConversationId) === sentDraft) draftCache.delete(targetConversationId)
   const sentFileIds = new Set(sentFiles.map((file) => file.id))
   const cachedFiles = stagedCache.get(targetConversationId)
