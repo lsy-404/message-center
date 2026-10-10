@@ -85,18 +85,6 @@ def _is_late_attachment_enrichment(existing_body, incoming_body):
         return False
 
 
-def _deduplicate_outbox_batch(encoded):
-    unique = []
-    by_key = {}
-    for item in encoded:
-        key = (item[0], item[2])
-        previous = by_key.get(key)
-        if previous is None:
-            by_key[key] = item
-            unique.append(item)
-        elif previous[1:] != item[1:]:
-            raise RuntimeError("event_id_conflict_in_page")
-    return unique
 
 
 def _ack_count(response, key, maximum):
@@ -535,7 +523,6 @@ class Relay:
                 page_ids[message["externalId"]] = body
                 encoded.append((self.connector, profile, str(message["externalId"]), body,
                                 len(raw) + media_size))
-        encoded = _deduplicate_outbox_batch(encoded)
         candidate = compact(result.get("cursor"))
         if len(candidate.encode("utf-8")) > 65536:
             raise RuntimeError("cursor_too_large")
