@@ -528,6 +528,35 @@ class DeviceRuntimeTests(unittest.TestCase):
             relay.scan_profile("primary")
         self.assertEqual(json_cursor(self.db), old)
 
+    def test_same_batch_external_id_conflict_keeps_rows_and_cursor_unchanged(self):
+        old = runtime.compact({"next": "old"})
+        self.db.execute("INSERT INTO cursors(connector_id,profile,value) VALUES('connector-a','primary',?)", (old,))
+        self.db.commit()
+        first = self.event("duplicate-id")
+        second = dict(first, body="different")
+        relay = runtime.Relay(self.config, self.db,
+                              lambda _request: {"ok": True, "health": "online", "cursor": {"next": "new"},
+                                                "messages": [first, second]},
+                              lambda *_args: {"ok": True})
+        with self.assertRaisesRegex(RuntimeError, "event_id_conflict_in_page"):
+            relay.scan_profile("primary")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+        self.assertEqual(json_cursor(self.db), old)
+
+    def test_same_batch_exact_duplicate_consumes_outbox_budget_once(self):
+        message = dict(self.event("duplicate-id"), contentType="text")
+        expected_size = len(runtime.compact({"connectorId": "connector-a", "messages": [message]}).encode())
+        self.config["outboxMaxBytes"] = expected_size
+        relay = runtime.Relay(self.config, self.db,
+                              lambda _request: {"ok": True, "health": "online", "cursor": {"next": "new"},
+                                                "messages": [message, dict(message)]},
+                              lambda *_args: {"ok": True})
+        self.assertTrue(relay.scan_profile("primary"))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox WHERE external_id='duplicate-id'").fetchone()[0], 1)
+        self.assertEqual(relay.count_bytes("connector-a"), expected_size)
+        self.assertEqual(json_cursor(self.db), runtime.compact({"next": "new"}))
+
     def test_page_that_would_exceed_capacity_does_not_advance_cursor(self):
         old = runtime.compact({"next": "old"})
         self.db.execute("INSERT INTO cursors(connector_id,profile,value) VALUES('connector-a','primary',?)", (old,))

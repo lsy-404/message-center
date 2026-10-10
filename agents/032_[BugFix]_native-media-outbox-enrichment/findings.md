@@ -7,3 +7,4 @@
 - The normalized late event may change only `contentType` from `text` to `mixed` and add a nonempty `attachments` list. Compare all other fields using canonical JSON serialization, preserving scalar types.
 - Existing `size` covers serialized event bytes plus staged attachment bytes. For enrichment, capacity must account for `new_size - old_size`, while ordinary inserts continue to consume their full size.
 - An enrichment must match the original connector, profile, and external ID. Updating the row in place preserves its `seq`, so FIFO ordering and any existing outbox row identity remain stable.
+- Batch-level deduplication is enforced again on the encoded outbox rows before capacity accounting. Identical rows with the same connector/profile/external ID coalesce once; any difference, including an enrichment transition within one batch, fails closed before cursor/profile side effects.
