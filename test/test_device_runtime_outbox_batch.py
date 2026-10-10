@@ -133,6 +133,66 @@ class DeviceRuntimeOutboxBatchTests(unittest.TestCase):
         self.assertLessEqual(payload_bytes, runtime.MAX_OUTBOX_BATCH_BYTES)
         self.assertEqual(len(self.outbox_ids()), 12 - len(calls[0]["messages"]))
 
+    def test_oversized_head_fails_closed_without_singleton_send(self):
+        oversized = self.event("oversized-head", body="x" * runtime.MAX_OUTBOX_BATCH_BYTES)
+        self.enqueue(oversized)
+        calls = []
+        relay = self.make_relay(lambda *args: calls.append(args) or self.event_ack(1))
+
+        self.assertIsNone(relay.flush_one())
+        self.assertEqual(calls, [])
+        self.assertEqual(self.outbox_ids(), ["oversized-head"])
+
+    def test_bad_qq_head_does_not_block_wechat_connector(self):
+        self.config["connectors"].append({
+            "id": "connector-b", "token": "y" * 40, "profile": "primary",
+            "kind": "wechat", "accountLabel": "test", "displayName": "device",
+        })
+        self.db.execute(
+            "INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,?)",
+            ("connector-a", "primary", "bad-head", "not-json", 1),
+        )
+        self.enqueue(self.event("wechat-next"), connector_id="connector-b")
+        calls = []
+
+        def http(_method, path, payload=None):
+            calls.append((path, payload["connectorId"],
+                          [item["externalId"] for item in payload["messages"]]))
+            return self.event_ack(len(payload["messages"]))
+
+        relay = self.make_relay(http)
+        self.assertEqual(relay.flush_one(), "connector-b")
+        self.assertEqual(calls, [
+            ("/api/connectors/events", "connector-b", ["wechat-next"]),
+        ])
+        self.assertEqual(self.outbox_ids(), ["bad-head"])
+        self.assertEqual(self.db.execute(
+            "SELECT external_id FROM outbox WHERE connector_id='connector-b'").fetchall(), [])
+
+    def test_oversized_qq_head_does_not_block_wechat_connector(self):
+        self.config["connectors"].append({
+            "id": "connector-b", "token": "y" * 40, "profile": "primary",
+            "kind": "wechat", "accountLabel": "test", "displayName": "device",
+        })
+        oversized = self.event("oversized-head", body="x" * runtime.MAX_OUTBOX_BATCH_BYTES)
+        self.enqueue(oversized)
+        self.enqueue(self.event("wechat-next"), connector_id="connector-b")
+        calls = []
+
+        def http(_method, path, payload=None):
+            calls.append((path, payload["connectorId"],
+                          [item["externalId"] for item in payload["messages"]]))
+            return self.event_ack(len(payload["messages"]))
+
+        relay = self.make_relay(http)
+        self.assertEqual(relay.flush_one(), "connector-b")
+        self.assertEqual(calls, [
+            ("/api/connectors/events", "connector-b", ["wechat-next"]),
+        ])
+        self.assertEqual(self.outbox_ids(), ["oversized-head"])
+        self.assertEqual(self.db.execute(
+            "SELECT external_id FROM outbox WHERE connector_id='connector-b'").fetchall(), [])
+
     def test_attachment_row_keeps_single_upload_path_and_blocks_following_batch(self):
         text_before = self.event("before")
         attachment = {"externalId": "file-1", "fileName": "image.png", "mimeType": "image/png",

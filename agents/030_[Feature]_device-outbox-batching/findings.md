@@ -8,3 +8,5 @@ The device outbox stores compact serialized event bodies and their byte length p
 
 
 The implementation caps a batch at 20 rows and `MAX_SCAN_RESPONSE` bytes of the exact serialized request, while preserving connector rotation after each successful batch. Prefix deletion compares every selected row's sequence, connector, profile, external ID, body, and stored size within one `BEGIN IMMEDIATE` transaction; any mismatch rolls back the batch deletion. Attachment rows still use the single-event upload path.
+
+A first text row whose serialized request exceeds the byte cap fails closed and stays queued; it is not sent as an oversized singleton. Prefix parsing and preparation run inside each connector's failure boundary, so a malformed or oversized head backs off only that connector and does not starve another connector in the same flush pass.

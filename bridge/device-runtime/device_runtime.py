@@ -344,7 +344,7 @@ class Relay:
         route = _event_route(first_message)
         payload = {"connectorId": connector_id, "messages": selected_messages}
         if len(compact(payload).encode("utf-8")) > MAX_OUTBOX_BATCH_BYTES:
-            return selected_rows, selected_messages
+            raise RuntimeError("outbox_batch_payload_too_large")
         for row in rows[1:]:
             if row[1] != first_row[1]:
                 break
@@ -631,10 +631,10 @@ class Relay:
                                   (connector_id,)).fetchone()
             if row is None:
                 continue
-            rows, messages = self._outbox_prefix(connector_id, row)
-            profile = row[1]
-            self.select_connector(connector)
             try:
+                profile = row[1]
+                self.select_connector(connector)
+                rows, messages = self._outbox_prefix(connector_id, row)
                 message = messages[0]
                 attachments = message.get("attachments", [])
                 for attachment in attachments:
