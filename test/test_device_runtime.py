@@ -234,6 +234,145 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertNotIn("stagingKey", cloud_attachment)
         self.assertFalse(os.path.exists(os.path.join(media_dir, "image-one.bin")))
 
+    def test_same_event_late_attachment_enriches_existing_outbox_row(self):
+        media_root = os.path.join(self.temp.name, "media")
+        media_dir = os.path.join(media_root, "connector-a")
+        os.makedirs(media_dir)
+        payload = b"late-image-bytes"
+        with open(os.path.join(media_dir, "late-image.bin"), "wb") as staged:
+            staged.write(payload)
+        attachment = {"externalId": "file-late", "fileName": "late.png", "mimeType": "image/png",
+                      "sizeBytes": len(payload), "sha256": runtime.hashlib.sha256(payload).hexdigest(),
+                      "stagingKey": "late-image.bin"}
+        placeholder = dict(self.event("late-media"), contentType="text", attachments=[])
+        enriched = dict(placeholder, contentType="mixed", attachments=[attachment])
+        current = {"event": placeholder, "cursor": {"n": 1}}
+        relay = runtime.Relay(self.config, self.db,
+                              lambda _request: {"ok": True, "health": "online",
+                                  "cursor": current["cursor"], "messages": [current["event"]]},
+                              lambda *_args: {"ok": True})
+        relay.media_directory = media_root
+        self.assertTrue(relay.scan_profile("primary"))
+        old_row = self.db.execute("SELECT seq,body,size FROM outbox WHERE external_id='late-media'").fetchone()
+        self.assertEqual(json.loads(old_row[1])["attachments"], [])
+        self.assertEqual(json_cursor(self.db), runtime.compact({"n": 1}))
+
+        current["event"] = enriched
+        current["cursor"] = {"n": 2}
+        self.assertTrue(relay.scan_profile("primary"))
+        new_row = self.db.execute("SELECT seq,body,size FROM outbox WHERE external_id='late-media'").fetchone()
+        self.assertEqual(new_row[0], old_row[0])
+        saved = json.loads(new_row[1])
+        self.assertEqual(saved["contentType"], "mixed")
+        self.assertEqual(saved["attachments"], [attachment])
+        expected_size = len(runtime.compact({"connectorId": "connector-a", "messages": [saved]}).encode()) + len(payload)
+        self.assertEqual(new_row[2], expected_size)
+        self.assertEqual(json_cursor(self.db), runtime.compact({"n": 2}))
+
+    def test_late_attachment_conflict_and_invalid_staging_leave_placeholder_and_cursor(self):
+        media_root = os.path.join(self.temp.name, "media")
+        media_dir = os.path.join(media_root, "connector-a")
+        os.makedirs(media_dir)
+        payload = b"late-image-bytes"
+        with open(os.path.join(media_dir, "late-image.bin"), "wb") as staged:
+            staged.write(payload)
+        attachment = {"externalId": "file-late", "fileName": "late.png", "mimeType": "image/png",
+                      "sizeBytes": len(payload), "sha256": runtime.hashlib.sha256(payload).hexdigest(),
+                      "stagingKey": "late-image.bin"}
+        placeholder = dict(self.event("late-media"), contentType="text")
+        enriched = dict(placeholder, contentType="mixed", attachments=[attachment])
+        current = {"event": placeholder, "cursor": {"n": 1}}
+        relay = runtime.Relay(self.config, self.db,
+                              lambda _request: {"ok": True, "health": "online",
+                                  "cursor": current["cursor"], "messages": [current["event"]]},
+                              lambda *_args: {"ok": True})
+        relay.media_directory = media_root
+        relay.scan_profile("primary")
+        old_row = self.db.execute("SELECT seq,body,size FROM outbox WHERE external_id='late-media'").fetchone()
+        old_cursor = json_cursor(self.db)
+
+        current["event"] = dict(enriched, senderName="Other")
+        current["cursor"] = {"n": 2}
+        with self.assertRaisesRegex(RuntimeError, "event_id_conflict_in_outbox"):
+            relay.scan_profile("primary")
+        self.assertEqual(self.db.execute("SELECT seq,body,size FROM outbox WHERE external_id='late-media'").fetchone(), old_row)
+        self.assertEqual(json_cursor(self.db), old_cursor)
+
+        current["event"] = dict(enriched, contentType="text")
+        with self.assertRaisesRegex(RuntimeError, "event_id_conflict_in_outbox"):
+            relay.scan_profile("primary")
+        self.assertEqual(self.db.execute("SELECT seq,body,size FROM outbox WHERE external_id='late-media'").fetchone(), old_row)
+        self.assertEqual(json_cursor(self.db), old_cursor)
+
+        current["event"] = dict(enriched, attachments=[dict(attachment, stagingKey="missing.bin")])
+        with self.assertRaisesRegex(RuntimeError, "staged_file_missing"):
+            relay.scan_profile("primary")
+        self.assertEqual(self.db.execute("SELECT seq,body,size FROM outbox WHERE external_id='late-media'").fetchone(), old_row)
+        self.assertEqual(json_cursor(self.db), old_cursor)
+
+    def test_late_attachment_byte_budget_uses_size_delta_and_rolls_back_cursor(self):
+        media_root = os.path.join(self.temp.name, "media")
+        media_dir = os.path.join(media_root, "connector-a")
+        os.makedirs(media_dir)
+        payload = b"late-image-bytes"
+        with open(os.path.join(media_dir, "late-image.bin"), "wb") as staged:
+            staged.write(payload)
+        attachment = {"externalId": "file-late", "fileName": "late.png", "mimeType": "image/png",
+                      "sizeBytes": len(payload), "sha256": runtime.hashlib.sha256(payload).hexdigest(),
+                      "stagingKey": "late-image.bin"}
+        placeholder = dict(self.event("late-media"), contentType="text")
+        enriched = dict(placeholder, contentType="mixed", attachments=[attachment])
+        current = {"event": placeholder, "cursor": {"n": 1}}
+        relay = runtime.Relay(self.config, self.db,
+                              lambda _request: {"ok": True, "health": "online",
+                                  "cursor": current["cursor"], "messages": [current["event"]]},
+                              lambda *_args: {"ok": True})
+        relay.media_directory = media_root
+        relay.scan_profile("primary")
+        old_row = self.db.execute("SELECT seq,body,size FROM outbox WHERE external_id='late-media'").fetchone()
+        old_cursor = json_cursor(self.db)
+        new_size = len(runtime.compact({"connectorId": "connector-a", "messages": [enriched]}).encode()) + len(payload)
+        self.assertGreater(new_size, old_row[2])
+        self.config["outboxMaxBytes"] = new_size - 1
+        current["event"] = enriched
+        current["cursor"] = {"n": 2}
+
+        self.assertIsNone(relay.scan_profile("primary"))
+        self.assertEqual(self.db.execute("SELECT seq,body,size FROM outbox WHERE external_id='late-media'").fetchone(), old_row)
+        self.assertEqual(json_cursor(self.db), old_cursor)
+
+    def test_late_attachment_update_rolls_back_when_cursor_commit_fails(self):
+        media_root = os.path.join(self.temp.name, "media")
+        media_dir = os.path.join(media_root, "connector-a")
+        os.makedirs(media_dir)
+        payload = b"late-image-bytes"
+        with open(os.path.join(media_dir, "late-image.bin"), "wb") as staged:
+            staged.write(payload)
+        attachment = {"externalId": "file-late", "fileName": "late.png", "mimeType": "image/png",
+                      "sizeBytes": len(payload), "sha256": runtime.hashlib.sha256(payload).hexdigest(),
+                      "stagingKey": "late-image.bin"}
+        placeholder = dict(self.event("late-media"), contentType="text")
+        enriched = dict(placeholder, contentType="mixed", attachments=[attachment])
+        current = {"event": placeholder, "cursor": {"n": 1}}
+        relay = runtime.Relay(self.config, self.db,
+                              lambda _request: {"ok": True, "health": "online",
+                                  "cursor": current["cursor"], "messages": [current["event"]]},
+                              lambda *_args: {"ok": True})
+        relay.media_directory = media_root
+        relay.scan_profile("primary")
+        old_row = self.db.execute("SELECT seq,body,size FROM outbox WHERE external_id='late-media'").fetchone()
+        old_cursor = json_cursor(self.db)
+        self.db.execute("CREATE TRIGGER fail_cursor_update BEFORE UPDATE ON cursors "
+                        "BEGIN SELECT RAISE(ABORT, 'cursor write failed'); END")
+        self.db.commit()
+        current["event"] = enriched
+        current["cursor"] = {"n": 2}
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            relay.scan_profile("primary")
+        self.assertEqual(self.db.execute("SELECT seq,body,size FROM outbox WHERE external_id='late-media'").fetchone(), old_row)
+        self.assertEqual(json_cursor(self.db), old_cursor)
+
     def test_connector_media_directories_isolate_same_staging_key_and_cleanup(self):
         second = dict(self.config["connectors"][0], id="connector-b", token="y" * 40, profile="secondary")
         self.config["connectors"].append(second)

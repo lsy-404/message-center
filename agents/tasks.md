@@ -43,3 +43,4 @@
 | 030 | [BugFix] Native helper eternalize acknowledgement | Attempt a generic script event after persistent lifetime is established | Prevent callback pointers from being published before helper lifetime is confirmed | ❌ 已废弃；runtime 验证表明 eternalize 后的 post 未送达 |
 
 | 031 | [BugFix] Canonical channel labels | Normalize known QQ and WeChat aliases consistently across navigation and filtering | Duplicate channel buckets caused by free-form casing and language labels | ✅ Completed |
+| 032 | [BugFix] Native media outbox enrichment | Allow a same-ID event with newly validated attachments to enrich an attachment-free durable outbox row atomically | Native receive may first persist a text placeholder before media staging completes | ✅ Completed; full Python tests pass |
