@@ -211,8 +211,6 @@ on_script_eternalized(GObject *source, GAsyncResult *result, gpointer user_data)
     return;
   }
   helper->script_eternalized = TRUE;
-  frida_script_post(helper->script,
-      "{\"type\":\"native-helper-eternalized\"}", NULL);
   start_cleanup(helper);
 }
 

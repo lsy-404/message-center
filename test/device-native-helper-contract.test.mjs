@@ -31,22 +31,17 @@ test('script eternalization is opt-in and follows only a valid setup result', ()
   assert.match(source, /frida_script_eternalize\(helper->script/);
   assert.match(source, /frida_script_eternalize_finish\(/);
   assert.match(source, /helper->script_eternalized = TRUE;/);
-  assert.ok(source.includes('"{\\"type\\":\\"native-helper-eternalized\\"}"'));
   const eternalizeCallback = source.match(/on_script_eternalized\([\s\S]*?(?=static void\ncomplete_script)/)?.[0];
   assert.ok(eternalizeCallback);
   assert.match(eternalizeCallback,
-    /if \(error != NULL\) \{[\s\S]*?start_cleanup\(helper\);\s+return;\s+\}[\s\S]*?helper->script_eternalized = TRUE;[\s\S]*?frida_script_post\(helper->script,[\s\S]*?start_cleanup\(helper\);/);
-  assert.ok(eternalizeCallback.indexOf('helper->script_eternalized = TRUE;') <
-    eternalizeCallback.indexOf('frida_script_post('));
-  assert.ok(eternalizeCallback.indexOf('frida_script_post(') <
-    eternalizeCallback.lastIndexOf('start_cleanup(helper);'));
+    /if \(error != NULL\) \{[\s\S]*?start_cleanup\(helper\);\s+return;\s+\}[\s\S]*?helper->script_eternalized = TRUE;[\s\S]*?start_cleanup\(helper\);/);
+  assert.doesNotMatch(eternalizeCallback, /frida_script_post\(/);
   assert.ok(source.includes('output[@"scriptLifetime"] = @"eternalized";'));
   assert.match(source, /\(!helper\.eternalize_requested \|\| helper\.script_eternalized\)/);
   assert.match(source, /if \(helper->script_eternalized\) \{\s+detach_session\(helper\);/);
   assert.match(docs, /--eternalize/);
   assert.match(docs, /without unloading the script/);
-  assert.match(docs, /native-helper-eternalized/);
-  assert.match(docs, /event is never posted when eternalization fails/);
+  assert.doesNotMatch(docs, /native-helper-eternalized/);
 });
 
 test('helper latches the first valid send and reserves space for JSON envelopes', () => {
