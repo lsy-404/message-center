@@ -25,6 +25,8 @@ if os.name == "posix":
 MAX_RESPONSE = 1024 * 1024
 MAX_SCAN_RESPONSE = 900 * 1024
 MAX_EVENT = 256 * 1024
+MAX_OUTBOX_BATCH_MESSAGES = 20
+MAX_OUTBOX_BATCH_BYTES = MAX_SCAN_RESPONSE
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 MEDIA_CHUNK = 64 * 1024
 MEDIA_UPLOAD_TIMEOUT = 600
@@ -39,6 +41,30 @@ ADAPTER_SEND_TIMEOUT = 90
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, response, code, message, headers, new_url):
         raise urllib.error.HTTPError(request.full_url, code, "redirect_refused", headers, response)
+
+
+def _event_route(message):
+    default_trigger = "background" if message.get("conversationType") == "group" else "direct"
+    background_group = (message.get("conversationType") == "group" and
+                        message.get("trigger", default_trigger) == "background")
+    return "/api/connectors/group-text-backups" if background_group else "/api/connectors/events"
+
+
+def _is_batchable_text(message):
+    if not isinstance(message, dict):
+        return False
+    attachments = message.get("attachments", [])
+    content_type = message.get("contentType")
+    return (isinstance(message.get("body"), str)
+            and bool(message["body"]) and attachments == []
+            and content_type in (None, "", "text"))
+
+
+def _ack_count(response, key, maximum):
+    value = response.get(key)
+    if type(value) is not int or value < 0 or value > maximum:
+        raise RuntimeError("invalid_event_ack")
+    return value
 
 
 def open_database(path):
@@ -299,6 +325,78 @@ class Relay:
             except OSError:
                 pass
 
+    def _outbox_prefix(self, connector_id, first_row):
+        rows = self.db.execute(
+            "SELECT seq,profile,external_id,body,size FROM outbox "
+            "WHERE connector_id=? ORDER BY seq LIMIT ?",
+            (connector_id, MAX_OUTBOX_BATCH_MESSAGES),
+        ).fetchall()
+        if not rows or rows[0] != first_row:
+            raise RuntimeError("outbox_head_changed")
+        try:
+            first_message = json.loads(first_row[3])
+        except (TypeError, ValueError):
+            return [first_row], [None]
+        if not _is_batchable_text(first_message):
+            return [first_row], [first_message]
+        selected_rows = [first_row]
+        selected_messages = [first_message]
+        route = _event_route(first_message)
+        payload = {"connectorId": connector_id, "messages": selected_messages}
+        if len(compact(payload).encode("utf-8")) > MAX_OUTBOX_BATCH_BYTES:
+            raise RuntimeError("outbox_batch_payload_too_large")
+        for row in rows[1:]:
+            if row[1] != first_row[1]:
+                break
+            try:
+                message = json.loads(row[3])
+            except (TypeError, ValueError):
+                break
+            if not _is_batchable_text(message) or _event_route(message) != route:
+                break
+            candidate_messages = selected_messages + [message]
+            candidate_payload = {"connectorId": connector_id, "messages": candidate_messages}
+            if len(compact(candidate_payload).encode("utf-8")) > MAX_OUTBOX_BATCH_BYTES:
+                break
+            selected_rows.append(row)
+            selected_messages.append(message)
+        return selected_rows, selected_messages
+
+    def _validate_event_ack(self, path, response, expected_count):
+        if not isinstance(response, dict) or response.get("ok") is not True:
+            raise RuntimeError("event_not_acknowledged")
+        if _ack_count(response, "received", expected_count) != expected_count:
+            raise RuntimeError("event_not_acknowledged")
+        if path == "/api/connectors/events":
+            _ack_count(response, "inserted", expected_count)
+            _ack_count(response, "upgraded", expected_count)
+            _ack_count(response, "promoted", expected_count)
+            if _ack_count(response, "suppressed", expected_count) != 0:
+                raise RuntimeError("event_not_acknowledged")
+        elif path == "/api/connectors/group-text-backups":
+            _ack_count(response, "inserted", expected_count)
+            _ack_count(response, "normalizedInserted", expected_count)
+            if type(response.get("retentionDays")) is not int or response["retentionDays"] != 30:
+                raise RuntimeError("event_not_acknowledged")
+        else:
+            raise RuntimeError("event_route_unavailable")
+
+    def _delete_outbox_prefix(self, connector_id, rows):
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            for seq, profile, external_id, body, size in rows:
+                cursor = self.db.execute(
+                    "DELETE FROM outbox WHERE seq=? AND connector_id=? AND profile=? "
+                    "AND external_id=? AND body=? AND size=?",
+                    (seq, connector_id, profile, external_id, body, size),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("outbox_prefix_changed")
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+
     def scan_profile(self, profile, history=False):
         ceiling = max(1, int(self.config.get("outboxMaxBytes", DEFAULT_OUTBOX_BYTES)) // len(self.connectors))
         if self.count_bytes(self.connector) >= ceiling:
@@ -528,35 +626,31 @@ class Relay:
             connector_id = connector["id"]
             if not self.eligible(connector_id):
                 continue
-            row = self.db.execute("SELECT seq,profile,body FROM outbox WHERE connector_id=? ORDER BY seq LIMIT 1",
+            row = self.db.execute("SELECT seq,profile,external_id,body,size FROM outbox "
+                                  "WHERE connector_id=? ORDER BY seq LIMIT 1",
                                   (connector_id,)).fetchone()
             if row is None:
                 continue
-            seq, profile, body = row
-            self.select_connector(connector)
             try:
-                message = json.loads(body)
+                profile = row[1]
+                self.select_connector(connector)
+                rows, messages = self._outbox_prefix(connector_id, row)
+                message = messages[0]
                 attachments = message.get("attachments", [])
                 for attachment in attachments:
                     self.upload_attachment(message, attachment)
                 if attachments:
                     message["attachments"] = [{key: value for key, value in attachment.items()
                                                if key != "stagingKey"} for attachment in attachments]
-                default_trigger = "background" if message.get("conversationType") == "group" else "direct"
-                background_group = (message.get("conversationType") == "group" and
-                                    message.get("trigger", default_trigger) == "background")
-                path = ("/api/connectors/group-text-backups" if background_group
-                        else "/api/connectors/events")
+                path = _event_route(message)
                 response = self.http_call("POST", path,
-                                          {"connectorId": connector_id, "messages": [message]})
-                if response.get("ok") is not True or response.get("suppressed", 0) > 0:
-                    raise RuntimeError("event_not_acknowledged")
+                                          {"connectorId": connector_id, "messages": messages})
+                self._validate_event_ack(path, response, len(rows))
             except Exception:
                 self.failed(connector_id)
                 continue
-            self.db.execute("DELETE FROM outbox WHERE seq=?", (seq,))
-            self.db.commit()
-            for attachment in json.loads(body).get("attachments", []):
+            self._delete_outbox_prefix(connector_id, rows)
+            for attachment in attachments:
                 try:
                     os.remove(os.path.join(self.media_directory_for(connector_id), attachment["stagingKey"]))
                 except OSError:

@@ -91,8 +91,16 @@ async function postEvent(message) {
   return connectorRequest('/api/connectors/events', 'POST', { connectorId, messages: [message] })
 }
 
+async function postEvents(messages) {
+  return connectorRequest('/api/connectors/events', 'POST', { connectorId, messages })
+}
+
 async function postGroupBackup(message) {
   return connectorRequest('/api/connectors/group-text-backups', 'POST', { connectorId, messages: [message] })
+}
+
+async function postGroupBackups(messages) {
+  return connectorRequest('/api/connectors/group-text-backups', 'POST', { connectorId, messages })
 }
 
 const eventBase = {
@@ -104,6 +112,23 @@ const eventBase = {
   conversationType: 'direct',
   trigger: 'direct',
 }
+const directBatch = [
+  { ...eventBase, externalId: 'message-batch-a', body: 'batch a' },
+  { ...eventBase, externalId: 'message-batch-b', body: 'batch b' },
+]
+const directBatchFirst = await postEvents(directBatch)
+assert.equal(directBatchFirst.status, 200)
+assert.deepEqual(await directBatchFirst.json(), {
+  ok: true, received: 2, inserted: 2, upgraded: 0, promoted: 0, suppressed: 0,
+})
+const directBatchReplay = await postEvents(directBatch)
+assert.equal(directBatchReplay.status, 200)
+assert.deepEqual(await directBatchReplay.json(), {
+  ok: true, received: 2, inserted: 0, upgraded: 0, promoted: 0, suppressed: 0,
+})
+assert.equal(database.prepare("SELECT COUNT(*) AS count FROM messages WHERE external_id IN ('message-batch-a', 'message-batch-b')")
+  .get().count, 2)
+
 const firstEvent = await postEvent({ ...eventBase, externalId: 'message-direct' })
 assert.equal(firstEvent.status, 200)
 const directMessage = database.prepare("SELECT id, metadata_json, content_type FROM messages WHERE external_id = 'message-direct'").get()
@@ -145,6 +170,25 @@ const groupBase = {
   conversationType: 'group',
   placement: 'normal',
 }
+const groupBatch = [
+  { ...groupBase, externalId: 'message-group-batch-a', conversationExternalId: 'conversation-group-batch',
+    conversationTitle: 'Group batch', senderName: 'Group sender', body: 'group batch a' },
+  { ...groupBase, externalId: 'message-group-batch-b', conversationExternalId: 'conversation-group-batch',
+    conversationTitle: 'Group batch', senderName: 'Group sender', body: 'group batch b' },
+]
+const groupBatchFirst = await postGroupBackups(groupBatch)
+assert.equal(groupBatchFirst.status, 200)
+assert.deepEqual(await groupBatchFirst.json(), {
+  ok: true, received: 2, inserted: 2, normalizedInserted: 2, retentionDays: 30,
+})
+const groupBatchReplay = await postGroupBackups(groupBatch)
+assert.equal(groupBatchReplay.status, 200)
+assert.deepEqual(await groupBatchReplay.json(), {
+  ok: true, received: 2, inserted: 0, normalizedInserted: 0, retentionDays: 30,
+})
+assert.equal(database.prepare("SELECT COUNT(*) AS count FROM messages WHERE external_id IN ('message-group-batch-a', 'message-group-batch-b')")
+  .get().count, 2)
+
 const firstGroup = await postGroupBackup(groupBase)
 assert.equal(firstGroup.status, 200)
 const groupMessage = database.prepare("SELECT id, metadata_json, content_type FROM messages WHERE external_id = 'message-group'").get()
