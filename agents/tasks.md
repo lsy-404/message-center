@@ -41,3 +41,5 @@
 | 029 | [Feature] Frida eternalized-script-helper | Add opt-in generic persistent-script lifecycle support to the native helper | Keep a coordinator script alive across short-lived Frida sessions without changing default helper cleanup | 🔄 进行中 |
 
 | 030 | [BugFix] Native helper eternalize acknowledgement | Attempt a generic script event after persistent lifetime is established | Prevent callback pointers from being published before helper lifetime is confirmed | ❌ 已废弃；runtime 验证表明 eternalize 后的 post 未送达 |
+
+| 031 | [BugFix] Canonical channel labels | Normalize known QQ and WeChat aliases consistently across navigation and filtering | Duplicate channel buckets caused by free-form casing and language labels | ✅ Completed |

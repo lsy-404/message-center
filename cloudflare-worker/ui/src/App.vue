@@ -11,6 +11,7 @@ import {
   CONVERSATION_PAGE_SIZE,
   conversationPageCount,
   filterConversations,
+  normalizeChannelLabel,
   nextConversationPage,
   pageConversations,
   previousConversationPage,
@@ -242,10 +243,14 @@ const canSend = computed(() => {
 
 function channelLabel(item: Connector | Conversation | null | undefined) {
   if (!item) return '未知'
-  if ('channelLabel' in item && item.channelLabel) return item.channelLabel
-  if ('connectorChannelLabel' in item && item.connectorChannelLabel) return item.connectorChannelLabel
+  if ('channelLabel' in item && item.channelLabel) return normalizeChannelLabel(item.channelLabel)
+  if ('connectorChannelLabel' in item && item.connectorChannelLabel) {
+    return normalizeChannelLabel(item.connectorChannelLabel)
+  }
   const kind = 'kind' in item ? item.kind : item.connectorKind
-  return ({ im: '即时消息', email: '邮箱', sms: '短信', voice: '语音', webhook: 'Webhook' } as Record<string, string>)[kind] || kind
+  return normalizeChannelLabel(
+    ({ im: '即时消息', email: '邮箱', sms: '短信', voice: '语音', webhook: 'Webhook' } as Record<string, string>)[kind] || kind,
+  )
 }
 
 function capLabel(capability: string) {

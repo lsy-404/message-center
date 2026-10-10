@@ -1,17 +1,25 @@
 export const CONVERSATION_PAGE_SIZE = 100
 
+export function normalizeChannelLabel(value) {
+  const label = String(value || '')
+  const knownLabel = label.trim().toLowerCase()
+  if (knownLabel === 'qq') return 'QQ'
+  if (knownLabel === 'wechat' || knownLabel === '微信') return '微信'
+  return label
+}
+
 export function filterConversations(conversations, options = {}) {
   const connectorId = String(options.connectorId || '')
-  const channelLabel = String(options.channelLabel || '')
+  const channelLabel = normalizeChannelLabel(options.channelLabel || '')
   const query = String(options.query || '').trim().toLowerCase()
   const getChannelLabel = options.getChannelLabel
 
   return conversations.filter((conversation) => {
     if (connectorId && conversation.connectorId !== connectorId) return false
     if (channelLabel) {
-      const label = getChannelLabel
+      const label = normalizeChannelLabel(getChannelLabel
         ? getChannelLabel(conversation)
-        : String(conversation.connectorChannelLabel || conversation.connectorKind || '')
+        : String(conversation.connectorChannelLabel || conversation.connectorKind || ''))
       if (label !== channelLabel) return false
     }
     if (!query) return true
