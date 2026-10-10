@@ -39,3 +39,5 @@
 
 | 028 | [BugFix] web-durable-send-request-key | Persist and reuse a send request key across reload/network error until Worker acceptance is confirmed | Prevent duplicate queued sends after a lost HTTP response | 🔄 进行中 |
 | 029 | [Feature] Frida eternalized-script-helper | Add opt-in generic persistent-script lifecycle support to the native helper | Keep a coordinator script alive across short-lived Frida sessions without changing default helper cleanup | 🔄 进行中 |
+
+| 030 | [BugFix] Native helper eternalize acknowledgement | Emit a generic script event only after persistent lifetime is established | Prevent a script from publishing callback pointers before Frida confirms eternalization | ✅ 已完成；生命周期契约测试通过 |
