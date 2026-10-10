@@ -60,6 +60,33 @@ def _is_batchable_text(message):
             and content_type in (None, "", "text"))
 
 
+def _is_late_attachment_enrichment(existing_body, incoming_body):
+    try:
+        existing = json.loads(existing_body)
+        incoming = json.loads(incoming_body)
+        if not isinstance(existing, dict) or not isinstance(incoming, dict):
+            return False
+        old_attachments = existing.get("attachments", [])
+        new_attachments = incoming.get("attachments")
+        if (old_attachments != []
+                or not isinstance(new_attachments, list) or not new_attachments
+                or existing.get("contentType") != "text"
+                or incoming.get("contentType") != "mixed"):
+            return False
+        existing_immutable = {key: value for key, value in existing.items()
+                              if key not in ("attachments", "contentType")}
+        incoming_immutable = {key: value for key, value in incoming.items()
+                              if key not in ("attachments", "contentType")}
+        return (json.dumps(existing_immutable, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=False, allow_nan=False)
+                == json.dumps(incoming_immutable, sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=False, allow_nan=False))
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+
+
 def _ack_count(response, key, maximum):
     value = response.get(key)
     if type(value) is not int or value < 0 or value > maximum:
@@ -504,18 +531,41 @@ class Relay:
         self.db.execute("BEGIN IMMEDIATE")
         try:
             current = self.count_bytes(self.connector)
-            added = sum(item[4] for item in encoded if not self.db.execute(
-                "SELECT 1 FROM outbox WHERE connector_id=? AND external_id=?", (item[0], item[2])).fetchone())
+            capacity_delta = 0
+            inserts = []
+            enrichments = []
+            for item in encoded:
+                existing = self.db.execute(
+                    "SELECT seq,profile,body,size FROM outbox WHERE connector_id=? AND external_id=?",
+                    (item[0], item[2]),
+                ).fetchone()
+                if existing is None:
+                    inserts.append(item)
+                    capacity_delta += item[4]
+                    continue
+                if existing[1] != item[1]:
+                    raise RuntimeError("event_id_conflict_in_outbox")
+                if existing[2] == item[3]:
+                    continue
+                if not _is_late_attachment_enrichment(existing[2], item[3]):
+                    raise RuntimeError("event_id_conflict_in_outbox")
+                enrichments.append((existing[0], item[0], item[1], item[2],
+                                    existing[2], existing[3], item[3], item[4]))
+                capacity_delta += item[4] - existing[3]
             ceiling = max(1, int(self.config.get("outboxMaxBytes", DEFAULT_OUTBOX_BYTES)) // len(self.connectors))
-            if current + added > ceiling:
+            if current + capacity_delta > ceiling:
                 self.db.rollback()
                 return None
-            for item in encoded:
-                existing = self.db.execute("SELECT body FROM outbox WHERE connector_id=? AND external_id=?",
-                                           (item[0], item[2])).fetchone()
-                if existing and existing[0] != item[3]:
-                    raise RuntimeError("event_id_conflict_in_outbox")
+            for item in inserts:
                 self.db.execute("INSERT OR IGNORE INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,?)", item)
+            for seq, connector_id, profile, external_id, old_body, old_size, new_body, new_size in enrichments:
+                updated = self.db.execute(
+                    "UPDATE outbox SET body=?,size=? WHERE seq=? AND connector_id=? AND profile=? "
+                    "AND external_id=? AND body=? AND size=?",
+                    (new_body, new_size, seq, connector_id, profile, external_id, old_body, old_size),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError("outbox_prefix_changed")
             self.db.execute("INSERT INTO cursors(connector_id,profile,value) VALUES(?,?,?) "
                             "ON CONFLICT(connector_id,profile) DO UPDATE SET value=excluded.value",
                             (self.connector, profile, candidate))
