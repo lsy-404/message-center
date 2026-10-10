@@ -9,6 +9,7 @@ on:
       - ".github/workflows/build-native-frida-helper.yml"
       - "test/device-native-runtime-launcher.test.c"
       - "test/device-native-helper-binary-output.test.c"
+      - "test/device-native-helper-contract.test.mjs"
 
 permissions:
   contents: read
@@ -65,6 +66,10 @@ jobs:
             bridge/device/native-frida-helper/binary-output.c \
             -o "$RUNNER_TEMP/device-native-helper-binary-output-test"
           "$RUNNER_TEMP/device-native-helper-binary-output-test"
+
+      - name: Test native helper lifecycle contract
+        shell: bash
+        run: node --test test/device-native-helper-contract.test.mjs
 
       - name: Build iOS 15+ arm64 helper
         shell: bash
