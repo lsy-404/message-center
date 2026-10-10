@@ -44,6 +44,17 @@ class DeviceRuntimeTests(unittest.TestCase):
                 "conversationTitle": "Test", "senderName": "Sender",
                 "occurredAt": "2026-10-07T12:00:00.000Z", "body": ident}
 
+    def event_ack(self, received, inserted=None, upgraded=0, promoted=0, suppressed=0):
+        return {"ok": True, "received": received,
+                "inserted": received if inserted is None else inserted,
+                "upgraded": upgraded, "promoted": promoted, "suppressed": suppressed}
+
+    def backup_ack(self, received, inserted=None, normalized_inserted=None):
+        return {"ok": True, "received": received,
+                "inserted": received if inserted is None else inserted,
+                "normalizedInserted": received if normalized_inserted is None else normalized_inserted,
+                "retentionDays": 30}
+
     def test_profile_sync_failure_preserves_cursor_and_outbox(self):
         result = {"ok": True, "health": "online", "cursor": {"next": "2"},
                   "messages": [self.event("new-1")],
@@ -102,7 +113,8 @@ class DeviceRuntimeTests(unittest.TestCase):
         try:
             success_calls = []
             relay = runtime.Relay(self.config, db2, scan,
-                                  lambda method, path, payload=None: success_calls.append(payload) or {"ok": True})
+                                  lambda method, path, payload=None: success_calls.append(payload) or
+                                      self.event_ack(len(payload["messages"]), inserted=0))
             relay.flush_one()
             self.assertEqual(success_calls[0]["messages"][0]["externalId"], "stable-1")
             self.assertEqual(db2.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
@@ -215,7 +227,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         uploaded = []
         relay.upload_attachment = lambda message, item: uploaded.append((message["externalId"], item["externalId"]))
         delivered = []
-        relay.http_call = lambda method, path, body=None: delivered.append((path, body)) or {"ok": True, "received": 1}
+        relay.http_call = lambda method, path, body=None: delivered.append((path, body)) or self.backup_ack(1)
         self.assertTrue(relay.flush_one())
         self.assertEqual(uploaded, [("group-image", "file-one")])
         cloud_attachment = delivered[0][1]["messages"][0]["attachments"][0]
@@ -472,6 +484,8 @@ class DeviceRuntimeTests(unittest.TestCase):
                     "messages": [self.event(request["profile"])]}
         def http(method, path, payload=None):
             requests.append((method, path, payload))
+            if path == "/api/connectors/events":
+                return self.event_ack(len(payload["messages"]))
             return {"ok": True, "commands": []}
         relay = runtime.Relay(self.config, self.db, adapter, http)
         relay.pass_once()
@@ -491,14 +505,18 @@ class DeviceRuntimeTests(unittest.TestCase):
              "kind": "wechat", "accountLabel": "B", "displayName": "B"},
         ]
         for index in range(12):
+            message = self.event("a" + str(index))
             self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) "
-                            "VALUES('connector-a','primary',?,?,1)", ("a" + str(index), "{}"))
+                            "VALUES('connector-a','primary',?,?,1)",
+                            ("a" + str(index), runtime.compact(message)))
+        second_message = self.event("b0")
         self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) "
-                        "VALUES('connector-b','primary','b0','{}',1)")
+                        "VALUES('connector-b','primary','b0',?,1)", (runtime.compact(second_message),))
         self.db.commit()
         delivered = []
         relay = runtime.Relay(self.config, self.db, lambda request: {},
-                              lambda method, path, payload=None: delivered.append(payload["connectorId"]) or {"ok": True})
+                              lambda method, path, payload=None: delivered.append(payload["connectorId"]) or
+                                  self.event_ack(len(payload["messages"])))
         relay.flush_one()
         relay.flush_one()
         self.assertEqual(delivered, ["connector-a", "connector-b"])
@@ -510,17 +528,18 @@ class DeviceRuntimeTests(unittest.TestCase):
             {"id": "connector-b", "token": "b" * 40, "profile": "primary",
              "kind": "wechat", "accountLabel": "B", "displayName": "B"},
         ]
+        first_message, second_message = self.event("a0"), self.event("b0")
         self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) "
-                        "VALUES('connector-a','primary','a0','{}',1)")
+                        "VALUES('connector-a','primary','a0',?,1)", (runtime.compact(first_message),))
         self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) "
-                        "VALUES('connector-b','primary','b0','{}',1)")
+                        "VALUES('connector-b','primary','b0',?,1)", (runtime.compact(second_message),))
         self.db.commit()
         delivered = []
         def http(method, path, payload=None):
             if payload["connectorId"] == "connector-a":
                 raise OSError("connector A is offline")
             delivered.append(payload["connectorId"])
-            return {"ok": True}
+            return self.event_ack(len(payload["messages"]))
         relay = runtime.Relay(self.config, self.db, lambda request: {}, http)
         self.assertTrue(relay.flush_one())
         self.assertEqual(delivered, ["connector-b"])
@@ -537,8 +556,8 @@ class DeviceRuntimeTests(unittest.TestCase):
         relay = runtime.Relay(
             self.config, self.db, lambda request: {},
             lambda method, path, payload=None: calls.append((path, payload)) or
-                ({"ok": True, "received": 1} if path.endswith("group-text-backups") else
-                 {"ok": True, "received": 1, "suppressed": 0}))
+                (self.backup_ack(len(payload["messages"])) if path.endswith("group-text-backups") else
+                 self.event_ack(len(payload["messages"]))))
         self.assertTrue(relay.flush_one())
         self.assertTrue(relay.flush_one())
         self.assertEqual([path for path, _ in calls], [
@@ -573,7 +592,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         calls = []
         relay = runtime.Relay(self.config, self.db, lambda request: {},
                               lambda method, path, payload=None: calls.append(path) or
-                                  {"ok": True, "received": 1, "inserted": 0, "suppressed": 0})
+                                  self.event_ack(1, inserted=0, upgraded=1, promoted=1))
         self.assertTrue(relay.flush_one())
         self.assertFalse(relay.flush_one())
         self.assertEqual(calls, ["/api/connectors/events"])
@@ -873,17 +892,20 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertTrue(all(item["state"] == "offline" for item in heartbeat_payloads))
 
     def test_outbox_ack_keeps_heartbeat_online_without_opening_command_gate(self):
-        for index in range(runtime.MAX_DELIVERIES_PER_PASS + 1):
+        for index in range(runtime.MAX_DELIVERIES_PER_PASS * runtime.MAX_OUTBOX_BATCH_MESSAGES + 1):
+            message = self.event("queued-" + str(index))
             self.db.execute(
                 "INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,1)",
-                ("connector-a", "primary", "queued-" + str(index), "{}"),
+                ("connector-a", "primary", "queued-" + str(index), runtime.compact(message)),
             )
         self.db.commit()
         calls = []
 
         def http(method, path, payload=None):
             calls.append((method, path, payload))
-            return {"ok": True, "received": 1, "suppressed": 0, "commands": []}
+            if path == "/api/connectors/events":
+                return self.event_ack(len(payload["messages"]))
+            return {"ok": True, "commands": []}
 
         relay = runtime.Relay(self.config, self.db, lambda _request: {}, http)
         with patch.object(runtime.time, "monotonic", return_value=1000.0):
@@ -897,9 +919,10 @@ class DeviceRuntimeTests(unittest.TestCase):
                              for method, path, _payload in calls))
 
     def test_failed_outbox_delivery_does_not_extend_offline_heartbeat(self):
+        message = self.event("queued")
         self.db.execute(
             "INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,1)",
-            ("connector-a", "primary", "queued", "{}"),
+            ("connector-a", "primary", "queued", runtime.compact(message)),
         )
         self.db.commit()
         calls = []
@@ -929,10 +952,11 @@ class DeviceRuntimeTests(unittest.TestCase):
              "kind": "wechat", "accountLabel": "B", "displayName": "B"},
         ]
         for connector_id in ("connector-a", "connector-b"):
-            for index in range(runtime.MAX_DELIVERIES_PER_PASS + 1):
+            for index in range(runtime.MAX_DELIVERIES_PER_PASS * runtime.MAX_OUTBOX_BATCH_MESSAGES + 1):
+                message = self.event(connector_id + "-" + str(index))
                 self.db.execute(
                     "INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,1)",
-                    (connector_id, "primary", connector_id + "-" + str(index), "{}"),
+                    (connector_id, "primary", connector_id + "-" + str(index), runtime.compact(message)),
                 )
         self.db.commit()
         heartbeats = {}
@@ -942,7 +966,9 @@ class DeviceRuntimeTests(unittest.TestCase):
                 raise OSError("connector B unavailable")
             if path.endswith("/heartbeat"):
                 heartbeats[payload["connectorId"]] = payload["state"]
-            return {"ok": True, "received": 1, "suppressed": 0, "commands": []}
+            if path == "/api/connectors/events":
+                return self.event_ack(len(payload["messages"]))
+            return {"ok": True, "commands": []}
 
         relay = runtime.Relay(self.config, self.db, lambda _request: {}, http)
         with patch.object(runtime.time, "monotonic", return_value=1000.0):
