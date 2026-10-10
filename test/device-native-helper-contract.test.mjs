@@ -24,6 +24,20 @@ test('helper reports uncertain dispatch after script loading starts', () => {
   assert.match(docs, /dispatch.*unknown/);
 });
 
+test('script eternalization is opt-in and follows only a valid setup result', () => {
+  assert.match(source, /gboolean eternalize_requested;/);
+  assert.match(source, /strcmp\(argv\[i\], "--eternalize"\)/);
+  assert.match(source, /helper->eternalize_requested && helper->result_received &&\s+helper->error_code == NULL/);
+  assert.match(source, /frida_script_eternalize\(helper->script/);
+  assert.match(source, /frida_script_eternalize_finish\(/);
+  assert.match(source, /helper->script_eternalized = TRUE;/);
+  assert.ok(source.includes('output[@"scriptLifetime"] = @"eternalized";'));
+  assert.match(source, /\(!helper\.eternalize_requested \|\| helper\.script_eternalized\)/);
+  assert.match(source, /if \(helper->script_eternalized\) \{\s+detach_session\(helper\);/);
+  assert.match(docs, /--eternalize/);
+  assert.match(docs, /without unloading the script/);
+});
+
 test('helper latches the first valid send and reserves space for JSON envelopes', () => {
   assert.match(source, /MAX_RESULT_BYTES \(MAX_INPUT_BYTES - 4096\)/);
   assert.match(source, /if \(helper->result_received\)/);

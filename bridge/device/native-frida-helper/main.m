@@ -49,6 +49,8 @@ typedef struct {
   gboolean cleanup_started;
   gboolean load_started;
   gboolean result_received;
+  gboolean eternalize_requested;
+  gboolean script_eternalized;
   gboolean binary_written;
   gboolean timed_out;
   gboolean hard_timeout;
@@ -196,6 +198,38 @@ detach_session(Helper *helper)
 }
 
 static void
+on_script_eternalized(GObject *source, GAsyncResult *result, gpointer user_data)
+{
+  Helper *helper = user_data;
+  GError *error = NULL;
+  helper->operation_in_flight = FALSE;
+  frida_script_eternalize_finish(FRIDA_SCRIPT(source), result, &error);
+  if (error != NULL) {
+    fail(helper, "eternalize", "eternalize_failed");
+    g_error_free(error);
+    start_cleanup(helper);
+    return;
+  }
+  helper->script_eternalized = TRUE;
+  start_cleanup(helper);
+}
+
+static void
+complete_script(Helper *helper)
+{
+  if (helper->eternalize_requested && helper->result_received &&
+      helper->error_code == NULL && helper->script != NULL &&
+      !helper->script_eternalized && !helper->cleanup_started) {
+    set_stage(helper, "eternalize");
+    helper->operation_in_flight = TRUE;
+    frida_script_eternalize(helper->script, helper->operation_cancel,
+        on_script_eternalized, helper);
+    return;
+  }
+  start_cleanup(helper);
+}
+
+static void
 on_script_unloaded(GObject *source, GAsyncResult *result, gpointer user_data)
 {
   Helper *helper = user_data;
@@ -212,6 +246,10 @@ on_script_unloaded(GObject *source, GAsyncResult *result, gpointer user_data)
 static void
 unload_script(Helper *helper)
 {
+  if (helper->script_eternalized) {
+    detach_session(helper);
+    return;
+  }
   if (helper->script == NULL || !helper->load_started ||
       frida_script_is_destroyed(helper->script)) {
     detach_session(helper);
@@ -334,7 +372,7 @@ on_script_message(FridaScript *script, const gchar *message, GBytes *data,
       helper->result_received = TRUE;
     }
     if (!helper->operation_in_flight)
-      start_cleanup(helper);
+      complete_script(helper);
   } else if ([type isEqualToString:@"error"]) {
     fail(helper, "script", "script_error");
     if (helper->operation_in_flight)
@@ -374,7 +412,7 @@ on_script_loaded(GObject *source, GAsyncResult *result, gpointer user_data)
     g_error_free(error);
     start_cleanup(helper);
   } else if (helper->result_received || helper->error_code != NULL) {
-    start_cleanup(helper);
+    complete_script(helper);
   } else {
     set_stage(helper, "await_result");
   }
@@ -635,6 +673,7 @@ main(int argc, char **argv)
   const char *binary_fd_value = NULL;
   const char *binary_max_value = NULL;
   gboolean use_stdin = FALSE;
+  gboolean eternalize_requested = FALSE;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
@@ -658,6 +697,8 @@ main(int argc, char **argv)
       binary_max_value = argv[++i];
     } else if (strcmp(argv[i], "--stdin") == 0) {
       use_stdin = TRUE;
+    } else if (strcmp(argv[i], "--eternalize") == 0 && !eternalize_requested) {
+      eternalize_requested = TRUE;
     } else {
       write_input_error("invalid_arguments");
       return 2;
@@ -716,6 +757,7 @@ main(int argc, char **argv)
 
   Helper helper = {0};
   helper.pid = (guint) pid;
+  helper.eternalize_requested = eternalize_requested;
   helper.binary_output = binary_output;
   helper.script_source = g_strdup([script_source UTF8String]);
   frida_init();
@@ -724,6 +766,7 @@ main(int argc, char **argv)
   NSMutableDictionary *output = [NSMutableDictionary dictionary];
   BOOL success = helper.error_code == NULL && helper.result_received &&
       helper.cleanup_code == NULL && !helper.hard_timeout &&
+      (!helper.eternalize_requested || helper.script_eternalized) &&
       (!helper.binary_output.enabled || helper.binary_written);
   if (helper.binary_output.enabled && !success) {
     BinaryOutputStatus reset_status = binary_output_reset(&helper.binary_output);
@@ -738,6 +781,8 @@ main(int argc, char **argv)
   output[@"dispatch"] = [NSString stringWithUTF8String:
       helper.result_received ? "confirmed" :
       (helper.load_started ? "unknown" : "not_started")];
+  if (helper.script_eternalized)
+    output[@"scriptLifetime"] = @"eternalized";
   if (helper.result_received && helper.result_json != NULL &&
       (!helper.binary_output.enabled || success)) {
     NSData *result_data = [[NSData alloc] initWithBytes:helper.result_json

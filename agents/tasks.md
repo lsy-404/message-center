@@ -38,3 +38,4 @@
 | 027 | [Chore] 离线回归验证 | 对当前公开 main 执行 Python、Node、schema、Fluent 与 Safari 15 UI 回归 | 完成用户要求的公共仓库离线测试并明确真实 UI 验证边界 | ✅ 全部离线测试通过；Safari/iPad 实机未验证 |
 
 | 028 | [BugFix] web-durable-send-request-key | Persist and reuse a send request key across reload/network error until Worker acceptance is confirmed | Prevent duplicate queued sends after a lost HTTP response | 🔄 进行中 |
+| 029 | [Feature] Frida eternalized-script-helper | Add opt-in generic persistent-script lifecycle support to the native helper | Keep a coordinator script alive across short-lived Frida sessions without changing default helper cleanup | 🔄 进行中 |
