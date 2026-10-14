@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-  [ValidateSet('Provision', 'ConfigureConnectorTokens', 'SyncCloudflare', 'Status', 'VerifyOnline', 'VerifyQueue', 'CopyAdminPassword', 'RunRelay', 'SyncConversationProfile')]
+  [ValidateSet('Provision', 'ConfigureConnectorTokens', 'ConfigureOidcSecrets', 'SyncCloudflare', 'Status', 'VerifyQueue', 'RunRelay', 'SyncConversationProfile')]
   [string]$Action = 'Status',
   [string]$SecretPath = (Join-Path $env:LOCALAPPDATA 'MessageCenter\secrets.dpapi.json'),
   [string]$WorkerProject = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\cloudflare-worker')),
@@ -18,7 +18,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $script:Entropy = [Text.Encoding]::UTF8.GetBytes('message-center/local-secrets/v1')
-$script:RequiredNames = @('CONNECTOR_TOKEN', 'AGENT_TOKEN', 'ADMIN_TOKEN')
+$script:RequiredNames = @('CONNECTOR_TOKEN', 'AGENT_TOKEN')
+$script:OptionalWorkerSecretNames = @('OIDC_CLIENT_SECRET', 'SESSION_SECRET')
 
 function Set-PrivateAcl {
   param(
@@ -28,9 +29,7 @@ function Set-PrivateAcl {
 
   $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
   $systemSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
-  # Build a DACL-only descriptor. Reusing Get-Acl can carry an existing SACL into
-  # Set-Acl, which requires SeSecurityPrivilege even though this function only
-  # intends to restrict ordinary file access.
+  # Use a DACL-only descriptor so an existing SACL cannot require SeSecurityPrivilege.
   $acl = if ($IsDirectory) {
     [Security.AccessControl.DirectorySecurity]::new()
   } else {
@@ -125,9 +124,15 @@ function Read-ProtectedSecrets {
   )
   try {
     $values = [Text.Encoding]::UTF8.GetString($plainBytes) | ConvertFrom-Json -AsHashtable
+    [void]$values.Remove('ADMIN_TOKEN')
     foreach ($name in $script:RequiredNames) {
       if (-not $values.ContainsKey($name) -or [string]$values[$name].Length -lt 32) {
         throw "Secret store is missing a valid $name."
+      }
+    }
+    foreach ($name in $script:OptionalWorkerSecretNames) {
+      if ($values.ContainsKey($name) -and [string]$values[$name].Length -lt 32) {
+        throw "Secret store contains an invalid $name."
       }
     }
     if ($values.ContainsKey('CONNECTOR_TOKENS')) {
@@ -193,9 +198,9 @@ function Invoke-WranglerSecretPut {
   )
 
   $pnpm = (Get-Command corepack.cmd -ErrorAction Stop).Source
-  $configPath = Join-Path $WorkerProject 'wrangler.jsonc'
+  $configPath = Join-Path $WorkerProject 'wrangler.local.jsonc'
   if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
-    throw "Worker configuration not found: $configPath"
+    throw "Local Worker configuration not found: $configPath. Copy and configure wrangler.local.jsonc before uploading secrets."
   }
 
   $startInfo = [Diagnostics.ProcessStartInfo]::new()
@@ -233,6 +238,15 @@ function Sync-CloudflareSecrets {
   if ($null -ne $connectorTokens) {
     Invoke-WranglerSecretPut -Name 'CONNECTOR_TOKENS' -Value (ConvertTo-ConnectorTokensJson -Tokens $connectorTokens)
   }
+  $missingOidcSecrets = @($script:OptionalWorkerSecretNames | Where-Object { -not $Values.ContainsKey($_) })
+  if ($missingOidcSecrets.Count -gt 0) {
+    throw "OIDC browser authentication remains unavailable because Worker secrets are missing: $($missingOidcSecrets -join ', '). Configure them with -Action ConfigureOidcSecrets. Existing connector and agent secrets were synchronized."
+  }
+  foreach ($name in $script:OptionalWorkerSecretNames) {
+    if ($Values.ContainsKey($name)) {
+      Invoke-WranglerSecretPut -Name $name -Value ([string]$Values[$name])
+    }
+  }
 }
 
 function Configure-ConnectorTokens {
@@ -269,6 +283,40 @@ function Configure-ConnectorTokens {
   Write-Output "Connector token map stored with DPAPI and uploaded; configured instances=$($tokens.Count)."
 }
 
+function Configure-OidcSecrets {
+  param([Parameter(Mandatory)] [hashtable]$Values)
+
+  if ($Values.ContainsKey('OIDC_CLIENT_SECRET')) {
+    throw 'OIDC_CLIENT_SECRET is already stored; refusing to replace an existing client credential.'
+  }
+
+  $secureSecret = Read-Host -Prompt 'Enter the confidential OIDC client secret' -AsSecureString
+  $secretPointer = [IntPtr]::Zero
+  $clientSecret = $null
+  try {
+    $secretPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureSecret)
+    $clientSecret = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($secretPointer)
+    if ($clientSecret.Length -lt 32 -or $clientSecret -match '\s') {
+      throw 'OIDC_CLIENT_SECRET must contain at least 32 non-whitespace characters.'
+    }
+    $Values['OIDC_CLIENT_SECRET'] = $clientSecret
+  } finally {
+    if ($secretPointer -ne [IntPtr]::Zero) {
+      [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($secretPointer)
+    }
+    if ($null -ne $secureSecret) { $secureSecret.Dispose() }
+  }
+
+  if (-not $Values.ContainsKey('SESSION_SECRET')) {
+    $Values['SESSION_SECRET'] = New-MessageToken
+  }
+  Write-ProtectedSecrets -Values $Values
+  foreach ($name in $script:OptionalWorkerSecretNames) {
+    Invoke-WranglerSecretPut -Name $name -Value ([string]$Values[$name])
+  }
+  Write-Output 'OIDC client and session secrets stored with DPAPI and uploaded; secret values were suppressed.'
+}
+
 function Get-SecretFingerprint {
   param([Parameter(Mandatory)] [string]$Value)
   $bytes = [Text.Encoding]::UTF8.GetBytes($Value)
@@ -277,77 +325,6 @@ function Get-SecretFingerprint {
     return ([Convert]::ToHexString($hash)).Substring(0, 12).ToLowerInvariant()
   } finally {
     [Array]::Clear($bytes, 0, $bytes.Length)
-  }
-}
-
-function Test-OnlineAccess {
-  param([Parameter(Mandatory)] [hashtable]$Values)
-
-  $baseUri = [Uri]$MessageUrl
-  $handler = [Net.Http.HttpClientHandler]::new()
-  $handler.CookieContainer = [Net.CookieContainer]::new()
-  $client = [Net.Http.HttpClient]::new($handler)
-  try {
-    $loginPageResponse = $client.GetAsync([Uri]::new($baseUri, '/login')).GetAwaiter().GetResult()
-    $loginPageText = $loginPageResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-    $csrfMatch = [Text.RegularExpressions.Regex]::Match($loginPageText, 'name="csrf" value="([^"]+)"')
-    if (-not $loginPageResponse.IsSuccessStatusCode -or -not $csrfMatch.Success) {
-      throw "Online login page did not provide a signed form token."
-    }
-    $loginFields = [Collections.Generic.Dictionary[string,string]]::new()
-    $loginFields.Add('password', [string]$Values.ADMIN_TOKEN)
-    $loginFields.Add('csrf', $csrfMatch.Groups[1].Value)
-    $loginBody = [Net.Http.FormUrlEncodedContent]::new($loginFields)
-    $loginResponse = $client.PostAsync([Uri]::new($baseUri, '/api/auth/login'), $loginBody).GetAwaiter().GetResult()
-    if (-not $loginResponse.IsSuccessStatusCode -or $loginResponse.RequestMessage.RequestUri.AbsolutePath -ne '/app') {
-      throw "Online password login failed with HTTP $([int]$loginResponse.StatusCode)."
-    }
-
-    $inboxResponse = $client.GetAsync([Uri]::new($baseUri, '/api/inbox')).GetAwaiter().GetResult()
-    if (-not $inboxResponse.IsSuccessStatusCode) {
-      throw "Online inbox verification failed with HTTP $([int]$inboxResponse.StatusCode)."
-    }
-    $inbox = $inboxResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json
-    $connectorCount = @($inbox.connectors).Count
-    $onlineConnectorCount = @($inbox.connectors | Where-Object state -eq 'online').Count
-    $conversationCount = @($inbox.conversations).Count
-    $detailMessageCount = 0
-    if ($conversationCount -gt 0) {
-      $conversationId = [Uri]::EscapeDataString([string]$inbox.conversations[0].id)
-      $detailResponse = $client.GetAsync([Uri]::new($baseUri, "/api/inbox?conversationId=$conversationId")).GetAwaiter().GetResult()
-      if (-not $detailResponse.IsSuccessStatusCode) {
-        throw "Online conversation detail verification failed with HTTP $([int]$detailResponse.StatusCode)."
-      }
-      $detail = $detailResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json
-      if ([string]$detail.selectedConversationId -ne [string]$inbox.conversations[0].id) {
-        throw "Online conversation detail selected the wrong conversation."
-      }
-      $detailMessageCount = @($detail.messages).Count
-    }
-
-    $backupResponse = $client.GetAsync([Uri]::new($baseUri, '/api/group-text-backups?limit=500')).GetAwaiter().GetResult()
-    if (-not $backupResponse.IsSuccessStatusCode) {
-      throw "Online backup verification failed with HTTP $([int]$backupResponse.StatusCode)."
-    }
-    $backup = $backupResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json
-    $backupCount = @($backup.backups).Count
-
-    $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Post, [Uri]::new($baseUri, '/mcp'))
-    $request.Headers.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', [string]$Values.AGENT_TOKEN)
-    $request.Content = [Net.Http.StringContent]::new(
-      '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
-      [Text.Encoding]::UTF8,
-      'application/json'
-    )
-    $mcpResponse = $client.SendAsync($request).GetAwaiter().GetResult()
-    $mcpText = $mcpResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-    if (-not $mcpResponse.IsSuccessStatusCode -or $mcpText -notmatch '"listen_messages"') {
-      throw "Online MCP verification failed with HTTP $([int]$mcpResponse.StatusCode)."
-    }
-    Write-Output "Online verification passed: password session, unified conversation detail, compatibility backup endpoint, and MCP listener are available; connectors=$connectorCount, online=$onlineConnectorCount, conversations=$conversationCount, selectedMessages=$detailMessageCount, normalizedBackgroundMessages=$backupCount."
-  } finally {
-    $client.Dispose()
-    $handler.Dispose()
   }
 }
 
@@ -483,19 +460,20 @@ switch ($Action) {
     if ($null -ne $connectorTokens) {
       Write-Output "CONNECTOR_TOKENS: present, configured instances=$($connectorTokens.Count); token values and fingerprints are suppressed."
     }
-  }
-  'VerifyOnline' {
-    $values = Read-ProtectedSecrets
-    Test-OnlineAccess -Values $values
+    $missingOidcSecrets = @($script:OptionalWorkerSecretNames | Where-Object { -not $values.ContainsKey($_) })
+    if ($missingOidcSecrets.Count -gt 0) {
+      Write-Output "OIDC browser authentication: unavailable; missing Worker secrets=$($missingOidcSecrets -join ', ')."
+    } else {
+      Write-Output 'OIDC browser authentication secrets: present; values and fingerprints are suppressed.'
+    }
   }
   'VerifyQueue' {
     $values = Read-ProtectedSecrets
     Test-ImmediateQueue -Values $values
   }
-  'CopyAdminPassword' {
+  'ConfigureOidcSecrets' {
     $values = Read-ProtectedSecrets
-    Set-Clipboard -Value ([string]$values.ADMIN_TOKEN)
-    Write-Output 'Administrator password copied to the Windows clipboard; no plaintext was printed.'
+    Configure-OidcSecrets -Values $values
   }
   'RunRelay' {
     $values = Read-ProtectedSecrets

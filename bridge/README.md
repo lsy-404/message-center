@@ -149,11 +149,14 @@ pnpm run unified-relay
 
 ### Windows 本地安全密钥
 
-无法使用外部密码管理器时，可用 `scripts/message-secrets.ps1` 生成并保存 Worker 密钥。脚本先生成向后兼容的 `CONNECTOR_TOKEN`、`AGENT_TOKEN` 与 `ADMIN_TOKEN`，也可为每个实例生成独立 token 并把 `CONNECTOR_TOKENS` JSON 安全上传。所有值都使用 Windows DPAPI `CurrentUser` 加密到 `%LOCALAPPDATA%\MessageCenter\secrets.dpapi.json`，ACL 限制为当前用户与 SYSTEM；明文不会写入仓库、命令行参数或终端输出。
+无法使用外部密码管理器时，可用 `scripts/message-secrets.ps1` 生成并保存 Worker 密钥。`Provision` 只生成设备/relay 使用的 `CONNECTOR_TOKEN` 和 `AGENT_TOKEN`；也可为每个实例生成独立 token 并把 `CONNECTOR_TOKENS` JSON 安全上传。`ConfigureOidcSecrets` 通过隐藏的 SecureString 提示读取 provider 为 confidential client 签发的 `OIDC_CLIENT_SECRET`，并仅在本地尚不存在时生成 `SESSION_SECRET`。所有值都使用 Windows DPAPI `CurrentUser` 加密到 `%LOCALAPPDATA%\MessageCenter\secrets.dpapi.json`，ACL 限制为当前用户与 SYSTEM；明文不会写入仓库、命令行参数或终端输出。旧存储中的 `ADMIN_TOKEN` 会被忽略并在下次写入时移除，不再作为登录密码上传或使用。
 
 ```powershell
-# 首次生成本地加密存储，并同步到 Cloudflare Worker Secrets
+# 首次生成 connector/agent 本地密钥并同步；首次缺少 OIDC secrets 时会明确提示浏览器登录仍不可用
 .\scripts\message-secrets.ps1 -Action Provision
+
+# 安全配置首次 OIDC 客户端密钥并生成 session secret；需先创建 wrangler.local.jsonc
+.\scripts\message-secrets.ps1 -Action ConfigureOidcSecrets
 
 # 为实例生成并上传独立 token map；再次运行会保留现有 token
 .\scripts\message-secrets.ps1 -Action ConfigureConnectorTokens `
@@ -169,17 +172,11 @@ pnpm run unified-relay
 # 从现有本地加密存储重新同步 Cloudflare
 .\scripts\message-secrets.ps1 -Action SyncCloudflare
 
-# 不打印密钥，验证公网密码会话与 MCP 监听工具
-.\scripts\message-secrets.ps1 -Action VerifyOnline
-
-# 把网页登录密码复制到 Windows 剪贴板，不在终端显示明文
-.\scripts\message-secrets.ps1 -Action CopyAdminPassword
-
 # 在已设置其余 relay 环境变量后，安全注入 Connector Token 并运行 relay
 .\scripts\message-secrets.ps1 -Action RunRelay
 ```
 
-DPAPI 文件只能由创建它的 Windows 用户解密；重装系统或删除该用户配置前应主动轮换 Worker Secrets。脚本不会静默覆盖现有存储，轮换必须显式传入 `-ForceRotate`。
+`wrangler secret put` 始终指定 `cloudflare-worker/wrangler.local.jsonc`，不会把 secret 写到公开示例配置对应的环境。首次缺少 `OIDC_CLIENT_SECRET` 或 `SESSION_SECRET` 时，同步流程仍会同步 connector/agent secrets，随后明确失败并说明浏览器认证未配置；配置后再运行 `SyncCloudflare` 可同步全部 secrets。DPAPI 文件只能由创建它的 Windows 用户解密；重装系统或删除该用户配置前应主动轮换 Worker Secrets。脚本不会静默覆盖现有 OIDC client secret；connector token 轮换仍需显式传入 `-ForceRotate`。
 
 ## 推荐编排流程
 
