@@ -12,7 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -260,6 +260,7 @@ class Relay:
         self.wake_ready = not self.auto_wake
         self.last_wake_attempt = float("-inf")
         self.wake_ready_at = float("-inf")
+        self.last_logged_wake_state = None
         self.wake_scan_pending = set()
         self.wake_scan_failures = {item["id"]: 0 for item in self.connectors}
         self.wake_scan_retry_at = {item["id"]: 0 for item in self.connectors}
@@ -610,15 +611,28 @@ class Relay:
                     type(result.get("attempted")) is not bool or
                     (result["ready"] and result["attempted"]) or
                     not isinstance(result.get("reason"), str) or not WAKE_REASON.fullmatch(result["reason"])):
+                self.wake_ready = False
+                self.log_wake_state(False, False, "invalid_result")
                 return False
             self.wake_ready = result["ready"]
             self.wake_ready_at = time.monotonic()
             if self.wake_ready and not was_ready:
                 self.wake_scan_pending = set(self.connector_by_id)
+            self.log_wake_state(result["ready"], result["attempted"], result["reason"])
             return self.wake_readiness_current()
         except Exception:
             self.wake_ready = False
+            self.log_wake_state(False, False, "adapter_error")
             return False
+
+    def log_wake_state(self, ready, attempted, reason):
+        state = (ready, attempted, reason)
+        if state == self.last_logged_wake_state:
+            return
+        self.last_logged_wake_state = state
+        observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        sys.stderr.write(compact({"observedAt": observed_at, "ready": ready,
+                                  "attempted": attempted, "reason": reason}) + "\n")
 
     def wake_readiness_current(self):
         return (not self.auto_wake or

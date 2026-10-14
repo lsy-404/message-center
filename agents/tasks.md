@@ -3,6 +3,7 @@
 
 | 编号 | 任务名称 | 任务描述 | 变更动机 | 状态 |
 | :--: | :-- | :-- | :-- | :-- |
+| 037 | [BugFix] auto-wake-diagnostics | Emit one compact diagnostic when the validated wake state tuple changes | Explain silent wake failures without logging private data or repeating unchanged status | ✅ Implemented and locally verified |
 | 036 | [Feature] device-auto-wake | Add opt-in device wake orchestration with bounded readiness gating | Let an unlocked device runtime restore its configured QQ and WeChat split view and resume bounded collection safely | ✅ Implemented and locally verified |
 | 001 | [Feature] 独立设备与云端体验 | 恢复设备连接、轻量采集、稳定读写与 Fluent UI | 取消电脑服务依赖并适配旧设备 | 🔄 进行中 |
 | 002 | [Feature] Fluent界面 | Fluent 主题、旧 iPad 视口与有界刷新 | 统一主题并减轻绘制和网络负载 | ✅ 已完成；本地化、类型检查、构建与 Playwright 通过，长期/锁屏行为待验证 |

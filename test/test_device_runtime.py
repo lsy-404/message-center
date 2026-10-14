@@ -1,5 +1,6 @@
 import importlib.util
 import http.server
+import io
 import json
 import os
 import sqlite3
@@ -8,6 +9,7 @@ import sys
 import threading
 import time
 import unittest
+from contextlib import redirect_stderr
 from unittest.mock import patch
 
 
@@ -1307,6 +1309,44 @@ class DeviceRuntimeTests(unittest.TestCase):
             with patch.object(runtime.time, "monotonic", return_value=100):
                 self.assertFalse(relay.ensure_active())
             self.assertFalse(relay.wake_ready)
+
+    def test_auto_wake_logs_only_changed_state_tuples(self):
+        responses = [self.wake_result(False), self.wake_result(True)]
+        calls = []
+        def adapter(request):
+            calls.append(request)
+            return responses.pop(0)
+        relay = runtime.Relay(self.auto_wake_config(), self.db, adapter)
+        captured = io.StringIO()
+        with redirect_stderr(captured):
+            with patch.object(runtime.time, "monotonic", return_value=100):
+                self.assertFalse(relay.ensure_active())
+            with patch.object(runtime.time, "monotonic", return_value=120):
+                self.assertFalse(relay.ensure_active())
+            with patch.object(runtime.time, "monotonic", return_value=160):
+                self.assertTrue(relay.ensure_active())
+        records = [json.loads(line) for line in captured.getvalue().splitlines()]
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([(record["ready"], record["attempted"], record["reason"])
+                          for record in records], [(False, True, "locked"), (True, False, "ready")])
+        self.assertTrue(all(record["observedAt"].endswith("Z") for record in records))
+        self.assertTrue(all(set(record) == {"observedAt", "ready", "attempted", "reason"}
+                            for record in records))
+
+    def test_auto_wake_diagnostic_errors_use_fixed_reasons(self):
+        for response, expected in (({}, "invalid_result"),
+                                   (RuntimeError("private error detail"), "adapter_error")):
+            def adapter(_request, response=response):
+                if isinstance(response, Exception):
+                    raise response
+                return response
+            relay = runtime.Relay(self.auto_wake_config(), self.db, adapter)
+            captured = io.StringIO()
+            with redirect_stderr(captured), patch.object(runtime.time, "monotonic", return_value=100):
+                self.assertFalse(relay.ensure_active())
+            record = json.loads(captured.getvalue())
+            self.assertEqual(record["reason"], expected)
+            self.assertNotIn("private", captured.getvalue())
 
     def test_auto_wake_not_ready_skips_scans_and_command_polls_but_flushes_outbox(self):
         adapter_calls = []
