@@ -5,3 +5,4 @@
 - [x] Add root/test regressions for wake contract, cadence, gating, outbox and heartbeat progress, scan recovery, and omitted-config behavior.
 - [x] Update public runtime configuration and behavior documentation without private details.
 - [x] Inspect the scoped diff and commit the task files.
+- [ ] Confirm an autonomous fresh source scan reaches cloud sync on the installed runtime.

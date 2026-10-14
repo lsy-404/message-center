@@ -28,6 +28,7 @@ Cloudflare Worker、D1、R2；Vue 前端与 @platform-kit/fluent；通用连接�
 - 原生 SplitView 的复核中，两侧 application state 为 0、视口各为 507×768。只读 daemon 快照 outbox 与错误日志均为 0，RSS 为 18,672 KiB，进程限制为 64 MiB。CPU 样本来自重启扫描阶段，不代表稳定负载。
 - 普通 daemon 后续快照中 QQ/微信均 online；receiver 无需手动 collect 即完成同步。Windows 旧 relay 任务处于 Disabled 且没有匹配进程，临时 Vite preview 已关闭，daily device-to-cloud 链路不依赖电脑常驻 relay。
 - 所有在线、队列及 SplitView 记录均为受控时间点快照；长期运行和锁屏状态尚未验证。
+- 自动唤醒公开 runtime 已安装；协调任务报告 iPad 端 73 项 runtime/outbox 测试在 9.176 秒内通过且无跳过，Windows 端 73 项通过、1 项平台跳过。设备启动并打开 Settings 后，三分钟没有新云端 heartbeat 且 outbox budget 为 0；原因尚未确定，端到端验收等待自主源同步验证。
 
 ## 当前任务
 - [036_[Feature]_device-auto-wake](036_[Feature]_device-auto-wake/task_plan.md)：公开设备 runtime 的 opt-in 自动唤醒编排。
