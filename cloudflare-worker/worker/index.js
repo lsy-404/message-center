@@ -2878,6 +2878,27 @@ function redirect(location) {
   return new Response(null, { status: 303, headers: { location, "cache-control": "no-store" } });
 }
 
+function authenticationPage(message, status = 200, extraHeaders) {
+  const headers = new Headers(extraHeaders);
+  headers.set("content-type", "text/html; charset=utf-8");
+  headers.set("cache-control", "no-store");
+  headers.set("referrer-policy", "no-referrer");
+  headers.set("x-content-type-options", "nosniff");
+  headers.set("x-frame-options", "DENY");
+  headers.set("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
+  return new Response(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Message Center</title>
+<style>:root{font-family:"Segoe UI",system-ui,sans-serif;color:rgb(36,36,36);background:rgb(250,250,250)}body{margin:0;display:grid;min-height:100vh;place-items:center}main{max-width:28rem;margin:1.5rem;padding:2rem;border:1px solid rgb(224,224,224);border-radius:8px;background:white}h1{font-size:1.5rem}p{line-height:1.6}a{display:inline-block;padding:.55rem 1rem;border-radius:4px;background:rgb(15,108,189);color:white;text-decoration:none}a:focus-visible{outline:3px solid rgb(36,36,36);outline-offset:3px}</style>
+<main><h1>Message Center</h1><p>${message}</p><a href="/login">通过统一身份登录</a></main></html>`, { status, headers });
+}
+
+function authenticationResult(response) {
+  if (response.status < 400) return response;
+  const message = response.status === 403 ? "此应用仅限管理员使用。请使用具备管理员权限的账号登录。"
+    : response.status >= 500 ? "登录服务暂时不可用，请稍后重试。"
+    : "登录未完成或已过期，请重新登录。";
+  return authenticationPage(message, response.status, response.headers);
+}
+
 async function appAssetResponse(request, env, assetPath) {
   if (!env.ASSETS || typeof env.ASSETS.fetch !== "function") {
     return fail("app_assets_unavailable", 503);
@@ -2938,9 +2959,10 @@ export default {
         return json({ ok: true, service: "message-center", architecture: "cloudflare-worker", storage: ["D1", "R2"] });
       }
       if (url.pathname === "/login" && request.method === "GET") {
-        return await oidcIdentity(request, env) ? redirect("/app") : await beginOidcLogin(request, env);
+        return await oidcIdentity(request, env) ? redirect("/app") : authenticationResult(await beginOidcLogin(request, env));
       }
-      if (url.pathname === "/api/auth/callback" && request.method === "GET") return await completeOidcLogin(request, env);
+      if (url.pathname === "/signed-out" && request.method === "GET") return authenticationPage("已退出 Message Center。再次访问需要登录。");
+      if (url.pathname === "/api/auth/callback" && request.method === "GET") return authenticationResult(await completeOidcLogin(request, env));
       if (url.pathname === "/api/auth/logout" && request.method === "POST") return await logoutOidc(request, env);
       if (url.pathname === "/mcp" && request.method === "POST") return await mcp(request, env);
       if (url.pathname === "/api/connectors/register" && request.method === "POST") return await registerConnector(request, env);

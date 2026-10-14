@@ -183,12 +183,12 @@ export async function createOidcFixture(options = {}) {
 export async function createAdminTestAuth(businessEnv = {}) {
   const fixture = await createOidcFixture();
   const businessDb = businessEnv.DB;
-  fixture.env.DB = {
+  fixture.env.DB = Object.assign(Object.create(businessDb || null), {
     prepare(sqlText) {
       if (/\boidc_sessions\b/i.test(sqlText)) return fixture.sqlite ? fixture.env.DB.__oidc.prepare(sqlText) : businessDb.prepare(sqlText);
       return businessDb.prepare(sqlText);
     },
-  };
+  });
   fixture.env.DB.__oidc = {
     prepare(sqlText) {
       const prepared = fixture.sqlite.prepare(sqlText);
@@ -206,5 +206,5 @@ export async function createAdminTestAuth(businessEnv = {}) {
   if (response.status !== 302) throw new Error(`OIDC fixture login failed with status ${response.status}`);
   const cookie = response.headers.getSetCookie().map((value) => value.split(";", 1)[0]).find((value) => value.startsWith("__Host-message_oidc="));
   const headers = { cookie, origin: APP_URL };
-  return { env: { ...businessEnv, ...fixture.env }, headers, restore: fixture.restore };
+  return { env: { ...businessEnv, ...fixture.env }, headers, restore() { fixture.restore(); fixture.sqlite.close(); } };
 }

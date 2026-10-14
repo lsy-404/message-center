@@ -172,7 +172,7 @@ assert.equal(denied.status, 303);
 assert.equal(denied.headers.get('location'), '/login');
 
 const loginPage = await worker.fetch(new Request('https://message.example.com/login'), env, ctx);
-assert.equal(loginPage.status, 303);
+assert.equal(loginPage.status, 302);
 const authorizeUrl = new URL(loginPage.headers.get('location'));
 assert.equal(authorizeUrl.origin, env.OIDC_ISSUER);
 assert.equal(authorizeUrl.searchParams.get('client_id'), env.OIDC_CLIENT_ID);
@@ -276,11 +276,15 @@ const logout = await worker.fetch(new Request('https://message.example.com/api/a
   method: 'POST', headers: { cookie: sessionCookie, origin: 'https://message.example.com' },
 }), env, ctx);
 assert.equal(logout.status, 303);
-assert.equal(logout.headers.get('location'), '/login');
+assert.equal(logout.headers.get('location'), '/signed-out');
 assert.match(logout.headers.get('set-cookie'), /Max-Age=0/);
 const afterLogout = await worker.fetch(new Request('https://message.example.com/app', {
   headers: { cookie: sessionCookie },
 }), env, ctx);
 assert.equal(afterLogout.status, 303);
+const signedOut = await worker.fetch(new Request('https://message.example.com/signed-out'), env, ctx);
+assert.equal(signedOut.status, 200);
+assert.equal(signedOut.headers.get('location'), null);
+assert.match(await signedOut.text(), /已退出 Message Center/);
 auth.restore();
 console.log('worker smoke tests passed');
