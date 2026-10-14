@@ -12,4 +12,5 @@
 - `git diff --check`: passed.
 - Public branch audit confirms `ready:false, attempted:true, reason:activation_submitted` is accepted and stays not-ready; no source scan or command polling follows from that result.
 - Coordinator reports 73 runtime/outbox tests passed on iPad in 9.176 seconds without skips, and 73 passed on Windows with one platform skip. Device boot/Settings opening was followed by three minutes with outbox budget zero and no fresh cloud heartbeat; this is not resolved by the diagnostics change.
-- Autonomous source-sync verification remains pending; regression-suite results do not satisfy end-to-end feature acceptance.
+- Coordinator reports a bounded autonomous run: activation at 22:54:16, readiness at 22:55:47, both cursors advanced by 22:56:35, and an independent remote database read at 22:56:43 confirmed 10 fresh rows per channel. QQ was online; the WeChat heartbeat remained pending refresh.
+- Marked short-window autonomous source-to-cloud sync verified. Locked state, reboot recovery, long-term operation, and WeChat heartbeat refresh remain unverified; this does not identify the cause of the earlier no-heartbeat observation.
