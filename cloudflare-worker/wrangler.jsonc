@@ -14,6 +14,11 @@
 	"observability": {
 		"enabled": true
 	},
+	"vars": {
+		"OIDC_ISSUER": "https://identity.example.com",
+		"OIDC_CLIENT_ID": "message-center-example",
+		"OIDC_REDIRECT_URI": "https://message.example.com/api/auth/callback"
+	},
 	"triggers": {
 		"crons": ["17 * * * *"]
 	},
