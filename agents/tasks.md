@@ -44,6 +44,6 @@
 
 | 031 | [BugFix] Canonical channel labels | Normalize known QQ and WeChat aliases consistently across navigation and filtering | Duplicate channel buckets caused by free-form casing and language labels | ✅ Completed |
 | 032 | [BugFix] Native media outbox enrichment | Allow a same-ID event with newly validated attachments to enrich an attachment-free durable outbox row atomically | Native receive may first persist a text placeholder before media staging completes | ✅ Completed; full Python tests pass |
-| 033 | [Feature] admin-oidc | Replace human password access with administrator-only confidential OIDC login | Use the existing auth provider and private client requested by the user | 🔄 Code and local verification complete; production registration awaits its existing registration credential |
+| 033 | [Feature] admin-oidc | Replace human password access with administrator-only confidential OIDC login | Use the existing auth provider and private client requested by the user | ✅ Deployed; live login, refresh and denial verified; manual logout user-confirmed, browser automation blocked |
 | 034 | [Feature] oidc-session-module | Add strict confidential OIDC and encrypted server sessions | Require live admin authorization and serialize rotating refresh tokens | ✅ Integrated and locally verified |
 | 035 | [Feature] oidc-ops | Configure OIDC secrets and document private deployment | Keep secrets in protected storage and preserve independent machine credentials | ✅ Integrated and locally verified |

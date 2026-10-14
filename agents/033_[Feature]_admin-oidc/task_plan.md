@@ -6,4 +6,5 @@
 - [x] Replace password and administrator bearer authentication with administrator-only OIDC sessions; retain scoped connector and agent machine authentication.
 - [x] Add authorization, callback, session and device-route regressions under root test, plus required build/schema checks.
 - [x] Independently review changes and merge local task commits; remote main is unprotected. Complete the final fast-forward and push after integration validation.
-- [ ] Configure secrets privately, deploy when the actual client contract is available, and verify live administrator/denial behavior without sending messages or changing device state.
+- [x] Configure secrets privately, deploy the registered client, and verify live administrator login, refresh and unauthenticated denial without sending messages or changing device state. Manual logout was confirmed by the user; automated logout remained blocked by the browser.
+- [x] Recover registration capability after the user could not locate its credential: verify the credential's narrow purpose, retain the replacement encrypted locally, then register one dedicated client and restrict its provider policy before deployment.
