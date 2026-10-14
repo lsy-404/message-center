@@ -218,4 +218,16 @@ CREATE TABLE IF NOT EXISTS audit_log (
   details_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_audit_recent ON audit_log(occurred_at);
+
+CREATE TABLE IF NOT EXISTS oidc_sessions (
+  session_hash TEXT PRIMARY KEY,
+  subject TEXT NOT NULL,
+  token_envelope TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  refresh_owner TEXT,
+  refresh_until TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_oidc_sessions_expiry ON oidc_sessions(expires_at);
+
 PRAGMA optimize;

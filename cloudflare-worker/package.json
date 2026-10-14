@@ -1,0 +1,12 @@
+{
+  "name": "message-center-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:oidc": "node --experimental-sqlite --test ../test/oidc-auth.test.mjs"
+  },
+  "dependencies": {
+    "jose": "6.2.12",
+    "openid-client": "6.8.8"
+  }
+}
