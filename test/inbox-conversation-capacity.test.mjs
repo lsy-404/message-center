@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 import worker from '../cloudflare-worker/worker/index.js'
+import { createAdminTestAuth } from './helpers/oidc-fixture.mjs'
 import {
   CONVERSATION_PAGE_SIZE,
   filterConversations,
@@ -50,12 +51,12 @@ function d1Statement(sql, args = []) {
   }
 }
 
-const adminToken = 'a'.repeat(40)
-const env = { ADMIN_TOKEN: adminToken, DB: { prepare: (sql) => d1Statement(sql) } }
+const auth = await createAdminTestAuth({ DB: { prepare: (sql) => d1Statement(sql) } })
+const { env } = auth
 
 test('Worker returns a bounded 512 conversations and UI can display or search the tail', async () => {
   const response = await worker.fetch(new Request('https://message.example.com/api/inbox', {
-    headers: { authorization: `Bearer ${adminToken}` },
+    headers: auth.headers,
   }), env, {})
   assert.equal(response.status, 200)
   const inbox = await response.json()
@@ -86,4 +87,4 @@ test('conversation cap is separate from the unchanged 300-message cap', () => {
 })
 
 
-test.after(() => database.close())
+test.after(() => { auth.restore(); database.close() })

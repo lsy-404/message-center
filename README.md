@@ -31,6 +31,7 @@ pnpm run test
 pnpm run build
 
 Set-Location ..\cloudflare-worker
+pnpm install --frozen-lockfile
 Set-Location .\ui
 pnpm install --frozen-lockfile
 pnpm run check
@@ -40,7 +41,7 @@ Set-Location ..
 node --check worker/index.js
 node ../test/worker-smoke.test.mjs
 node ../test/inbox-refresh.test.mjs
-node worker/schema-test.mjs
+node ../test/worker-schema.test.mjs
 pnpm dlx wrangler deploy --dry-run
 
 Set-Location ..

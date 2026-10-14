@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import worker, { hasConnectorRole, semanticCardBody } from '../cloudflare-worker/worker/index.js';
+import { createAdminTestAuth } from './helpers/oidc-fixture.mjs';
 
 const workerSource = readFileSync(new URL('../cloudflare-worker/worker/index.js', import.meta.url), 'utf8');
 const vueSource = readFileSync(new URL('../cloudflare-worker/ui/src/App.vue', import.meta.url), 'utf8');
@@ -48,7 +49,7 @@ const assetBodies = new Map([
   ['/vendor/fluent/NOTICE', [fluentNotice, 'text/plain; charset=utf-8']],
   ['/vendor/fluent/LICENSE', [fluentLicense, 'text/plain; charset=utf-8']],
 ]);
-const env = {
+const auth = await createAdminTestAuth({
   ADMIN_TOKEN: adminToken,
   AGENT_TOKEN: agentToken,
   ASSETS: {
@@ -57,7 +58,8 @@ const env = {
       return value ? new Response(value[0], { headers: { 'content-type': value[1] } }) : new Response('not found', { status: 404 });
     },
   },
-};
+});
+const { env } = auth;
 const ctx = {};
 
 const connectorTokenEnv = {
@@ -170,44 +172,29 @@ assert.equal(denied.status, 303);
 assert.equal(denied.headers.get('location'), '/login');
 
 const loginPage = await worker.fetch(new Request('https://message.example.com/login'), env, ctx);
-assert.equal(loginPage.status, 200);
-assert.match(loginPage.headers.get('content-security-policy'), /form-action 'self'/);
-const loginHtml = await loginPage.text();
-assert.match(loginHtml, /type="password"/);
-assert.doesNotMatch(loginHtml, /欢迎回来|Unified messaging workspace|管理员密码安全登录|HTTPS 传输/);
-const csrfToken = loginHtml.match(/name="csrf" value="([^"]+)"/)?.[1];
-assert.ok(csrfToken);
+assert.equal(loginPage.status, 303);
+const authorizeUrl = new URL(loginPage.headers.get('location'));
+assert.equal(authorizeUrl.origin, env.OIDC_ISSUER);
+assert.equal(authorizeUrl.searchParams.get('client_id'), env.OIDC_CLIENT_ID);
+assert.equal(authorizeUrl.searchParams.get('code_challenge_method'), 'S256');
+assert.equal(authorizeUrl.searchParams.get('redirect_uri'), env.OIDC_REDIRECT_URI);
 
-const crossOriginLogin = await worker.fetch(new Request('https://message.example.com/api/auth/login', {
-  method: 'POST',
-  headers: { 'content-type': 'application/x-www-form-urlencoded', origin: 'https://attacker.example' },
-  body: new URLSearchParams({ password: adminToken, csrf: csrfToken }),
-}), env, ctx);
-assert.equal(crossOriginLogin.status, 403);
-
-const wrongPassword = 'wrong-password-that-is-long-enough-to-submit';
-const wrongLogin = await worker.fetch(new Request('https://message.example.com/api/auth/login', {
+const legacyLogin = await worker.fetch(new Request('https://message.example.com/api/auth/login', {
   method: 'POST',
   headers: { 'content-type': 'application/x-www-form-urlencoded', origin: 'https://message.example.com' },
-  body: new URLSearchParams({ password: wrongPassword, csrf: csrfToken }),
+  body: new URLSearchParams({ password: adminToken }),
 }), env, ctx);
-assert.equal(wrongLogin.status, 401);
-assert.equal(wrongLogin.headers.get('set-cookie'), null);
-assert.doesNotMatch(await wrongLogin.text(), new RegExp(wrongPassword));
+assert.equal(legacyLogin.status, 401);
+assert.equal(legacyLogin.headers.get('set-cookie'), null);
+const sessionCookie = new Headers(auth.headers).get('cookie');
+assert.match(sessionCookie, /^__Host-message_oidc=/);
 
-const login = await worker.fetch(new Request('https://message.example.com/api/auth/login', {
-  method: 'POST',
-  headers: { 'content-type': 'application/x-www-form-urlencoded', origin: 'null' },
-  body: new URLSearchParams({ password: adminToken, csrf: csrfToken }),
-}), env, ctx);
-assert.equal(login.status, 303);
-assert.equal(login.headers.get('location'), '/app');
-const setCookie = login.headers.get('set-cookie');
-assert.match(setCookie, /^__Host-message_session=/);
-assert.match(setCookie, /HttpOnly/);
-assert.match(setCookie, /Secure/);
-assert.match(setCookie, /SameSite=Strict/);
-const sessionCookie = setCookie.split(';', 1)[0];
+for (const path of ['/api/inbox', '/api/files/private-file', '/api/sender-avatars/device/sender']) {
+  const legacyBearer = await worker.fetch(new Request(`https://message.example.com${path}`, {
+    headers: { authorization: `Bearer ${adminToken}` },
+  }), env, ctx);
+  assert.equal(legacyBearer.status, 401);
+}
 
 const sessionPage = await worker.fetch(new Request('https://message.example.com/app', {
   headers: { cookie: sessionCookie },
@@ -225,16 +212,8 @@ const forgedSession = await worker.fetch(new Request('https://message.example.co
 assert.equal(forgedSession.status, 303);
 assert.equal(forgedSession.headers.get('location'), '/login');
 
-const logout = await worker.fetch(new Request('https://message.example.com/api/auth/logout', {
-  method: 'POST',
-  headers: { cookie: sessionCookie, origin: 'https://message.example.com' },
-}), env, ctx);
-assert.equal(logout.status, 303);
-assert.equal(logout.headers.get('location'), '/login');
-assert.match(logout.headers.get('set-cookie'), /Max-Age=0/);
-
 const page = await worker.fetch(new Request('https://message.example.com/', {
-  headers: { authorization: `Bearer ${adminToken}` },
+  headers: auth.headers,
 }), env, ctx);
 assert.equal(page.status, 200);
 assert.match(page.headers.get('content-security-policy'), /script-src 'self'/);
@@ -267,7 +246,7 @@ assert.match(vueSource, /supportsLayoutAutoRecovery\(connector\)/);
 assert.match(vueSource, /mergeConnectorLayoutControls/);
 
 const staticAsset = await worker.fetch(new Request('https://message.example.com/assets/app.js', {
-  headers: { authorization: `Bearer ${adminToken}` },
+  headers: auth.headers,
 }), env, ctx);
 assert.equal(staticAsset.status, 200);
 assert.match(staticAsset.headers.get('cache-control'), /no-store/);
@@ -287,4 +266,21 @@ assert.ok(toolsBody.result.tools.some((tool) => tool.name === 'next_message'));
 assert.ok(toolsBody.result.tools.some((tool) => tool.name === 'claim_message'));
 assert.ok(toolsBody.result.tools.some((tool) => tool.name === 'consume_message'));
 
+for (const origin of [undefined, 'null', 'https://attacker.example']) {
+  const rejectedLogout = await worker.fetch(new Request('https://message.example.com/api/auth/logout', {
+    method: 'POST', headers: { cookie: sessionCookie, ...(origin === undefined ? {} : { origin }) },
+  }), env, ctx);
+  assert.equal(rejectedLogout.status, 403);
+}
+const logout = await worker.fetch(new Request('https://message.example.com/api/auth/logout', {
+  method: 'POST', headers: { cookie: sessionCookie, origin: 'https://message.example.com' },
+}), env, ctx);
+assert.equal(logout.status, 303);
+assert.equal(logout.headers.get('location'), '/login');
+assert.match(logout.headers.get('set-cookie'), /Max-Age=0/);
+const afterLogout = await worker.fetch(new Request('https://message.example.com/app', {
+  headers: { cookie: sessionCookie },
+}), env, ctx);
+assert.equal(afterLogout.status, 303);
+auth.restore();
 console.log('worker smoke tests passed');

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 import worker from '../cloudflare-worker/worker/index.js'
+import { createAdminTestAuth } from './helpers/oidc-fixture.mjs'
 
 const database = new DatabaseSync(':memory:')
 database.exec(readFileSync(new URL('../cloudflare-worker/worker/schema.sql', import.meta.url), 'utf8'))
@@ -41,8 +42,7 @@ database.prepare(`
 `).run(connectorA, stamp, stamp)
 
 const objects = new Map()
-const env = {
-  ADMIN_TOKEN: 'z'.repeat(40),
+const auth = await createAdminTestAuth({
   CONNECTOR_TOKENS: JSON.stringify({ [connectorA]: tokenA, [connectorB]: tokenB }),
   DB: {
     prepare(sql) {
@@ -74,7 +74,8 @@ const env = {
     },
     async delete(key) { objects.delete(key) },
   },
-}
+})
+const { env } = auth
 
 async function digest(bytes) {
   return [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))]
@@ -118,7 +119,7 @@ assert.equal(rows.length, 2)
 assert.notEqual(rows[0].object_key, rows[1].object_key)
 assert.notEqual(rows[0].sha256, rows[1].sha256)
 
-const adminHeaders = { authorization: `Bearer ${env.ADMIN_TOKEN}` }
+const adminHeaders = auth.headers
 const inboxResponse = await worker.fetch(new Request(
   'https://message.example.com/api/inbox?conversationId=conversation-a', { headers: adminHeaders },
 ), env, {})
@@ -187,5 +188,6 @@ const unauthenticatedDownload = await worker.fetch(new Request(
 ), env, {})
 assert.equal(unauthenticatedDownload.status, 401)
 
+auth.restore()
 database.close()
 console.log('Sender avatar API, connector isolation, inbox, and group backup tests passed')

@@ -1,3 +1,5 @@
+import { OidcAuthError, beginOidcLogin, completeOidcLogin, oidcIdentity, logoutOidc, cleanupOidcSessions } from "./oidc.js";
+
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
   "cache-control": "no-store",
@@ -15,9 +17,6 @@ const BLOCKED_EXTENSIONS = new Set([
   "pkg", "deb", "rpm", "apk", "ipa",
 ]);
 const MCP_VERSIONS = new Set(["2025-11-25", "2025-06-18", "2025-03-26"]);
-const SESSION_COOKIE = "__Host-message_session";
-const SESSION_SECONDS = 12 * 60 * 60;
-const LOGIN_CSRF_SECONDS = 10 * 60;
 const STAGED_FILE_SECONDS = 24 * 60 * 60;
 const UNBOUND_INBOUND_FILE_SECONDS = 48 * 60 * 60;
 const MAX_SENDER_AVATAR_BYTES = 128 * 1024;
@@ -103,7 +102,7 @@ async function hasRole(request, env, role) {
   if (role === "connector" && env.CONNECTOR_TOKENS !== undefined && env.CONNECTOR_TOKENS !== null) {
     return false;
   }
-  const expected = role === "connector" ? env.CONNECTOR_TOKEN : role === "agent" ? env.AGENT_TOKEN : env.ADMIN_TOKEN;
+  const expected = role === "connector" ? env.CONNECTOR_TOKEN : role === "agent" ? env.AGENT_TOKEN : null;
   return typeof expected === "string" && expected.length >= 32 && await secureEqual(bearer(request), expected);
 }
 
@@ -139,134 +138,9 @@ export async function hasConnectorRole(request, env, connectorId) {
   return valid && equal;
 }
 
-function base64UrlEncode(bytes) {
-  let binary = "";
-  for (const value of bytes) binary += String.fromCharCode(value);
-  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/g, "");
-}
-
-function base64UrlDecode(value) {
-  if (!/^[a-zA-Z0-9_-]+$/.test(value)) throw new Error("invalid_session");
-  const normalized = value.replaceAll("-", "+").replaceAll("_", "/");
-  const binary = atob(normalized + "=".repeat((4 - normalized.length % 4) % 4));
-  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
-}
-
-function cookieValue(request, name) {
-  const header = request.headers.get("cookie") || "";
-  if (header.length > 8192) return "";
-  for (const part of header.split(";")) {
-    const index = part.indexOf("=");
-    if (index > 0 && part.slice(0, index).trim() === name) return part.slice(index + 1).trim();
-  }
-  return "";
-}
-
-async function sessionKey(env) {
-  if (typeof env.ADMIN_TOKEN !== "string" || env.ADMIN_TOKEN.length < 32) throw new Error("admin_login_unavailable");
-  return crypto.subtle.importKey("raw", ENCODER.encode(env.ADMIN_TOKEN), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
-}
-
-async function createSession(env) {
-  const issuedAt = Math.floor(Date.now() / 1000);
-  const payload = base64UrlEncode(ENCODER.encode(JSON.stringify({
-    version: 1,
-    subject: "admin:session",
-    issuedAt,
-    expiresAt: issuedAt + SESSION_SECONDS,
-    nonce: crypto.randomUUID(),
-  })));
-  const signature = await crypto.subtle.sign("HMAC", await sessionKey(env), ENCODER.encode(`v1.${payload}`));
-  return `v1.${payload}.${base64UrlEncode(new Uint8Array(signature))}`;
-}
-
-async function createLoginCsrf(env) {
-  const issuedAt = Math.floor(Date.now() / 1000);
-  const payload = base64UrlEncode(ENCODER.encode(JSON.stringify({
-    version: 1,
-    purpose: "admin_login",
-    issuedAt,
-    expiresAt: issuedAt + LOGIN_CSRF_SECONDS,
-    nonce: crypto.randomUUID(),
-  })));
-  const signature = await crypto.subtle.sign("HMAC", await sessionKey(env), ENCODER.encode(`login.v1.${payload}`));
-  return `v1.${payload}.${base64UrlEncode(new Uint8Array(signature))}`;
-}
-
-async function validLoginCsrf(value, env) {
-  if (typeof value !== "string" || value.length > 2048) return false;
-  const parts = value.split(".");
-  if (parts.length !== 3 || parts[0] !== "v1") return false;
-  try {
-    const valid = await crypto.subtle.verify(
-      "HMAC",
-      await sessionKey(env),
-      base64UrlDecode(parts[2]),
-      ENCODER.encode(`login.v1.${parts[1]}`),
-    );
-    if (!valid) return false;
-    const payload = JSON.parse(new TextDecoder().decode(base64UrlDecode(parts[1])));
-    const current = Math.floor(Date.now() / 1000);
-    return payload?.version === 1 && payload?.purpose === "admin_login" &&
-      Number.isInteger(payload.issuedAt) && Number.isInteger(payload.expiresAt) &&
-      payload.issuedAt <= current + 60 && payload.expiresAt > current &&
-      payload.expiresAt - payload.issuedAt === LOGIN_CSRF_SECONDS;
-  } catch {
-    return false;
-  }
-}
-
-async function sessionIdentity(request, env) {
-  const value = cookieValue(request, SESSION_COOKIE);
-  if (!value || value.length > 2048) return null;
-  const parts = value.split(".");
-  if (parts.length !== 3 || parts[0] !== "v1") return null;
-  try {
-    const valid = await crypto.subtle.verify(
-      "HMAC",
-      await sessionKey(env),
-      base64UrlDecode(parts[2]),
-      ENCODER.encode(`v1.${parts[1]}`),
-    );
-    if (!valid) return null;
-    const payload = JSON.parse(new TextDecoder().decode(base64UrlDecode(parts[1])));
-    const current = Math.floor(Date.now() / 1000);
-    if (payload?.version !== 1 || payload?.subject !== "admin:session" ||
-        !Number.isInteger(payload.issuedAt) || !Number.isInteger(payload.expiresAt) ||
-        payload.issuedAt > current + 60 || payload.expiresAt <= current ||
-        payload.expiresAt - payload.issuedAt !== SESSION_SECONDS) return null;
-    return { id: "admin:session", name: "Administrator", email: null, authLabel: "密码会话" };
-  } catch {
-    return null;
-  }
-}
-
-function sessionCookie(value, maxAge = SESSION_SECONDS) {
-  return `${SESSION_COOKIE}=${value}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
-}
-
-async function humanIdentity(request, env) {
-  const session = await sessionIdentity(request, env);
-  if (session) return session;
-  if (await hasRole(request, env, "admin")) return { id: "admin:token", name: "Administrator", email: null, authLabel: "管理令牌" };
-  return null;
-}
-
 function sameOrigin(request) {
   const origin = request.headers.get("origin");
-  return !origin || origin === new URL(request.url).origin;
-}
-
-async function readFormUrlEncoded(request, maxBytes = 4096) {
-  const contentType = request.headers.get("content-type") || "";
-  if (!contentType.toLowerCase().startsWith("application/x-www-form-urlencoded")) {
-    throw new Error("invalid_form");
-  }
-  const announced = Number(request.headers.get("content-length") || 0);
-  if (announced > maxBytes) throw new Error("request_too_large");
-  const raw = await request.text();
-  if (ENCODER.encode(raw).length > maxBytes) throw new Error("request_too_large");
-  return new URLSearchParams(raw);
+  return origin === new URL(request.url).origin;
 }
 
 async function readJson(request, maxBytes = 1024 * 1024) {
@@ -2621,7 +2495,7 @@ async function completeCommand(request, env, commandId) {
 
 async function downloadFile(request, env, ctx, fileId) {
   if (!validId(fileId)) throw new Error("invalid_file_id");
-  const human = await humanIdentity(request, env);
+  const human = await oidcIdentity(request, env);
   const connectorId = request.headers.get("x-connector-id") || "";
   const [agent, connector] = await Promise.all([
     hasRole(request, env, "agent"),
@@ -3000,62 +2874,8 @@ async function mcp(request, env) {
   return json({ jsonrpc: "2.0", id: body.id ?? null, error: { code: -32601, message: "Method not found" } });
 }
 
-function htmlEscape(value) {
-  return String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
-}
-
-function loginHtml(error, nonce, csrfToken) {
-  const invalidClass = error ? " invalid" : "";
-  return `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light"><title>Message Center</title>
-<style nonce="${nonce}">
-:root{--ink:#16241e;--line:#dce6e0;--green:#177c59;--danger:#bd4b4b}*{box-sizing:border-box}body{min-height:100vh;margin:0;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at 20% 10%,#dcefe5 0,transparent 34%),linear-gradient(145deg,#edf4f0,#f8faf9 55%,#e8f0ec);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}.login{width:min(100%,360px)}.wordmark{margin:0 0 20px;text-align:center;font-size:18px;font-weight:760;letter-spacing:-.025em}.field{position:relative}.sr{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}input{width:100%;height:50px;border:1px solid var(--line);border-radius:14px;padding:0 54px 0 16px;background:#ffffffee;color:var(--ink);font:inherit;outline:0;box-shadow:0 18px 60px #1b3e3018;transition:border-color .15s,box-shadow .15s}input:focus{border-color:#63a98d;box-shadow:0 0 0 4px #72b79b22,0 18px 60px #1b3e3018}input.invalid{border-color:var(--danger);box-shadow:0 0 0 4px #bd4b4b18}button{position:absolute;top:6px;right:6px;width:38px;height:38px;border:0;border-radius:10px;background:var(--green);color:#fff;font-size:18px;line-height:1;cursor:pointer}button:hover{background:#105b40}
-</style></head><body><main class="login"><div class="wordmark">Message Center</div><form method="post" action="/api/auth/login" autocomplete="on"><input type="hidden" name="csrf" value="${htmlEscape(csrfToken)}"><div class="field"><label class="sr" for="password">Password</label><input class="${invalidClass.trim()}" id="password" name="password" type="password" minlength="32" maxlength="512" autocomplete="current-password" required autofocus aria-invalid="${error ? "true" : "false"}"><button type="submit" aria-label="Submit">→</button></div></form></main></body></html>`;
-}
-
-function htmlResponse(body, nonce, status = 200, headers = {}) {
-  return new Response(body, { status, headers: {
-    "content-type": "text/html; charset=utf-8", "cache-control": "private, no-store",
-    "content-security-policy": `default-src 'none'; style-src 'nonce-${nonce}'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`,
-    "referrer-policy": "no-referrer", "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=()",
-    "x-content-type-options": "nosniff", "x-frame-options": "DENY", "x-robots-tag": "noindex, nofollow",
-    ...headers,
-  }});
-}
-
-async function loginResponse(env, error = "", status = 200) {
-  const nonce = crypto.randomUUID().replaceAll("-", "");
-  return htmlResponse(loginHtml(error, nonce, await createLoginCsrf(env)), nonce, status);
-}
-
-function redirect(location, headers = {}) {
-  return new Response(null, { status: 303, headers: { location, "cache-control": "no-store", ...headers } });
-}
-
-async function login(request, env) {
-  const origin = request.headers.get("origin");
-  if (!sameOrigin(request) && origin !== "null") return fail("cross_origin_denied", 403);
-  const form = await readFormUrlEncoded(request);
-  const password = form.get("password");
-  if (typeof env.ADMIN_TOKEN !== "string" || env.ADMIN_TOKEN.length < 32) {
-    return loginResponse(env, "管理员登录尚未配置。", 503);
-  }
-  if (!await validLoginCsrf(form.get("csrf"), env)) return fail("invalid_login_csrf", 403);
-  if (typeof password !== "string" || !await secureEqual(password, env.ADMIN_TOKEN)) {
-    console.warn(JSON.stringify({ event: "admin_login_failed", path: "/api/auth/login" }));
-    return loginResponse(env, "密码不正确，请重试。", 401);
-  }
-  const value = await createSession(env);
-  console.log(JSON.stringify({ event: "admin_login_succeeded", path: "/api/auth/login" }));
-  return redirect("/app", { "set-cookie": sessionCookie(value) });
-}
-
-async function logout(request, env, ctx) {
-  if (!sameOrigin(request)) return fail("cross_origin_denied", 403);
-  const identity = await humanIdentity(request, env);
-  if (!identity) return redirect("/login", { "set-cookie": sessionCookie("", 0) });
-  return redirect("/login", { "set-cookie": `${sessionCookie("", 0)}; Expires=Thu, 01 Jan 1970 00:00:00 GMT` });
+function redirect(location) {
+  return new Response(null, { status: 303, headers: { location, "cache-control": "no-store" } });
 }
 
 async function appAssetResponse(request, env, assetPath) {
@@ -3103,6 +2923,7 @@ function statusForError(message) {
 export default {
   async scheduled(controller, env, ctx) {
     ctx.waitUntil(Promise.all([
+      cleanupOidcSessions(env),
       cleanupStagedFiles(env),
       cleanupUnboundInboundFiles(env),
       cleanupOrphanConversationAvatars(env),
@@ -3117,10 +2938,10 @@ export default {
         return json({ ok: true, service: "message-center", architecture: "cloudflare-worker", storage: ["D1", "R2"] });
       }
       if (url.pathname === "/login" && request.method === "GET") {
-        return await humanIdentity(request, env) ? redirect("/app") : await loginResponse(env);
+        return await oidcIdentity(request, env) ? redirect("/app") : await beginOidcLogin(request, env);
       }
-      if (url.pathname === "/api/auth/login" && request.method === "POST") return await login(request, env);
-      if (url.pathname === "/api/auth/logout" && request.method === "POST") return await logout(request, env, ctx);
+      if (url.pathname === "/api/auth/callback" && request.method === "GET") return await completeOidcLogin(request, env);
+      if (url.pathname === "/api/auth/logout" && request.method === "POST") return await logoutOidc(request, env);
       if (url.pathname === "/mcp" && request.method === "POST") return await mcp(request, env);
       if (url.pathname === "/api/connectors/register" && request.method === "POST") return await registerConnector(request, env);
       if (url.pathname === "/api/connectors/heartbeat" && request.method === "POST") return await heartbeatConnector(request, env);
@@ -3160,9 +2981,9 @@ export default {
       const fileDownload = url.pathname.match(/^\/api\/files\/([a-zA-Z0-9._:-]+)$/);
       if (fileDownload && request.method === "GET") return await downloadFile(request, env, ctx, fileDownload[1]);
 
-      const identity = await humanIdentity(request, env);
+      const identity = await oidcIdentity(request, env);
       if (!identity && (url.pathname === "/" || url.pathname === "/app" || url.pathname === "/index.html") && request.method === "GET") return redirect("/login");
-      if (!identity) return fail("access_required", 401, "Sign in at /login or provide an authorized bearer token.");
+      if (!identity) return fail("access_required", 401, "Administrator sign-in is required at /login.");
       if (["POST", "PUT", "PATCH", "DELETE"].includes(request.method) && !sameOrigin(request)) return fail("cross_origin_denied", 403);
 
       if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/app" || url.pathname === "/index.html")) {
@@ -3203,6 +3024,10 @@ export default {
       if (policy && new Set(["GET", "PUT"]).has(request.method)) return await conversationPolicy(request, env, identity, policy[1]);
       return fail("not_found", 404);
     } catch (caught) {
+      if (caught instanceof OidcAuthError) {
+        const headers = caught.status === 503 ? { "retry-after": "1" } : {};
+        return json({ ok: false, error: caught.code }, caught.status, headers);
+      }
       const message = caught instanceof Error ? caught.message : String(caught);
       console.error(JSON.stringify({ event: "request_failed", path: url.pathname, message }));
       return fail(message, statusForError(message));

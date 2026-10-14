@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 import worker from '../cloudflare-worker/worker/index.js'
+import { createAdminTestAuth } from './helpers/oidc-fixture.mjs'
 
 const database = new DatabaseSync(':memory:')
 database.exec(readFileSync(new URL('../cloudflare-worker/worker/schema.sql', import.meta.url), 'utf8'))
@@ -63,9 +64,7 @@ function d1Statement(sql, args = []) {
   }
 }
 
-const adminToken = 'a'.repeat(40)
-const env = {
-  ADMIN_TOKEN: adminToken,
+const auth = await createAdminTestAuth({
   DB: { prepare: (sql) => d1Statement(sql) },
   FILES: {
     async get(key) {
@@ -73,10 +72,11 @@ const env = {
       return body ? { body, size: body.byteLength, httpEtag: `etag-${key}` } : null
     },
   },
-}
+})
+const { env } = auth
 const inboxResponse = await worker.fetch(new Request(
   `https://message.example.com/api/inbox?conversationId=${conversationId}`,
-  { headers: { authorization: `Bearer ${adminToken}` } },
+  { headers: auth.headers },
 ), env, {})
 assert.equal(inboxResponse.status, 200)
 assert.match(inboxResponse.headers.get('content-type'), /application\/json; charset=utf-8/)
@@ -88,7 +88,7 @@ assert.equal(inbox.messages.find((message) => message.id === 'message-group-000'
 
 const imageResponse = await worker.fetch(new Request(
   'https://message.example.com/api/files/file-group-000',
-  { headers: { authorization: `Bearer ${adminToken}` } },
+  { headers: auth.headers },
 ), env, {})
 assert.equal(imageResponse.status, 200)
 assert.equal(imageResponse.headers.get('content-disposition')?.split(';')[0], 'inline')
@@ -96,10 +96,11 @@ assert.equal(imageResponse.headers.get('content-type'), 'image/png')
 
 const documentResponse = await worker.fetch(new Request(
   'https://message.example.com/api/files/file-pdf-fixture',
-  { headers: { authorization: `Bearer ${adminToken}` } },
+  { headers: auth.headers },
 ), env, {})
 assert.equal(documentResponse.status, 200)
 assert.equal(documentResponse.headers.get('content-disposition')?.split(';')[0], 'attachment')
 
+auth.restore()
 database.close()
 console.log('Large group inbox and inline image tests passed')

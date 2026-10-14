@@ -2,12 +2,13 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
-import worker from './index.js';
-import { testLateInboundImageReplay } from '../../test/inbound-late-attachment.test.mjs';
+import worker from '../cloudflare-worker/worker/index.js';
+import { createAdminTestAuth } from './helpers/oidc-fixture.mjs';
+import { testLateInboundImageReplay } from './inbound-late-attachment.test.mjs';
 
 const stamp = new Date().toISOString();
 const freshMigrationDatabase = new DatabaseSync(':memory:');
-const migrationDirectory = new URL('../migrations/', import.meta.url);
+const migrationDirectory = new URL('../cloudflare-worker/migrations/', import.meta.url);
 for (const fileName of readdirSync(migrationDirectory).filter((name) => name.endsWith('.sql')).sort()) {
   freshMigrationDatabase.exec(readFileSync(new URL(fileName, migrationDirectory), 'utf8'));
 }
@@ -71,8 +72,8 @@ migrationDatabase.prepare(`
   INSERT INTO group_text_backups (connector_id, conversation_external_id, placement, occurred_at)
   VALUES (?, ?, 'folded', ?)
 `).run('instance-migration', 'profile-only-migration', stamp);
-migrationDatabase.exec(readFileSync(new URL('../migrations/0003_conversation_profile_metadata.sql', import.meta.url), 'utf8'));
-migrationDatabase.exec(readFileSync(new URL('../migrations/0005_conversation_native_state.sql', import.meta.url), 'utf8'));
+migrationDatabase.exec(readFileSync(new URL('../cloudflare-worker/migrations/0003_conversation_profile_metadata.sql', import.meta.url), 'utf8'));
+migrationDatabase.exec(readFileSync(new URL('../cloudflare-worker/migrations/0005_conversation_native_state.sql', import.meta.url), 'utf8'));
 const migratedProfile = migrationDatabase.prepare(`
   SELECT channel_label, conversation_type, placement, is_pinned FROM conversation_profiles
   WHERE connector_id = ? AND conversation_external_id = ?
@@ -87,7 +88,7 @@ assert.equal(migrationDatabase.prepare(`
 migrationDatabase.close();
 
 const conflictMigrationDatabase = new DatabaseSync(':memory:');
-conflictMigrationDatabase.exec(readFileSync(new URL('./schema.sql', import.meta.url), 'utf8'));
+conflictMigrationDatabase.exec(readFileSync(new URL('../cloudflare-worker/worker/schema.sql', import.meta.url), 'utf8'));
 conflictMigrationDatabase.prepare(`
   INSERT INTO connector_instances (id, kind, account_label, display_name, mode, created_at, updated_at)
   VALUES ('instance-conflict', 'im', 'fixture', 'Fixture', 'device_relay', ?, ?)
@@ -113,7 +114,7 @@ conflictMigrationDatabase.prepare(`
     'Member', 'Wrong B body', 'normal', ?, ?)
 `).run(stamp, stamp);
 conflictMigrationDatabase.exec(readFileSync(
-  new URL('../migrations/0004_normalize_existing_backups.sql', import.meta.url), 'utf8',
+  new URL('../cloudflare-worker/migrations/0004_normalize_existing_backups.sql', import.meta.url), 'utf8',
 ));
 assert.deepEqual({ ...conflictMigrationDatabase.prepare(`
   SELECT title, last_message_preview FROM conversations WHERE id = 'conversation-conflict-b'
@@ -124,7 +125,7 @@ assert.equal(conflictMigrationDatabase.prepare(`
 conflictMigrationDatabase.close();
 
 const database = new DatabaseSync(':memory:');
-database.exec(readFileSync(new URL('./schema.sql', import.meta.url), 'utf8'));
+database.exec(readFileSync(new URL('../cloudflare-worker/worker/schema.sql', import.meta.url), 'utf8'));
 const profileColumns = database.prepare('PRAGMA table_info(conversation_profiles)').all().map((row) => row.name);
 assert.ok(profileColumns.includes('channel_label'));
 assert.ok(profileColumns.includes('conversation_type'));
@@ -212,7 +213,6 @@ const d1 = {
 const connectorToken = 'c'.repeat(40);
 const nonOwnerConnectorToken = 'n'.repeat(40);
 const wrongModeConnectorToken = 'w'.repeat(40);
-const adminToken = 'a'.repeat(40);
 const agentToken = 'g'.repeat(40);
 const connectorId = 'instance-device-test';
 const nonOwnerConnectorId = 'instance-device-secondary';
@@ -243,12 +243,12 @@ database.prepare(`
     'member-legacy', 'Legacy member', 'legacy background text', 'normal', ?, ?)
 `).run(connectorId, stamp, stamp);
 const normalizeBackupsMigration = readFileSync(
-  new URL('../migrations/0004_normalize_existing_backups.sql', import.meta.url), 'utf8',
+  new URL('../cloudflare-worker/migrations/0004_normalize_existing_backups.sql', import.meta.url), 'utf8',
 );
 database.exec(normalizeBackupsMigration);
 database.exec(normalizeBackupsMigration);
 database.exec(readFileSync(
-  new URL('../migrations/0006_reconcile_backup_retention.sql', import.meta.url), 'utf8',
+  new URL('../cloudflare-worker/migrations/0006_reconcile_backup_retention.sql', import.meta.url), 'utf8',
 ));
 const migratedBackup = database.prepare(`
   SELECT m.body, m.queue_class, c.title, c.last_message_preview
@@ -310,7 +310,7 @@ const r2 = {
       .map(([key, value]) => ({ key, uploaded: value.uploaded })), truncated: false };
   },
 };
-const workerEnv = {
+const auth = await createAdminTestAuth({
   DB: d1,
   FILES: r2,
   CONNECTOR_TOKENS: JSON.stringify({
@@ -318,9 +318,9 @@ const workerEnv = {
     [nonOwnerConnectorId]: nonOwnerConnectorToken,
     [wrongModeConnectorId]: wrongModeConnectorToken,
   }),
-  ADMIN_TOKEN: adminToken,
   AGENT_TOKEN: agentToken,
-};
+});
+const workerEnv = auth.env;
 
 const connectorLayoutHeaders = {
   authorization: `Bearer ${connectorToken}`,
@@ -378,7 +378,7 @@ assert.equal((await invalidLayoutOwnerRegistration.json()).error, 'invalid_conne
 const unsupportedAdminLayoutUpdate = await worker.fetch(new Request(
   `https://message.example.com/api/connectors/${nonOwnerConnectorId}/layout-control`, {
     method: 'PUT',
-    headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+    headers: { ...auth.headers, 'content-type': 'application/json' },
     body: JSON.stringify({ enabled: true, expectedRevision: 0 }),
   },
 ), workerEnv, {});
@@ -407,7 +407,7 @@ async function updateLayout(enabled, expectedRevision) {
   return worker.fetch(new Request(
     `https://message.example.com/api/connectors/${connectorId}/layout-control`, {
       method: 'PUT',
-      headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+      headers: { ...auth.headers, 'content-type': 'application/json' },
       body: JSON.stringify({ enabled, expectedRevision }),
     },
   ), workerEnv, {});
@@ -838,7 +838,7 @@ const fakeImage = new File([new Uint8Array([0x6e, 0x6f, 0x74, 0x2d, 0x70, 0x6e, 
 const stagedForm = new FormData();
 stagedForm.append('file', fakeImage);
 const stagedResponse = await worker.fetch(new Request('https://message.example.com/api/files', {
-  method: 'POST', headers: { authorization: `Bearer ${adminToken}` }, body: stagedForm,
+  method: 'POST', headers: { ...auth.headers }, body: stagedForm,
 }), workerEnv, {});
 assert.equal(stagedResponse.status, 201);
 const stagedAttachment = (await stagedResponse.json()).attachment;
@@ -846,7 +846,7 @@ assert.equal(stagedAttachment.mimeType, 'application/octet-stream');
 assert.equal(r2Objects.size, inboundObjectCount + 1);
 const discardedResponse = await worker.fetch(new Request(
   `https://message.example.com/api/files/${stagedAttachment.id}`,
-  { method: 'DELETE', headers: { authorization: `Bearer ${adminToken}` } },
+  { method: 'DELETE', headers: { ...auth.headers } },
 ), workerEnv, {});
 assert.equal(discardedResponse.status, 200);
 assert.equal(r2Objects.size, inboundObjectCount);
@@ -872,7 +872,7 @@ ambiguousStagedForm.append('file', new File([new Uint8Array([8, 7, 6, 5])], 'amb
   type: 'application/octet-stream',
 }));
 const ambiguousStagedResponse = await worker.fetch(new Request('https://message.example.com/api/files', {
-  method: 'POST', headers: { authorization: `Bearer ${adminToken}` }, body: ambiguousStagedForm,
+  method: 'POST', headers: { ...auth.headers }, body: ambiguousStagedForm,
 }), workerEnv, {});
 d1.prepare = originalPrepare;
 assert.equal(ambiguousStagedResponse.status, 201);
@@ -884,7 +884,7 @@ assert.equal(ambiguousStagedRow.state, 'staged');
 assert.equal(r2Objects.has(ambiguousStagedRow.object_key), true);
 const ambiguousDiscard = await worker.fetch(new Request(
   `https://message.example.com/api/files/${ambiguousStagedAttachment.id}`,
-  { method: 'DELETE', headers: { authorization: `Bearer ${adminToken}` } },
+  { method: 'DELETE', headers: { ...auth.headers } },
 ), workerEnv, {});
 assert.equal(ambiguousDiscard.status, 200);
 assert.equal(r2Objects.has(ambiguousStagedRow.object_key), false);
@@ -948,13 +948,13 @@ outboundForm.append('file', new File([new Uint8Array([9, 8, 7, 6])], 'outbound.b
   type: 'application/octet-stream',
 }));
 const outboundStage = await worker.fetch(new Request('https://message.example.com/api/files', {
-  method: 'POST', headers: { authorization: `Bearer ${adminToken}` }, body: outboundForm,
+  method: 'POST', headers: { ...auth.headers }, body: outboundForm,
 }), workerEnv, {});
 assert.equal(outboundStage.status, 201);
 const outboundAttachment = (await outboundStage.json()).attachment;
 const directFileBlocked = await worker.fetch(new Request('https://message.example.com/api/messages/send', {
   method: 'POST',
-  headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+  headers: { ...auth.headers, 'content-type': 'application/json' },
   body: JSON.stringify({ conversationId: profileOnlyConversation.id, body: '',
     attachmentIds: [outboundAttachment.id], clientRequestId: 'web-direct-file-block-0001' }),
 }), workerEnv, {});
@@ -967,7 +967,7 @@ database.prepare(`
 `).run(connectorId);
 const oversizedDeviceText = await worker.fetch(new Request('https://message.example.com/api/messages/send', {
   method: 'POST',
-  headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+  headers: { ...auth.headers, 'content-type': 'application/json' },
   body: JSON.stringify({ conversationId: profileOnlyConversation.id, body: 'x'.repeat(501),
     attachmentIds: [], clientRequestId: 'web-device-text-too-long-0001' }),
 }), workerEnv, {});
@@ -977,7 +977,7 @@ database.prepare('UPDATE attachments SET size_bytes = ? WHERE id = ?')
   .run(10 * 1024 * 1024 + 1, outboundAttachment.id);
 const oversizedDeviceFile = await worker.fetch(new Request('https://message.example.com/api/messages/send', {
   method: 'POST',
-  headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+  headers: { ...auth.headers, 'content-type': 'application/json' },
   body: JSON.stringify({ conversationId: profileOnlyConversation.id, body: '',
     attachmentIds: [outboundAttachment.id], clientRequestId: 'web-device-file-too-large-0001' }),
 }), workerEnv, {});
@@ -987,7 +987,7 @@ database.prepare('UPDATE attachments SET size_bytes = 4 WHERE id = ?').run(outbo
 database.prepare('UPDATE attachments SET file_name = ? WHERE id = ?').run('invalid?.bin', outboundAttachment.id);
 const invalidDeviceFileName = await worker.fetch(new Request('https://message.example.com/api/messages/send', {
   method: 'POST',
-  headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+  headers: { ...auth.headers, 'content-type': 'application/json' },
   body: JSON.stringify({ conversationId: profileOnlyConversation.id, body: '',
     attachmentIds: [outboundAttachment.id], clientRequestId: 'web-device-file-invalid-name-0001' }),
 }), workerEnv, {});
@@ -996,7 +996,7 @@ assert.equal((await invalidDeviceFileName.json()).error, 'invalid_device_attachm
 database.prepare('UPDATE attachments SET file_name = ? WHERE id = ?').run('outbound.bin', outboundAttachment.id);
 const mixedDevicePayload = await worker.fetch(new Request('https://message.example.com/api/messages/send', {
   method: 'POST',
-  headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+  headers: { ...auth.headers, 'content-type': 'application/json' },
   body: JSON.stringify({ conversationId: profileOnlyConversation.id, body: 'caption',
     attachmentIds: [outboundAttachment.id], clientRequestId: 'web-device-mixed-payload-0001' }),
 }), workerEnv, {});
@@ -1007,13 +1007,13 @@ secondOutboundForm.append('file', new File([new Uint8Array([1, 2])], 'outbound-s
   type: 'application/octet-stream',
 }));
 const secondOutboundStage = await worker.fetch(new Request('https://message.example.com/api/files', {
-  method: 'POST', headers: { authorization: `Bearer ${adminToken}` }, body: secondOutboundForm,
+  method: 'POST', headers: { ...auth.headers }, body: secondOutboundForm,
 }), workerEnv, {});
 assert.equal(secondOutboundStage.status, 201);
 const secondOutboundAttachment = (await secondOutboundStage.json()).attachment;
 const multipleDeviceAttachments = await worker.fetch(new Request('https://message.example.com/api/messages/send', {
   method: 'POST',
-  headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+  headers: { ...auth.headers, 'content-type': 'application/json' },
   body: JSON.stringify({ conversationId: profileOnlyConversation.id, body: '',
     attachmentIds: [outboundAttachment.id, secondOutboundAttachment.id],
     clientRequestId: 'web-device-multiple-files-0001' }),
@@ -1024,7 +1024,7 @@ assert.equal(database.prepare('SELECT state FROM attachments WHERE id = ?')
   .get(secondOutboundAttachment.id).state, 'staged');
 const outboundSend = await worker.fetch(new Request('https://message.example.com/api/messages/send', {
   method: 'POST',
-  headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+  headers: { ...auth.headers, 'content-type': 'application/json' },
   body: JSON.stringify({ conversationId: profileOnlyConversation.id, body: '',
     attachmentIds: [outboundAttachment.id], clientRequestId: 'web-claim-test-0001' }),
 }), workerEnv, {});
@@ -1041,7 +1041,7 @@ async function stageOutbound(name, bytes) {
   const form = new FormData();
   form.append('file', new File([bytes], name, { type: 'application/octet-stream' }));
   const response = await worker.fetch(new Request('https://message.example.com/api/files', {
-    method: 'POST', headers: { authorization: `Bearer ${adminToken}` }, body: form,
+    method: 'POST', headers: { ...auth.headers }, body: form,
   }), workerEnv, {});
   assert.equal(response.status, 201);
   return (await response.json()).attachment;
@@ -1052,7 +1052,7 @@ const concurrentBody = JSON.stringify({ conversationId: profileOnlyConversation.
   attachmentIds: [concurrentAttachment.id], clientRequestId: 'web-claim-concurrent-0001' });
 const concurrentRequest = () => worker.fetch(new Request('https://message.example.com/api/messages/send', {
   method: 'POST',
-  headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+  headers: { ...auth.headers, 'content-type': 'application/json' },
   body: concurrentBody,
 }), workerEnv, {});
 const concurrentResponses = await Promise.all([concurrentRequest(), concurrentRequest()]);
@@ -1067,7 +1067,7 @@ assert.equal(database.prepare('SELECT state FROM attachments WHERE id = ?')
   .get(concurrentAttachment.id).state, 'queued');
 const idempotencyConflict = await worker.fetch(new Request('https://message.example.com/api/messages/send', {
   method: 'POST',
-  headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+  headers: { ...auth.headers, 'content-type': 'application/json' },
   body: JSON.stringify({ conversationId: profileOnlyConversation.id, body: 'different payload',
     attachmentIds: [], clientRequestId: 'web-claim-concurrent-0001' }),
 }), workerEnv, {});
@@ -1087,14 +1087,14 @@ d1.batch = async (statements) => {
 const retryBody = JSON.stringify({ conversationId: profileOnlyConversation.id, body: '',
   attachmentIds: [retryAttachment.id], clientRequestId: 'web-claim-retry-0001' });
 const failedOutbound = await worker.fetch(new Request('https://message.example.com/api/messages/send', {
-  method: 'POST', headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' }, body: retryBody,
+  method: 'POST', headers: { ...auth.headers, 'content-type': 'application/json' }, body: retryBody,
 }), workerEnv, {});
 assert.equal(failedOutbound.status, 400);
 assert.deepEqual({ ...database.prepare(`
   SELECT state, message_id, outbound_claim_token FROM attachments WHERE id = ?
 `).get(retryAttachment.id) }, { state: 'staged', message_id: null, outbound_claim_token: null });
 const retriedOutbound = await worker.fetch(new Request('https://message.example.com/api/messages/send', {
-  method: 'POST', headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' }, body: retryBody,
+  method: 'POST', headers: { ...auth.headers, 'content-type': 'application/json' }, body: retryBody,
 }), workerEnv, {});
 d1.batch = originalBatch;
 assert.equal(retriedOutbound.status, 202);
@@ -1122,7 +1122,7 @@ const wrapClaimFenceStatement = (statement, sql) => ({
 d1.prepare = (sql) => wrapClaimFenceStatement(fencePrepare(sql), sql);
 const fencedResponse = await worker.fetch(new Request('https://message.example.com/api/messages/send', {
   method: 'POST',
-  headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+  headers: { ...auth.headers, 'content-type': 'application/json' },
   body: JSON.stringify({ conversationId: profileOnlyConversation.id, body: '',
     attachmentIds: [fencedAttachment.id], clientRequestId: 'web-claim-fenced-0001' }),
 }), workerEnv, {});
@@ -1155,7 +1155,7 @@ d1.prepare = (sql) => wrapClaimRefreshFailure(refreshFailurePrepare(sql), sql);
 const refreshFailureResponse = await worker.fetch(new Request(
   'https://message.example.com/api/messages/send', {
     method: 'POST',
-    headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+    headers: { ...auth.headers, 'content-type': 'application/json' },
     body: JSON.stringify({ conversationId: profileOnlyConversation.id, body: '',
       attachmentIds: [refreshFailureAttachment.id], clientRequestId: 'web-claim-refresh-failure-0001' }),
   },
@@ -1192,7 +1192,7 @@ d1.prepare = (sql) => wrapAmbiguousClaim(ambiguousClaimPrepare(sql), sql);
 const ambiguousClaimResponse = await worker.fetch(new Request(
   'https://message.example.com/api/messages/send', {
     method: 'POST',
-    headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+    headers: { ...auth.headers, 'content-type': 'application/json' },
     body: JSON.stringify({ conversationId: profileOnlyConversation.id, body: '',
       attachmentIds: [ambiguousClaimAttachment.id], clientRequestId: 'web-claim-ambiguous-0001' }),
   },
@@ -1320,7 +1320,7 @@ assert.deepEqual({ ...database.prepare(`
   native_last_message_at: '2026-08-28T12:00:01.000Z',
 });
 const inboxResponse = await worker.fetch(new Request('https://message.example.com/api/inbox', {
-  headers: { authorization: `Bearer ${adminToken}` },
+  headers: { ...auth.headers },
 }), workerEnv, {});
 assert.equal(inboxResponse.status, 200);
 const inboxBody = await inboxResponse.json();
@@ -1869,7 +1869,7 @@ database.prepare(`
     '{}', '2026-08-28T12:00:00.600Z', ?)
 `).run(connectorId, stamp);
 
-database.exec(readFileSync(new URL('../migrations/0006_reconcile_backup_retention.sql', import.meta.url), 'utf8'));
+database.exec(readFileSync(new URL('../cloudflare-worker/migrations/0006_reconcile_backup_retention.sql', import.meta.url), 'utf8'));
 assert.equal(database.prepare("SELECT count(*) AS total FROM conversations WHERE id = 'legacy-runtime-uuid'").get().total, 0);
 assert.deepEqual({ ...database.prepare(`
   SELECT unread_count, last_message_preview, last_message_at FROM conversations
@@ -1998,3 +1998,5 @@ assert.equal(database.prepare(`
 `).get().total, 0);
 database.close();
 console.log('schema multi-instance tests passed');
+
+auth.restore();
