@@ -1265,6 +1265,131 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(received["headers"].get("Authorization"), "Bearer " + "x" * 40)
         self.assertEqual(received["headers"].get("X-connector-id"), "connector-a")
 
+    def auto_wake_config(self):
+        config = dict(self.config)
+        config["autoWake"] = True
+        config["connectors"] = [
+            {**self.config["connectors"][0], "kind": "qq"},
+            {"id": "connector-b", "token": "y" * 40, "kind": "wechat",
+             "accountLabel": "test", "displayName": "device", "profile": "secondary"},
+        ]
+        return config
+
+    def wake_result(self, ready=True):
+        return {"ok": True, "ready": ready, "attempted": True, "reason": "ready" if ready else "locked"}
+
+    def test_auto_wake_is_bounded_to_once_per_minute(self):
+        calls = []
+        relay = runtime.Relay(self.auto_wake_config(), self.db,
+                              lambda req: calls.append(req) or self.wake_result())
+        with patch.object(runtime.time, "monotonic", return_value=100):
+            self.assertTrue(relay.ensure_active())
+        with patch.object(runtime.time, "monotonic", return_value=159.999):
+            self.assertTrue(relay.ensure_active())
+        with patch.object(runtime.time, "monotonic", return_value=160):
+            self.assertTrue(relay.ensure_active())
+        self.assertEqual(calls, [{"op": "ensure-active"}, {"op": "ensure-active"}])
+        self.assertEqual(runtime.adapter_timeout_for_request({"op": "ensure-active"}), 20)
+
+    def test_auto_wake_invalid_and_exception_results_fail_closed(self):
+        responses = [
+            {"ok": True, "ready": True, "attempted": True, "reason": "x" * 41},
+            {"ok": True, "ready": 1, "attempted": True, "reason": "ready"},
+            RuntimeError("adapter_timeout"),
+        ]
+        for response in responses:
+            def adapter(_request, response=response):
+                if isinstance(response, Exception):
+                    raise response
+                return response
+            relay = runtime.Relay(self.auto_wake_config(), self.db, adapter)
+            with patch.object(runtime.time, "monotonic", return_value=100):
+                self.assertFalse(relay.ensure_active())
+            self.assertFalse(relay.wake_ready)
+
+    def test_auto_wake_not_ready_skips_scans_and_command_polls_but_flushes_outbox(self):
+        adapter_calls = []
+        http_calls = []
+        relay = runtime.Relay(self.auto_wake_config(), self.db,
+                              lambda req: adapter_calls.append(req) or self.wake_result(False),
+                              lambda method, path, payload=None: http_calls.append((method, path)) or
+                                  (self.event_ack(1) if path.endswith("/events") else {"ok": True}))
+        self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,?)",
+                         ("connector-a", "primary", "queued", runtime.compact(self.event("queued")), 100))
+        self.db.commit()
+        with patch.object(runtime.time, "monotonic", return_value=1000):
+            relay.pass_once()
+        self.assertEqual(adapter_calls, [{"op": "ensure-active"}])
+        self.assertFalse(any("/commands?" in path for _, path in http_calls))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+        self.assertEqual(sum(path.endswith("/events") for _, path in http_calls), 1)
+        self.assertEqual(sum(path.endswith("/heartbeat") for _, path in http_calls), 2)
+
+    def test_auto_wake_expired_during_outbox_flush_gates_scans_and_command_polls(self):
+        now = [100]
+        adapter_calls = []
+        http_calls = []
+        def http_call(method, path, payload=None):
+            http_calls.append(path)
+            if path.endswith("/events"):
+                now[0] += 61
+                return self.event_ack(1)
+            return {"ok": True}
+        relay = runtime.Relay(self.auto_wake_config(), self.db,
+                              lambda req: adapter_calls.append(req) or self.wake_result(True), http_call)
+        self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,?)",
+                         ("connector-a", "primary", "queued", runtime.compact(self.event("queued")), 100))
+        self.db.commit()
+        with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]):
+            relay.pass_once()
+        self.assertEqual(adapter_calls, [{"op": "ensure-active"}])
+        self.assertEqual(sum(path.endswith("/events") for path in http_calls), 1)
+        self.assertFalse(any("/commands?" in path for path in http_calls))
+        self.assertEqual(sum(path.endswith("/heartbeat") for path in http_calls), 2)
+
+    def test_auto_wake_recovery_forces_fresh_scan_without_clearing_cloud_backoff(self):
+        scans = []
+        http_calls = []
+        def adapter(req):
+            if req["op"] == "ensure-active":
+                return self.wake_result(True)
+            scans.append(req)
+            return {"ok": True, "health": "online", "cursor": None, "messages": []}
+        relay = runtime.Relay(self.auto_wake_config(), self.db, adapter,
+                              lambda method, path, payload=None: http_calls.append(path) or {"ok": True})
+        relay.wake_ready = False
+        relay.last_wake_attempt = 0
+        relay.last_scan.update({"connector-a": 990, "connector-b": 990})
+        relay.scan_interval.update({"connector-a": 300, "connector-b": 300})
+        relay.wake_scan_retry_at["connector-a"] = 5000
+        relay.retry_at["connector-a"] = 5000
+        relay.failures["connector-a"] = 4
+        with patch.object(runtime.time, "monotonic", return_value=1000):
+            relay.pass_once()
+        self.assertEqual([request["driver"] for request in scans], ["qq", "wechat"])
+        self.assertEqual(relay.retry_at["connector-a"], 5000)
+        self.assertEqual(relay.failures["connector-a"], 4)
+        self.assertTrue(all(request.get("history") is False for request in scans))
+
+    def test_auto_wake_requires_exact_qq_and_wechat_pair(self):
+        config = self.auto_wake_config()
+        config["connectors"] = config["connectors"][:1]
+        with self.assertRaisesRegex(ValueError, "auto_wake_requires_qq_and_wechat"):
+            runtime.Relay(config, self.db, lambda _request: {})
+
+    def test_auto_wake_omitted_preserves_existing_scan_and_command_behavior(self):
+        scans = []
+        http_calls = []
+        relay = runtime.Relay(self.config, self.db,
+                              lambda req: scans.append(req) or {"ok": True, "health": "online",
+                                  "cursor": None, "messages": []},
+                              lambda method, path, payload=None: http_calls.append(path) or {"ok": True})
+        with patch.object(runtime.time, "monotonic", return_value=1000):
+            relay.pass_once()
+        self.assertEqual(len(scans), 1)
+        self.assertEqual(scans[0]["op"], "scan")
+        self.assertTrue(any("/commands?" in path for path in http_calls))
+
 
 def json_cursor(db):
     return db.execute("SELECT value FROM cursors WHERE connector_id='connector-a' AND profile='primary'").fetchone()[0]

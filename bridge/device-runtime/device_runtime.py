@@ -36,6 +36,9 @@ DEFAULT_OUTBOX_BYTES = 128 * 1024 * 1024
 MAX_DELIVERIES_PER_PASS = 5
 ADAPTER_SCAN_TIMEOUT = 60
 ADAPTER_SEND_TIMEOUT = 90
+ADAPTER_WAKE_TIMEOUT = 20
+AUTO_WAKE_INTERVAL = 60
+WAKE_REASON = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -215,6 +218,8 @@ def adapter_timeout_for_request(request):
         return ADAPTER_SCAN_TIMEOUT
     if operation == "send":
         return ADAPTER_SEND_TIMEOUT
+    if operation == "ensure-active":
+        return ADAPTER_WAKE_TIMEOUT
     raise ValueError("unsupported_adapter_operation")
 
 
@@ -230,6 +235,8 @@ class Relay:
         if not self.base.startswith("https://"):
             raise ValueError("https_required")
         self.connectors = config["connectors"]
+        if "autoWake" in config and type(config["autoWake"]) is not bool:
+            raise ValueError("invalid_auto_wake_configuration")
         self.media_directory = os.path.abspath(config.get("mediaDirectory", config["database"] + ".media"))
         if not os.path.isdir(self.media_directory):
             os.makedirs(self.media_directory, mode=0o700)
@@ -246,6 +253,16 @@ class Relay:
                     len(connector["token"]) < 32):
                 raise ValueError("invalid_connector_configuration")
         self.connector_by_id = {item["id"]: item for item in self.connectors}
+        self.auto_wake = config.get("autoWake") is True
+        if self.auto_wake and (len(self.connectors) != 2 or
+                               {item.get("kind") for item in self.connectors} != {"qq", "wechat"}):
+            raise ValueError("auto_wake_requires_qq_and_wechat")
+        self.wake_ready = not self.auto_wake
+        self.last_wake_attempt = float("-inf")
+        self.wake_ready_at = float("-inf")
+        self.wake_scan_pending = set()
+        self.wake_scan_failures = {item["id"]: 0 for item in self.connectors}
+        self.wake_scan_retry_at = {item["id"]: 0 for item in self.connectors}
         self.connector = self.connectors[0]["id"]
         self.health = {item["id"]: False for item in self.connectors}
         self.last_scan = {item["id"]: float("-inf") for item in self.connectors}
@@ -577,6 +594,44 @@ class Relay:
         self.scan_interval[self.connector] = 15 if result.get("more") is True else (60 if active else 300)
         return result.get("health") == "online"
 
+    def ensure_active(self):
+        if not self.auto_wake:
+            return True
+        now = time.monotonic()
+        if now - self.last_wake_attempt < AUTO_WAKE_INTERVAL:
+            return self.wake_ready
+        self.last_wake_attempt = now
+        was_ready = self.wake_ready
+        self.wake_ready = False
+        try:
+            result = self.adapter_call({"op": "ensure-active"})
+            if (not isinstance(result, dict) or set(result) != {"ok", "ready", "attempted", "reason"} or
+                    result.get("ok") is not True or type(result.get("ready")) is not bool or
+                    type(result.get("attempted")) is not bool or
+                    not isinstance(result.get("reason"), str) or not WAKE_REASON.fullmatch(result["reason"])):
+                return False
+            self.wake_ready = result["ready"]
+            self.wake_ready_at = time.monotonic()
+            if self.wake_ready and not was_ready:
+                self.wake_scan_pending = set(self.connector_by_id)
+            return self.wake_readiness_current()
+        except Exception:
+            self.wake_ready = False
+            return False
+
+    def wake_readiness_current(self):
+        return (not self.auto_wake or
+                (self.wake_ready and time.monotonic() - self.wake_ready_at < AUTO_WAKE_INTERVAL))
+
+    def wake_scan_failed(self, connector_id):
+        count = self.wake_scan_failures[connector_id] + 1
+        self.wake_scan_failures[connector_id] = count
+        self.wake_scan_retry_at[connector_id] = time.monotonic() + min(15 * (2 ** min(count - 1, 5)), 300)
+
+    def wake_scan_succeeded(self, connector_id):
+        self.wake_scan_failures[connector_id] = 0
+        self.wake_scan_retry_at[connector_id] = 0
+
     def validate_staged_attachment(self, attachment):
         if not isinstance(attachment, dict):
             raise RuntimeError("invalid_attachment")
@@ -764,6 +819,12 @@ class Relay:
             self.db.commit()
             self.complete(command, outcome)
             return
+        if not self.wake_readiness_current():
+            self.db.execute("UPDATE command_ledger SET state='retry',retryable=1 WHERE connector_id=? AND idempotency_key=?",
+                            (self.connector, key))
+            self.db.commit()
+            self.complete(command, {"retry": True, "error": "device_not_ready"})
+            return
         try:
             connector = self.connector_by_id[self.connector]
             driver = connector.get("kind")
@@ -820,6 +881,7 @@ class Relay:
                 self.failed(connector["id"])
 
     def pass_once(self):
+        ready = self.ensure_active()
         delivered_connectors = set()
         for _ in range(MAX_DELIVERIES_PER_PASS):
             try:
@@ -834,20 +896,34 @@ class Relay:
             self.select_connector(connector)
             profile = connector["profile"]
             connector_id = connector["id"]
-            if (connector_id not in pending_connectors and self.eligible(connector_id) and
-                    time.monotonic() - self.last_scan[connector_id] >= self.scan_interval[connector_id]):
+            ready = self.wake_readiness_current()
+            force_scan = self.auto_wake and ready and connector_id in self.wake_scan_pending
+            scan_due = (time.monotonic() - self.last_scan[connector_id] >= self.scan_interval[connector_id])
+            scan_allowed = (ready if self.auto_wake else self.eligible(connector_id))
+            scan_retry_allowed = (force_scan or time.monotonic() >= self.wake_scan_retry_at[connector_id])
+            if (connector_id not in pending_connectors and scan_allowed and scan_retry_allowed and
+                    (force_scan or scan_due)):
                 try:
                     self.health[connector_id] = self.scan_profile(profile)
                     self.last_scan[connector_id] = time.monotonic()
-                    self.succeeded(connector_id)
+                    if self.auto_wake:
+                        self.wake_scan_succeeded(connector_id)
+                    else:
+                        self.succeeded(connector_id)
                 except Exception:
                     self.health[connector_id] = False
                     self.last_scan[connector_id] = time.monotonic() - self.scan_interval[connector_id]
-                    self.failed(connector_id)
+                    if self.auto_wake:
+                        self.wake_scan_failed(connector_id)
+                    else:
+                        self.failed(connector_id)
                 finally:
+                    if force_scan:
+                        self.wake_scan_pending.discard(connector_id)
                     self.cleanup_unreferenced_media()
             if time.monotonic() >= self.heartbeat_retry_at[connector_id]:
-                source_fresh = (self.health[connector_id] and
+                ready = self.wake_readiness_current()
+                source_fresh = (ready and self.health[connector_id] and
                                 time.monotonic() - self.last_scan[connector_id] <=
                                 self.scan_interval[connector_id] + 30)
                 heartbeat_state = "online" if connector_id in delivered_connectors or source_fresh else "offline"
@@ -862,7 +938,8 @@ class Relay:
         for connector in self.connectors:
             self.select_connector(connector)
             connector_id = self.connector
-            if (connector.get("receiveOnly") is True or not self.eligible(connector_id) or
+            ready = self.wake_readiness_current()
+            if (not ready or connector.get("receiveOnly") is True or not self.eligible(connector_id) or
                     not self.health.get(connector_id) or
                     time.monotonic() - self.last_scan[connector_id] > self.scan_interval[connector_id] + 30):
                 continue

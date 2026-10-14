@@ -19,12 +19,15 @@ Store a UTF-8 JSON configuration at a private local path with mode `0600`. Relat
     {"id":"instance-device-secondary","token":"injected-token-b",
      "kind":"im","accountLabel":"Account B","displayName":"Device relay B","profile":"profile-b"}
   ],
+  "autoWake": false,
   "outboxMaxBytes": 134217728,
   "pageLimit": 20
 }
 ```
 
 Use a real HTTPS origin and keep each bearer token private. The sample values are placeholders. The relay rejects redirects so credentials cannot be forwarded to another host. One process owns all configured connector identities and serializes polling and native actions across them. Run with `python3 device_runtime.py /path/to/private-config.json`.
+
+Set `autoWake` to `true` only when the configured connector pair is exactly one `qq` and one `wechat` connector. The runtime requests `{"op":"ensure-active"}` at most once every 60 seconds, with a 20-second timeout. A valid response has exactly `{"ok":true,"ready":boolean,"attempted":boolean,"reason":"short_code"}`; the reason must be a lowercase code of at most 40 characters. Malformed or failed results keep readiness false. While not ready, source scans and cloud command polling pause while heartbeats and durable outbox delivery continue. A ready result only permits scanning; it does not mark a source online. When readiness returns, the runtime schedules a fresh bounded scan for both configured profiles.
 
 ## Adapter process contract
 
