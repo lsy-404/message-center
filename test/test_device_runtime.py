@@ -1276,7 +1276,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         return config
 
     def wake_result(self, ready=True):
-        return {"ok": True, "ready": ready, "attempted": True, "reason": "ready" if ready else "locked"}
+        return {"ok": True, "ready": ready, "attempted": not ready, "reason": "ready" if ready else "locked"}
 
     def test_auto_wake_is_bounded_to_once_per_minute(self):
         calls = []
@@ -1294,6 +1294,7 @@ class DeviceRuntimeTests(unittest.TestCase):
     def test_auto_wake_invalid_and_exception_results_fail_closed(self):
         responses = [
             {"ok": True, "ready": True, "attempted": True, "reason": "x" * 41},
+            {"ok": True, "ready": True, "attempted": True, "reason": "ready"},
             {"ok": True, "ready": 1, "attempted": True, "reason": "ready"},
             RuntimeError("adapter_timeout"),
         ]

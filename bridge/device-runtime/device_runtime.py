@@ -599,7 +599,7 @@ class Relay:
             return True
         now = time.monotonic()
         if now - self.last_wake_attempt < AUTO_WAKE_INTERVAL:
-            return self.wake_ready
+            return self.wake_readiness_current()
         self.last_wake_attempt = now
         was_ready = self.wake_ready
         self.wake_ready = False
@@ -608,6 +608,7 @@ class Relay:
             if (not isinstance(result, dict) or set(result) != {"ok", "ready", "attempted", "reason"} or
                     result.get("ok") is not True or type(result.get("ready")) is not bool or
                     type(result.get("attempted")) is not bool or
+                    (result["ready"] and result["attempted"]) or
                     not isinstance(result.get("reason"), str) or not WAKE_REASON.fullmatch(result["reason"])):
                 return False
             self.wake_ready = result["ready"]
