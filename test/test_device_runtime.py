@@ -1519,7 +1519,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         config["autoWake"] = True
         config["connectors"] = [
             {**self.config["connectors"][0], "kind": "qq"},
-            {"id": "connector-b", "token": "y" * 40, "kind": "wechat",
+            {"id": "connector-b", "token": "y" * 40, "kind": "qq",
              "accountLabel": "test", "displayName": "device", "profile": "secondary"},
         ]
         return config
@@ -1537,7 +1537,8 @@ class DeviceRuntimeTests(unittest.TestCase):
             self.assertTrue(relay.ensure_active())
         with patch.object(runtime.time, "monotonic", return_value=160):
             self.assertTrue(relay.ensure_active())
-        self.assertEqual(calls, [{"op": "ensure-active"}, {"op": "ensure-active"}])
+        self.assertEqual(calls, [{"op": "ensure-active", "driver": "qq"},
+                                 {"op": "ensure-active", "driver": "qq"}])
         self.assertEqual(runtime.adapter_timeout_for_request({"op": "ensure-active"}), 55)
 
     def test_auto_wake_invalid_and_exception_results_fail_closed(self):
@@ -1624,7 +1625,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.db.commit()
         with patch.object(runtime.time, "monotonic", return_value=1000):
             relay.pass_once()
-        self.assertEqual(adapter_calls, [{"op": "ensure-active"}])
+        self.assertEqual(adapter_calls, [{"op": "ensure-active", "driver": "qq"}])
         self.assertFalse(any("/commands?" in path for _, path in http_calls))
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
         self.assertEqual(sum(path.endswith("/events") for _, path in http_calls), 1)
@@ -1647,7 +1648,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.db.commit()
         with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]):
             relay.pass_once()
-        self.assertEqual(adapter_calls, [{"op": "ensure-active"}])
+        self.assertEqual(adapter_calls, [{"op": "ensure-active", "driver": "qq"}])
         self.assertEqual(sum(path.endswith("/events") for path in http_calls), 1)
         self.assertFalse(any("/commands?" in path for path in http_calls))
         self.assertEqual(sum(path.endswith("/heartbeat") for path in http_calls), 2)
@@ -1677,15 +1678,18 @@ class DeviceRuntimeTests(unittest.TestCase):
             self.assertEqual(scans, [])
             now[0] += 60
             relay.pass_once()
-        self.assertEqual([request["driver"] for request in scans], ["qq", "wechat"])
+        self.assertEqual([request["driver"] for request in scans], ["qq", "qq"])
         self.assertEqual(relay.retry_at["connector-a"], 5000)
         self.assertEqual(relay.failures["connector-a"], 4)
         self.assertTrue(all(request.get("history") is False for request in scans))
 
-    def test_auto_wake_requires_exact_qq_and_wechat_pair(self):
+    def test_auto_wake_accepts_qq_only_and_rejects_mixed_connectors(self):
         config = self.auto_wake_config()
         config["connectors"] = config["connectors"][:1]
-        with self.assertRaisesRegex(ValueError, "auto_wake_requires_qq_and_wechat"):
+        runtime.Relay(config, self.db, lambda _request: {})
+        config = self.auto_wake_config()
+        config["connectors"][1]["kind"] = "wechat"
+        with self.assertRaisesRegex(ValueError, "auto_wake_requires_qq_only"):
             runtime.Relay(config, self.db, lambda _request: {})
 
     def test_auto_wake_omitted_preserves_existing_scan_and_command_behavior(self):

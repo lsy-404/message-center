@@ -291,9 +291,8 @@ class Relay:
                 raise ValueError("invalid_connector_configuration")
         self.connector_by_id = {item["id"]: item for item in self.connectors}
         self.auto_wake = config.get("autoWake") is True
-        if self.auto_wake and (len(self.connectors) != 2 or
-                               {item.get("kind") for item in self.connectors} != {"qq", "wechat"}):
-            raise ValueError("auto_wake_requires_qq_and_wechat")
+        if self.auto_wake and any(item.get("kind") != "qq" for item in self.connectors):
+            raise ValueError("auto_wake_requires_qq_only")
         self.wake_ready = not self.auto_wake
         self.wake_readiness_established = not self.auto_wake
         self.last_wake_attempt = float("-inf")
@@ -717,9 +716,9 @@ class Relay:
         was_ready = self.wake_ready
         self.wake_ready = False
         try:
-            request = {"op": "ensure-active"}
+            request = {"op": "ensure-active", "driver": "qq"}
             if recovery_driver is not None:
-                if recovery_driver not in {"qq", "wechat"}:
+                if recovery_driver != "qq":
                     raise RuntimeError("invalid_recovery_driver")
                 request.update({"reason": "read_failure", "driver": recovery_driver})
             result = self.adapter_call(request)

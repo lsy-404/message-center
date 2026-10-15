@@ -53,3 +53,4 @@
 | 035 | [Feature] oidc-ops | Configure OIDC secrets and document private deployment | Keep secrets in protected storage and preserve independent machine credentials | ✅ Integrated and locally verified |
 
 | 038 | [BugFix] oidc-refresh-recovery | Preserve valid sessions through optional/ambiguous token refresh and restore browser reauthentication flow | Users receive auth_refresh_failed after sessions age; classify refresh failure and route terminal browser auth correctly | ✅ Implemented and locally verified; deployment pending coordinator |
+| 040 | [Feature] QQ-only runtime contract | Align readiness with QQ-only operation and record public contract boundaries | Enable supported QQ independently without overstating send validation | ✅ Complete; 72 runtime tests pass (2 platform skips) |
