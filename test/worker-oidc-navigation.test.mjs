@@ -34,3 +34,32 @@ test("terminal API auth failure stays JSON and clears the session cookie", async
     assert.match(response.headers.get("set-cookie"), /__Host-message_oidc=; Path=\/; Max-Age=0/);
   } finally { fixture.restore(); fixture.sqlite.close(); }
 });
+
+test("transient browser auth failure shows an unavailable page without clearing or redirecting", async () => {
+  const fixture = await createOidcFixture({ tokenExpiry: Math.floor(Date.now() / 1000) + 10 });
+  const { cookie } = await fixture.authenticated();
+  fixture.refreshFailure = "server_error";
+  try {
+    const response = await worker.fetch(new Request("https://message.example.com/", {
+      headers: { cookie, accept: "text/html,application/xhtml+xml" },
+    }), fixture.env, {});
+    assert.equal(response.status, 503);
+    assert.match(response.headers.get("content-type"), /text\/html/u);
+    assert.equal(response.headers.has("location"), false);
+    assert.equal(response.headers.has("set-cookie"), false);
+  } finally { fixture.restore(); fixture.sqlite.close(); }
+});
+
+test("terminal administrator-role loss clears the cookie and redirects browser navigation", async () => {
+  const fixture = await createOidcFixture({ tokenExpiry: Math.floor(Date.now() / 1000) + 10 });
+  const { cookie } = await fixture.authenticated();
+  fixture.roles = [];
+  try {
+    const response = await worker.fetch(new Request("https://message.example.com/", {
+      headers: { cookie, accept: "text/html,application/xhtml+xml" },
+    }), fixture.env, {});
+    assert.equal(response.status, 303);
+    assert.equal(response.headers.get("location"), "/login");
+    assert.match(response.headers.get("set-cookie"), /__Host-message_oidc=; Path=\/; Max-Age=0/);
+  } finally { fixture.restore(); fixture.sqlite.close(); }
+});

@@ -172,6 +172,42 @@ test("an expired refresh lease quarantines the session while the late owner can 
   });
 });
 
+test("a stale terminal refresh result cannot delete a newer session envelope", async () => {
+  await withFixture({ tokenExpiry: Math.floor(Date.now() / 1000) + 10 }, async (fixture) => {
+    const first = await fixture.authenticated();
+    fixture.authorizationUsed = false;
+    const second = await fixture.authenticated();
+    const sessionHash = async (cookie) => {
+      const opaque = cookie.split("=", 2)[1];
+      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(opaque));
+      return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    };
+    const firstHash = await sessionHash(first.cookie);
+    const secondHash = await sessionHash(second.cookie);
+    const replacement = fixture.sqlite.prepare("SELECT token_envelope FROM oidc_sessions WHERE session_hash = ?").get(secondHash);
+    let entered;
+    const enteredPromise = new Promise((resolve) => { entered = resolve; });
+    let release;
+    const blocked = new Promise((resolve) => { release = resolve; });
+    fixture.tokenRequestHook = async (form) => {
+      if (form.get("grant_type") === "refresh_token") {
+        entered();
+        await blocked;
+      }
+    };
+    const stale = oidcIdentity(identityRequest(first.cookie), fixture.env);
+    await enteredPromise;
+    fixture.sqlite.prepare(`UPDATE oidc_sessions SET token_envelope = ?, refresh_owner = NULL, refresh_until = NULL
+      WHERE session_hash = ?`).run(replacement.token_envelope, firstHash);
+    fixture.roles = [];
+    release();
+    await assert.rejects(stale, (error) => error.code === "admin_required" && error.status === 403);
+    const row = fixture.sqlite.prepare("SELECT token_envelope FROM oidc_sessions WHERE session_hash = ?").get(firstHash);
+    assert.equal(row.token_envelope, replacement.token_envelope);
+    assert.equal(fixture.revocations.length, 0);
+  });
+});
+
 test("logout racing a refresh removes the row and the late rotated token", async () => {
   await withFixture({ tokenExpiry: Math.floor(Date.now() / 1000) + 10 }, async (fixture) => {
     const { cookie } = await fixture.authenticated();
@@ -243,6 +279,18 @@ test("a rotated refresh token is saved when introspection is temporarily unavail
     assert.ok(row);
     assert.equal(row.refresh_owner, null);
     assert.equal(fixture.revocations.length, 0);
+    fixture.introspectionFailure = false;
+    assert.equal((await oidcIdentity(identityRequest(cookie), fixture.env)).id, "oidc:subject-123");
+    assert.equal(fixture.refreshCalls, 1);
+    assert.ok(fixture.introspectedTokens.includes("access-refreshed-1"));
+  });
+});
+
+test("a saved rotation without expires_in probes introspection before refreshing again", async () => {
+  await withFixture({ tokenExpiry: Math.floor(Date.now() / 1000) + 10, omitRefreshExpiresIn: true }, async (fixture) => {
+    const { cookie } = await fixture.authenticated();
+    fixture.introspectionFailure = true;
+    await assert.rejects(oidcIdentity(identityRequest(cookie), fixture.env), (error) => error.code === "auth_refresh_pending" && error.status === 503);
     fixture.introspectionFailure = false;
     assert.equal((await oidcIdentity(identityRequest(cookie), fixture.env)).id, "oidc:subject-123");
     assert.equal(fixture.refreshCalls, 1);

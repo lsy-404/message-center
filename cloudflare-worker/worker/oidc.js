@@ -46,7 +46,8 @@ function isInvalidGrant(error) {
 
 function refreshAccessExpiry(tokens) {
   const expiresIn = tokens.expires_in;
-  return Math.floor(Date.now() / 1000) + (Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn : 0);
+  const lifetime = expiresIn === undefined ? 60 : Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn : 0;
+  return Math.floor(Date.now() / 1000) + lifetime;
 }
 
 async function persistRotatedTokens(env, cfg, session, owner, updated) {
