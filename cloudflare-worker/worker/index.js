@@ -1852,11 +1852,12 @@ async function readInbox(env, selectedConversationId) {
   let messages = [];
   if (selected) {
     const messageResult = await env.DB.prepare(`
-      SELECT m.*, a.sha256 AS sender_avatar_sha256 FROM (
+      SELECT m.*, a.sha256 AS sender_avatar_sha256, q.state AS agent_state FROM (
         SELECT * FROM messages WHERE conversation_id = ?
         ORDER BY occurred_at DESC, created_at DESC LIMIT 300
       ) m LEFT JOIN sender_avatars a
         ON a.connector_id = m.connector_id AND a.sender_id = m.sender_id
+      LEFT JOIN agent_queue q ON q.message_id = m.id
       ORDER BY m.occurred_at ASC, m.created_at ASC
     `).bind(selected).all();
     const ids = (messageResult.results || []).map((row) => row.id);
@@ -1884,6 +1885,9 @@ async function readInbox(env, selectedConversationId) {
       senderAvatarPath: row.sender_avatar_sha256
         ? `/api/sender-avatars/${row.connector_id}/${row.sender_id}?v=${encodeURIComponent(row.sender_avatar_sha256)}` : null,
       deliveryState: row.delivery_state, queueClass: row.queue_class, occurredAt: row.occurred_at,
+      authorRole: row.direction !== "outbound" ? "contact"
+        : String(row.created_by || "").startsWith("agent:") ? "agent" : "owner",
+      agentRead: row.agent_state ? row.agent_state !== "pending" : null,
       attachments: attachmentMap.get(row.id) || [],
     }));
   }

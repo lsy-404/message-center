@@ -13,9 +13,11 @@ export function filterConversations(conversations, options = {}) {
   const channelLabel = normalizeChannelLabel(options.channelLabel || '')
   const query = String(options.query || '').trim().toLowerCase()
   const getChannelLabel = options.getChannelLabel
+  const unreadOnly = Boolean(options.unreadOnly)
 
   return conversations.filter((conversation) => {
     if (connectorId && conversation.connectorId !== connectorId) return false
+    if (unreadOnly && !(Number(conversation.unreadCount) > 0)) return false
     if (channelLabel) {
       const label = normalizeChannelLabel(getChannelLabel
         ? getChannelLabel(conversation)

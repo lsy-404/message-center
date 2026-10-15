@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { FluentButton, FluentField, FluentSwitch, FluentTheme } from '@platform-kit/fluent/vue'
+import AppIcon from './AppIcon.vue'
+import type { IconName } from './icons'
 import { createInboxReadGate, createInboxRefreshLoop } from './inbox-refresh.mjs'
 import {
   clearPendingSendRequestKey,
@@ -16,6 +18,17 @@ import {
   pageConversations,
   previousConversationPage,
 } from './conversation-list.mjs'
+import {
+  avatarTone,
+  buildThreadEntries,
+  channelGlyph,
+  channelTone,
+  formatClock,
+  formatFullStamp,
+  formatListTime,
+  formatRelativeAge,
+} from './presentation.mjs'
+import { parseMessageBody, previewText, type CardKind, type MediaKind, type MoneyKind } from './rich-body.mjs'
 
 type LayoutAcknowledgement = {
   enabled: boolean
@@ -69,8 +82,9 @@ type Conversation = {
 }
 
 type ConversationListItem = Pick<Conversation,
-  'id' | 'title' | 'avatarLabel' | 'avatarPath' | 'unreadCount' | 'lastMessagePreview' | 'lastMessageAt' | 'placement' | 'pinned'
->
+  'id' | 'title' | 'avatarLabel' | 'avatarPath' | 'unreadCount' | 'lastMessagePreview' | 'lastMessageAt' | 'placement'
+  | 'pinned' | 'conversationType'
+> & { channel: string }
 
 type Attachment = {
   id: string
@@ -89,8 +103,13 @@ type Message = {
   contentType: string
   occurredAt: string
   deliveryState?: string | null
+  queueClass?: string | null
+  authorRole?: 'contact' | 'owner' | 'agent' | string | null
+  agentRead?: boolean | null
   attachments: Attachment[]
 }
+
+type StatusInfo = { label: string, tone: 'muted' | 'success' | 'warning' | 'danger', icon: IconName }
 
 type Snapshot = {
   connectors: Connector[]
@@ -120,6 +139,9 @@ const selectedId = ref('')
 const activeFilter = ref('all')
 const activeConnectorId = ref('')
 const conversationSearch = ref('')
+const unreadOnly = ref(false)
+const manualRefreshing = ref(false)
+const nowTick = ref(Date.now())
 const conversationPage = ref(0)
 const conversationListElement = ref<HTMLElement | null>(null)
 const showInstances = ref(false)
@@ -133,6 +155,7 @@ const inboxReads = createInboxReadGate()
 let inboxTimeout: number | undefined
 let refreshLoop: ReturnType<typeof createInboxRefreshLoop> | undefined
 let toastTimer: number | undefined
+let clockTimer: number | undefined
 let pendingScrollToBottomId: string | null = null
 const draftCache = new Map<string, string>()
 const stagedCache = new Map<string, StagedAttachment[]>()
@@ -156,20 +179,37 @@ const filters = computed(() => {
     const label = channelLabel(conversation)
     labels.set(label, label)
   }
+  const summarize = (items: Conversation[]) => ({
+    count: items.length,
+    unread: items.reduce((total, item) => total + Math.max(0, Number(item.unreadCount) || 0), 0),
+  })
   return [
-    { id: 'all', label: '全部', count: snapshot.value.conversations.length },
+    { id: 'all', label: '全部', channel: '', ...summarize(snapshot.value.conversations) },
     ...[...labels.values()].map((label) => ({
       id: `channel:${label}`,
       label,
-      count: snapshot.value.conversations.filter((item) => channelLabel(item) === label).length,
+      channel: label,
+      ...summarize(snapshot.value.conversations.filter((item) => channelLabel(item) === label)),
     })),
   ]
 })
+const totalUnread = computed(() => filters.value[0]?.unread ?? 0)
+const onlineConnectorCount = computed(() => snapshot.value.connectors.filter((item) => item.state === 'online').length)
+const activeFilterLabel = computed(() => {
+  if (activeConnectorId.value) {
+    const connector = snapshot.value.connectors.find((item) => item.id === activeConnectorId.value)
+    if (connector) return connector.accountLabel
+  }
+  return activeFilter.value === 'all' ? '收件箱' : activeFilter.value.slice('channel:'.length)
+})
+const filteredUnread = computed(() => filteredConversations.value
+  .reduce((total, item) => total + Math.max(0, Number(item.unreadCount) || 0), 0))
 
 const filteredConversations = computed(() => filterConversations(snapshot.value.conversations, {
   connectorId: activeConnectorId.value,
   channelLabel: activeFilter.value === 'all' ? '' : activeFilter.value.slice('channel:'.length),
   query: conversationSearch.value,
+  unreadOnly: unreadOnly.value,
   getChannelLabel: channelLabel,
 }))
 const visibleConversations = computed(() => pageConversations(
@@ -194,13 +234,35 @@ const conversationRows = computed<ConversationListItem[]>(() => visibleConversat
   lastMessageAt: conversation.lastMessageAt,
   placement: conversation.placement,
   pinned: conversation.pinned,
+  conversationType: conversation.conversationType,
+  channel: channelLabel(conversation),
 })))
 
-watch([activeFilter, activeConnectorId, conversationSearch], async () => {
+watch([activeFilter, activeConnectorId, conversationSearch, unreadOnly], async () => {
   conversationPage.value = 0
   await nextTick()
   conversationListElement.value?.scrollTo(0, 0)
 })
+
+const threadEntries = computed(() => buildThreadEntries(snapshot.value.messages, nowTick.value))
+const aiUnreadCount = computed(() => snapshot.value.messages
+  .filter((message) => message.direction !== 'outbound' && message.agentRead === false).length)
+
+const threadRows = computed(() => threadEntries.value.map((entry) => {
+  if (entry.kind === 'day') return entry
+  const blocks = parseMessageBody(messageBody(entry.message))
+  const solo = blocks.length === 1 && !entry.message.attachments.length ? blocks[0] : null
+  return {
+    ...entry,
+    byAgent: isAgentMessage(entry.message),
+    delivery: deliveryStateInfo(entry.message),
+    aiRead: entry.message.direction === 'outbound' ? null : entry.message.agentRead ?? null,
+    blocks,
+    // A lone pat reads as a system line; a lone card or transfer is its own bubble.
+    systemText: solo?.type === 'notice' ? solo.text : '',
+    bare: solo?.type === 'card' || solo?.type === 'money',
+  }
+}))
 
 const hasKnownConversationActivity = computed(() => Boolean(
   selectedConversation.value?.lastMessageAt || selectedConversation.value?.lastMessagePreview?.trim(),
@@ -261,6 +323,22 @@ function capLabel(capability: string) {
   } as Record<string, string>)[capability] || capability
 }
 
+function capabilityGroups(capabilities: string[]) {
+  return [
+    { id: 'receive', label: '接收', items: capabilities.filter((item) => item.startsWith('receive_')) },
+    { id: 'send', label: '发送', items: capabilities.filter((item) => item.startsWith('send_')) },
+    {
+      id: 'other',
+      label: '其他',
+      items: capabilities.filter((item) => !item.startsWith('receive_') && !item.startsWith('send_')),
+    },
+  ].filter((group) => group.items.length)
+}
+
+function modeLabel(mode: string) {
+  return ({ device_relay: '设备中继', cloud_relay: '云端中继', webhook: 'Webhook' } as Record<string, string>)[mode] || mode
+}
+
 function supportsAttachment(capabilities: string[], mimeType?: string | null, fileName = '') {
   if (capabilities.includes('send_files')) return true
   const mime = String(mimeType || '').toLowerCase()
@@ -274,6 +352,10 @@ function supportsAttachment(capabilities: string[], mimeType?: string | null, fi
 
 function initials(value?: string | null) {
   const text = String(value || '?').trim()
+  const words = text.split(/\s+/).filter(Boolean)
+  if (words.length > 1 && /^[\x21-\x7e]+$/.test(words.join(''))) {
+    return words.slice(0, 2).map((word) => word[0]).join('').toUpperCase()
+  }
   return [...text].slice(0, 2).join('') || '?'
 }
 
@@ -281,37 +363,62 @@ function statusLabel(state?: string | null) {
   return state === 'online' ? '在线' : '离线'
 }
 
-function deliveryStateLabel(message: Message) {
-  if (message.direction !== 'outbound') return ''
+function deliveryStateInfo(message: Message): StatusInfo | null {
+  if (message.direction !== 'outbound') return null
   return ({
-    queued: '等待发送',
-    delivered: '已发送',
-    failed: '发送失败',
-    uncertain: '待确认（不可自动重发）',
-  } as Record<string, string>)[message.deliveryState || ''] || ''
+    queued: { label: '等待发送', tone: 'muted', icon: 'clock' },
+    delivered: { label: '已发送', tone: 'success', icon: 'check' },
+    failed: { label: '发送失败', tone: 'danger', icon: 'error' },
+    uncertain: { label: '待确认（不可自动重发）', tone: 'warning', icon: 'warning' },
+  } as Record<string, StatusInfo>)[message.deliveryState || ''] || null
 }
 
-function formatListTime(value?: string | null) {
-  if (!value) return ''
-  const date = new Date(value)
-  if (Number.isNaN(date.valueOf())) return ''
-  const today = new Date()
-  if (date.toDateString() === today.toDateString()) {
-    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-  }
-  return date.toLocaleDateString([], { month: 'numeric', day: 'numeric' })
+const CARD_ICONS: Record<CardKind, IconName> = {
+  miniprogram: 'miniProgram', link: 'link', app: 'miniProgram', forward: 'forward', channels: 'channels',
+  music: 'music', location: 'location', contact: 'contact', article: 'article',
+}
+const MEDIA_ICONS: Record<MediaKind, IconName> = {
+  image: 'image', voice: 'voice', video: 'video', file: 'file', sticker: 'sticker', unknown: 'unknown',
+}
+const MONEY_ICONS: Record<MoneyKind, IconName> = { transfer: 'money', redpacket: 'gift' }
+
+function isAgentMessage(message: Message) {
+  return message.direction === 'outbound' && message.authorRole === 'agent'
 }
 
-function formatStamp(value?: string | null) {
-  if (!value) return ''
+function senderLabel(message: Message) {
+  return isAgentMessage(message) ? 'AI 代理' : message.senderName
+}
+
+function listTime(value?: string | null) {
+  return formatListTime(value, nowTick.value)
+}
+
+function relativeAge(value?: string | null) {
+  return formatRelativeAge(value, nowTick.value)
+}
+
+function isoTime(value?: string | null) {
+  if (!value) return undefined
   const date = new Date(value)
-  return Number.isNaN(date.valueOf()) ? '' : date.toLocaleString([], {
-    year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',
-  })
+  return Number.isNaN(date.valueOf()) ? undefined : date.toISOString()
+}
+
+function isFolded(conversation: Pick<Conversation, 'placement'>) {
+  return conversation.placement === 'folded' || conversation.placement === 'message_box'
+}
+
+function conversationStateText(conversation: ConversationListItem) {
+  return [
+    conversation.pinned ? '置顶' : '',
+    conversation.conversationType === 'group' ? '群聊' : '',
+    conversation.placement === 'message_box' ? '消息盒子' : conversation.placement === 'folded' ? '折叠聊天' : '',
+    conversation.unreadCount ? `${conversation.unreadCount} 条未读` : '',
+  ].filter(Boolean).join('，')
 }
 
 function conversationPreview(conversation: ConversationListItem) {
-  const preview = String(conversation.lastMessagePreview || '').trim()
+  const preview = previewText(conversation.lastMessagePreview)
   if (preview) return preview
   return conversation.lastMessageAt ? '最近消息尚未同步' : '暂无消息'
 }
@@ -537,7 +644,8 @@ function sameInbox(left: Snapshot, right: Snapshot) {
     if (a.id !== b.id || a.direction !== b.direction || a.senderName !== b.senderName
         || a.senderAvatarPath !== b.senderAvatarPath
         || a.body !== b.body || a.contentType !== b.contentType || a.occurredAt !== b.occurredAt
-        || a.deliveryState !== b.deliveryState
+        || a.deliveryState !== b.deliveryState || a.queueClass !== b.queueClass
+        || a.authorRole !== b.authorRole || a.agentRead !== b.agentRead
         || a.attachments.length !== b.attachments.length) return false
     for (let attachmentIndex = 0; attachmentIndex < a.attachments.length; attachmentIndex += 1) {
       const file = a.attachments[attachmentIndex]
@@ -641,6 +749,20 @@ async function selectConversation(conversation: Conversation, openMobileThread =
     if (selectedId.value === conversation.id && !(error instanceof DOMException && error.name === 'AbortError')) {
       notify(`详情加载失败：${error instanceof Error ? error.message : String(error)}`)
     }
+  }
+}
+
+async function refreshNow() {
+  if (manualRefreshing.value) return
+  manualRefreshing.value = true
+  try {
+    await load(selectedId.value)
+  } catch (error) {
+    if (!(error instanceof DOMException && error.name === 'AbortError')) {
+      notify(`刷新失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  } finally {
+    manualRefreshing.value = false
   }
 }
 
@@ -907,10 +1029,12 @@ function refreshAllowed() {
 }
 
 function onPageShow() {
+  nowTick.value = Date.now()
   if (refreshAllowed()) refreshLoop?.start(true)
 }
 
 function onVisibilityChange() {
+  nowTick.value = Date.now()
   if (refreshAllowed()) refreshLoop?.start(true)
   else {
     refreshLoop?.stop()
@@ -943,6 +1067,7 @@ onMounted(() => {
     }
   }, refreshAllowed)
   refreshLoop.start(true)
+  clockTimer = window.setInterval(() => { nowTick.value = Date.now() }, 60_000)
   window.addEventListener('pageshow', onPageShow)
   window.addEventListener('pagehide', onOffline)
   window.addEventListener('online', onOnline)
@@ -954,6 +1079,7 @@ onUnmounted(() => {
   refreshLoop?.stop()
   cancelInboxRead()
   if (toastTimer) window.clearTimeout(toastTimer)
+  if (clockTimer) window.clearInterval(clockTimer)
   window.removeEventListener('pageshow', onPageShow)
   window.removeEventListener('pagehide', onOffline)
   window.removeEventListener('online', onOnline)
@@ -962,123 +1088,192 @@ onUnmounted(() => {
 })
 </script>
 
+
 <template>
   <FluentTheme mode="system">
   <main class="mc-shell" :class="{ 'is-thread-open': mobileThread, 'is-instances-open': showInstances }">
-    <aside class="nav-pane">
-      <div class="brand" aria-label="Message Center">
-        <span class="brand-mark">M</span>
-        <strong>Message Center</strong>
+    <aside class="nav-pane" aria-label="导航">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"><AppIcon name="brand" :size="18" /></span>
+        <span class="brand-copy">
+          <strong>Message Center</strong>
+          <small><span class="presence-dot" :class="onlineConnectorCount ? 'online' : 'offline'" />{{ onlineConnectorCount }}/{{ snapshot.connectors.length }} 接入在线</small>
+        </span>
       </div>
 
-      <div class="nav-scroll">
+      <nav class="nav-scroll" aria-label="收件箱分类">
         <div class="nav-section">
-          <p class="nav-label">渠道</p>
+          <p class="nav-label">收件箱</p>
           <button
             v-for="filter in filters"
             :key="filter.id"
             class="nav-item"
             :class="{ active: activeFilter === filter.id && !showInstances }"
             type="button"
+            :title="filter.label"
+            :aria-current="activeFilter === filter.id && !showInstances ? 'page' : undefined"
+            :data-channel="filter.channel || undefined"
+            :data-unread-count="filter.unread"
             @click="selectFilter(filter.id)"
           >
-            <span class="nav-glyph">{{ initials(filter.label) }}</span>
+            <span
+              class="nav-glyph"
+              :class="filter.channel ? `channel-tone tone-${channelTone(filter.channel)}` : 'is-all'"
+              :data-unread="filter.unread > 0 || undefined"
+              aria-hidden="true"
+            >
+              <AppIcon v-if="!filter.channel" name="inbox" :size="16" />
+              <template v-else>{{ channelGlyph(filter.channel) }}</template>
+            </span>
             <span class="nav-copy">{{ filter.label }}</span>
-            <span class="nav-count">{{ filter.count }}</span>
+            <span v-if="filter.unread" class="nav-count is-unread" aria-hidden="true">{{ filter.unread > 99 ? '99+' : filter.unread }}</span>
+            <span v-else class="nav-count" aria-hidden="true">{{ filter.count }}</span>
+            <span class="sr-only">，{{ filter.count }} 个会话，{{ filter.unread }} 条未读</span>
           </button>
         </div>
 
         <div class="nav-section management-nav">
+          <p class="nav-label">管理</p>
           <button
             class="nav-item"
             :class="{ active: showInstances }"
             type="button"
             aria-label="接入管理"
             title="接入管理"
+            :aria-current="showInstances ? 'page' : undefined"
             @click="showConnectorManagement"
           >
-            <span class="nav-glyph">⚙</span>
+            <span class="nav-glyph is-system" :data-alert="onlineConnectorCount < snapshot.connectors.length || undefined" aria-hidden="true">
+              <AppIcon name="settings" :size="16" />
+            </span>
             <span class="nav-copy">接入管理</span>
-            <span class="nav-count">{{ snapshot.connectors.length }}</span>
+            <span
+              class="nav-count"
+              :class="{ 'is-alert': onlineConnectorCount < snapshot.connectors.length }"
+              aria-hidden="true"
+            >{{ onlineConnectorCount }}/{{ snapshot.connectors.length }}</span>
           </button>
         </div>
-      </div>
+      </nav>
 
       <div class="nav-footer">
         <a class="license-link" href="/vendor/fluent/NOTICE" target="_blank" rel="noreferrer">许可</a>
         <form method="post" action="/api/auth/logout">
-          <button class="quiet-button logout-button" type="submit" aria-label="退出登录" title="退出登录">↪</button>
+          <button class="quiet-button logout-button" type="submit" aria-label="退出登录" title="退出登录">
+            <AppIcon name="signOut" :size="18" />
+          </button>
         </form>
       </div>
     </aside>
 
-    <section v-if="!showInstances" class="conversation-pane">
+    <section v-if="!showInstances" class="conversation-pane" aria-label="会话列表">
       <header class="pane-header">
-        <div>
-          <h1>收件箱</h1>
-          <p>{{ filteredConversations.length }} 个会话 · {{ snapshot.connectors.length }} 个接入实例</p>
+        <div class="pane-title">
+          <h1>{{ activeFilterLabel }}</h1>
+          <p aria-live="polite">
+            {{ filteredConversations.length }} 个会话<template v-if="filteredUnread"> · <strong>{{ filteredUnread }}</strong> 条未读</template>
+          </p>
         </div>
-        <FluentButton class="quiet-button refresh-button" type="button" aria-label="刷新" title="刷新" @click="load(selectedId)">↻</FluentButton>
+        <FluentButton
+          class="quiet-button refresh-button"
+          :class="{ spinning: manualRefreshing }"
+          type="button"
+          aria-label="刷新"
+          title="刷新"
+          @click="refreshNow"
+        ><AppIcon name="refresh" :size="18" /></FluentButton>
       </header>
 
       <div ref="conversationListElement" class="conversation-list">
         <div class="conversation-list-tools">
           <div class="conversation-search">
+            <AppIcon class="search-icon" name="search" :size="16" />
             <FluentField
               v-model="conversationSearch"
               label="搜索会话"
               type="search"
-              placeholder="名称或最近消息"
+              placeholder="搜索名称或消息"
             />
           </div>
-          <span class="conversation-list-count" aria-live="polite">
-            {{ conversationRows.length }} / {{ filteredConversations.length }}
-          </span>
+          <div class="segmented" role="group" aria-label="显示范围">
+            <button
+              type="button"
+              :class="{ active: !unreadOnly }"
+              :aria-pressed="!unreadOnly"
+              title="显示全部会话"
+              @click="unreadOnly = false"
+            >全部</button>
+            <button
+              type="button"
+              :class="{ active: unreadOnly }"
+              :aria-pressed="unreadOnly"
+              title="仅显示未读会话"
+              @click="unreadOnly = true"
+            >未读<span v-if="totalUnread" class="segmented-dot" aria-hidden="true" /></button>
+          </div>
         </div>
-        <button
-          v-for="conversation in conversationRows"
-          :key="conversation.id"
-          class="conversation-row"
-          :class="{
-            active: selectedId === conversation.id,
-            pinned: conversation.pinned,
-            folded: conversation.placement === 'folded' || conversation.placement === 'message_box',
-          }"
-          type="button"
-          @click="selectConversationById(conversation.id)"
-        >
-          <span class="avatar conversation-avatar">
-            <span>{{ initials(conversation.avatarLabel || conversation.title) }}</span>
-            <img
-              v-if="conversation.avatarPath"
-              :key="avatarKey(conversation.avatarPath)"
-              :src="avatarSource(conversation.avatarPath)"
-              :data-avatar-path="conversation.avatarPath"
-              :data-avatar-revision="avatarRevision(conversation.avatarPath)"
-              alt=""
-              loading="lazy"
-              @load="imageLoaded"
-              @error="imageFailed"
+
+        <ul class="conversation-items">
+          <li v-for="conversation in conversationRows" :key="conversation.id">
+            <button
+              class="conversation-row"
+              :class="{
+                active: selectedId === conversation.id,
+                pinned: conversation.pinned,
+                folded: isFolded(conversation),
+                unread: conversation.unreadCount > 0,
+              }"
+              type="button"
+              :aria-current="selectedId === conversation.id ? 'true' : undefined"
+              :data-conversation-id="conversation.id"
+              :data-channel="conversation.channel"
+              :data-conversation-type="conversation.conversationType || undefined"
+              :data-unread-count="conversation.unreadCount"
+              :data-pinned="conversation.pinned || undefined"
+              @click="selectConversationById(conversation.id)"
             >
-          </span>
-          <span class="conversation-copy">
-            <span class="conversation-title-row">
-              <strong>
-                <span v-if="conversation.pinned" class="state-mark" title="置顶" aria-label="置顶">◆</span>
+              <span class="avatar conversation-avatar" :class="`avatar-tone-${avatarTone(conversation.title)}`">
+                <span aria-hidden="true">{{ initials(conversation.avatarLabel || conversation.title) }}</span>
+                <img
+                  v-if="conversation.avatarPath"
+                  :key="avatarKey(conversation.avatarPath)"
+                  :src="avatarSource(conversation.avatarPath)"
+                  :data-avatar-path="conversation.avatarPath"
+                  :data-avatar-revision="avatarRevision(conversation.avatarPath)"
+                  alt=""
+                  loading="lazy"
+                  @load="imageLoaded"
+                  @error="imageFailed"
+                >
                 <span
-                  v-if="conversation.placement === 'folded' || conversation.placement === 'message_box'"
-                  class="state-mark folded-mark"
-                  :title="conversation.placement === 'message_box' ? '消息盒子' : '折叠聊天'"
-                  :aria-label="conversation.placement === 'message_box' ? '消息盒子' : '折叠聊天'"
-                >▱</span>
-                {{ conversation.title }}
-              </strong>
-              <time>{{ formatListTime(conversation.lastMessageAt) }}</time>
-            </span>
-            <span class="conversation-preview">{{ conversationPreview(conversation) }}</span>
-          </span>
-          <span v-if="conversation.unreadCount" class="unread-count">{{ conversation.unreadCount }}</span>
-        </button>
+                  v-if="activeFilter === 'all' && !activeConnectorId"
+                  class="channel-badge channel-tone"
+                  :class="`tone-${channelTone(conversation.channel)}`"
+                  aria-hidden="true"
+                >{{ channelGlyph(conversation.channel) }}</span>
+              </span>
+              <span class="conversation-copy">
+                <span class="conversation-title-row">
+                  <strong>
+                    <AppIcon v-if="conversation.conversationType === 'group'" class="title-icon" name="group" :size="14" />
+                    <AppIcon v-if="isFolded(conversation)" class="title-icon" name="archive" :size="14" />
+                    <span class="conversation-title">{{ conversation.title }}</span>
+                  </strong>
+                  <AppIcon v-if="conversation.pinned" class="pin-icon" name="pin" :size="12" />
+                  <time
+                    :datetime="isoTime(conversation.lastMessageAt)"
+                    :title="formatFullStamp(conversation.lastMessageAt)"
+                  >{{ listTime(conversation.lastMessageAt) }}</time>
+                </span>
+                <span class="conversation-meta-row">
+                  <span class="conversation-preview">{{ conversationPreview(conversation) }}</span>
+                  <span v-if="conversation.unreadCount" class="unread-count" aria-hidden="true">{{ conversation.unreadCount > 99 ? '99+' : conversation.unreadCount }}</span>
+                </span>
+                <span class="sr-only">，{{ conversation.channel }}<template v-if="conversationStateText(conversation)">，{{ conversationStateText(conversation) }}</template></span>
+              </span>
+            </button>
+          </li>
+        </ul>
 
         <div v-if="totalConversationPages > 1" class="conversation-pager">
           <FluentButton type="button" :disabled="conversationPage === 0" @click="showPreviousConversationPage">上一页</FluentButton>
@@ -1090,19 +1285,21 @@ onUnmounted(() => {
           >下一页</FluentButton>
         </div>
         <div v-if="!filteredConversations.length && !loading" class="empty-state">
-          <span class="empty-glyph">□</span>
-          <p>{{ conversationSearch.trim() ? '没有匹配的会话' : '暂无会话' }}</p>
+          <span class="empty-glyph"><AppIcon :name="unreadOnly ? 'unread' : 'chat'" :size="22" /></span>
+          <p>{{ conversationSearch.trim() ? '没有匹配的会话' : unreadOnly ? '没有未读会话' : '暂无会话' }}</p>
         </div>
         <div v-if="loading" class="loading-state"><span class="spinner" />正在载入</div>
       </div>
     </section>
 
-    <section v-if="!showInstances" class="content-pane">
+    <section v-if="!showInstances" class="content-pane" aria-label="会话详情">
       <template v-if="selectedConversation">
         <header class="thread-header">
-          <button class="quiet-button mobile-back" type="button" aria-label="返回收件箱" @click="mobileThread = false">←</button>
-          <span class="avatar thread-avatar">
-            <span>{{ initials(selectedConversation.avatarLabel || selectedConversation.title) }}</span>
+          <button class="quiet-button mobile-back" type="button" aria-label="返回收件箱" title="返回收件箱" @click="mobileThread = false">
+            <AppIcon name="back" :size="18" />
+          </button>
+          <span class="avatar thread-avatar" :class="`avatar-tone-${avatarTone(selectedConversation.title)}`">
+            <span aria-hidden="true">{{ initials(selectedConversation.avatarLabel || selectedConversation.title) }}</span>
             <img
               v-if="selectedConversation.avatarPath"
               :key="avatarKey(selectedConversation.avatarPath)"
@@ -1114,121 +1311,232 @@ onUnmounted(() => {
               @error="imageFailed"
             >
           </span>
-          <h2>{{ selectedConversation.title }}</h2>
-          <span class="status-pill" :class="selectedConversation.connectorState">
-            <span class="presence-dot" :class="selectedConversation.connectorState" />
-            {{ statusLabel(selectedConversation.connectorState) }}
+          <div class="thread-title">
+            <h2>{{ selectedConversation.title }}</h2>
+            <p class="thread-subtitle">
+              <span class="channel-tag channel-tone" :class="`tone-${channelTone(channelLabel(selectedConversation))}`">{{ channelLabel(selectedConversation) }}</span>
+              <span v-if="selectedConversation.conversationType === 'group'">群聊</span>
+              <span v-else-if="selectedConversation.conversationType === 'direct'">私聊</span>
+              <span class="presence" :class="selectedConversation.connectorState">
+                <span class="presence-dot" :class="selectedConversation.connectorState" />接入{{ statusLabel(selectedConversation.connectorState) }}
+              </span>
+            </p>
+          </div>
+          <span v-if="aiUnreadCount" class="status-chip ai-unread-chip" :title="`AI 未读 ${aiUnreadCount} 条`">
+            <span class="unread-dot" /><span class="chip-label">AI 未读</span> {{ aiUnreadCount }}
           </span>
         </header>
 
-        <div class="message-scroll" :class="{ busy: detailLoading }">
-          <article
-            v-for="message in snapshot.messages"
-            :key="message.id"
-            :data-message-id="message.id"
-            class="message-row"
-            :class="message.direction"
-          >
-            <span class="avatar message-avatar">
-              <span>{{ initials(message.senderName) }}</span>
-              <img
-                v-if="message.senderAvatarPath"
-                :key="avatarKey(message.senderAvatarPath)"
-                :src="avatarSource(message.senderAvatarPath)"
-                :data-avatar-path="message.senderAvatarPath"
-                :data-avatar-revision="avatarRevision(message.senderAvatarPath)"
-                alt=""
-                loading="lazy"
-                decoding="async"
-                @load="imageLoaded"
-                @error="imageFailed"
-              >
-            </span>
-            <div class="message-block">
-              <p class="message-meta">
-                {{ message.senderName }} · {{ formatStamp(message.occurredAt) }}
-                <span v-if="deliveryStateLabel(message)" class="message-delivery-state">{{ deliveryStateLabel(message) }}</span>
-              </p>
-              <div class="message-bubble">
-                <p v-if="messageBody(message)">{{ messageBody(message) }}</p>
-                <div v-for="file in message.attachments" :key="file.id" class="attachment">
-                  <img
-                    v-if="isImage(file)"
-                    class="attachment-image"
-                    :src="filePath(file)"
-                    :alt="file.fileName"
-                    loading="lazy"
-                    @load="setAttachmentImageLoaded(message, file, true)"
-                    @error="setAttachmentImageLoaded(message, file, false)"
-                  >
-                  <video v-else-if="isVideo(file)" class="attachment-video" :src="filePath(file)" controls preload="metadata" />
-                  <a v-else-if="file.downloadable" class="attachment-link" :href="filePath(file)">
-                    <span class="file-icon">▤</span>
-                    <span><strong>{{ file.fileName }}</strong><small>{{ formatBytes(file.sizeBytes) }}</small></span>
-                  </a>
-                  <span v-else class="attachment-link pending">
-                    <span class="file-icon">▤</span>
-                    <span><strong>{{ file.fileName }}</strong><small>等待上传</small></span>
-                  </span>
-                </div>
-              </div>
+        <div class="message-scroll" :class="{ busy: detailLoading }" role="log" aria-label="消息记录" :aria-busy="detailLoading">
+          <template v-for="entry in threadRows" :key="entry.key">
+            <div v-if="entry.kind === 'day'" class="day-divider">
+              <time :datetime="entry.dateTime">{{ entry.label }}</time>
             </div>
-          </article>
+            <article
+              v-else-if="entry.systemText"
+              :data-message-id="entry.message.id"
+              class="message-row system"
+              :data-direction="entry.message.direction"
+              :data-ai-read="entry.aiRead === null ? undefined : String(entry.aiRead)"
+            >
+              <p class="system-notice" data-block="notice">
+                <AppIcon name="handWave" :size="14" />{{ entry.systemText }}
+                <time class="sr-only" :datetime="isoTime(entry.message.occurredAt)">{{ formatFullStamp(entry.message.occurredAt) }}</time>
+              </p>
+            </article>
+            <article
+              v-else
+              :data-message-id="entry.message.id"
+              class="message-row"
+              :class="[entry.message.direction, { continuation: entry.continuation, 'by-agent': entry.byAgent }]"
+              :data-direction="entry.message.direction"
+              :data-author-role="entry.message.authorRole || undefined"
+              :data-delivery-state="entry.message.direction === 'outbound' ? entry.message.deliveryState || undefined : undefined"
+              :data-ai-read="entry.aiRead === null ? undefined : String(entry.aiRead)"
+            >
+              <span
+                class="avatar message-avatar"
+                :class="entry.byAgent ? 'avatar-agent' : `avatar-tone-${avatarTone(entry.message.senderName)}`"
+              >
+                <AppIcon v-if="entry.byAgent" name="bot" :size="16" />
+                <span v-else aria-hidden="true">{{ initials(entry.message.senderName) }}</span>
+                <img
+                  v-if="entry.message.senderAvatarPath && !entry.byAgent"
+                  :key="avatarKey(entry.message.senderAvatarPath)"
+                  :src="avatarSource(entry.message.senderAvatarPath)"
+                  :data-avatar-path="entry.message.senderAvatarPath"
+                  :data-avatar-revision="avatarRevision(entry.message.senderAvatarPath)"
+                  alt=""
+                  loading="lazy"
+                  decoding="async"
+                  @load="imageLoaded"
+                  @error="imageFailed"
+                >
+              </span>
+              <div class="message-block">
+                <p class="message-meta" :class="{ 'sr-only': entry.continuation }">
+                  <span class="message-sender">{{ senderLabel(entry.message) }}</span>
+                  <span v-if="entry.byAgent" class="role-chip"><AppIcon name="bot" :size="12" />代你发送</span>
+                  <time
+                    :datetime="isoTime(entry.message.occurredAt)"
+                    :title="formatFullStamp(entry.message.occurredAt)"
+                  >{{ formatClock(entry.message.occurredAt) }}</time>
+                </p>
+                <div
+                  class="message-bubble"
+                  :class="{ bare: entry.bare }"
+                  :title="entry.continuation ? formatFullStamp(entry.message.occurredAt) : undefined"
+                >
+                  <template v-for="(block, blockIndex) in entry.blocks" :key="blockIndex">
+                    <p v-if="block.type === 'text'" class="block-text">{{ block.text }}</p>
+                    <blockquote v-else-if="block.type === 'quote'" class="block-quote" data-block="quote">
+                      <AppIcon class="quote-icon" name="quote" :size="14" />
+                      <span class="quote-copy">
+                        <span v-if="block.author" class="quote-author">{{ block.author }}</span>
+                        <span class="quote-text">{{ block.text || '引用了一条消息' }}</span>
+                      </span>
+                    </blockquote>
+                    <div v-else-if="block.type === 'card'" class="block-card" :class="`card-${block.kind}`" data-block="card" :data-card-kind="block.kind">
+                      <span v-if="block.source" class="card-source"><AppIcon :name="CARD_ICONS[block.kind]" :size="14" />{{ block.source }}</span>
+                      <strong class="card-title">{{ block.title || block.label }}</strong>
+                      <span v-if="block.summary" class="card-summary">{{ block.summary }}</span>
+                      <span class="card-type"><AppIcon :name="CARD_ICONS[block.kind]" :size="12" />{{ block.label }}</span>
+                    </div>
+                    <div v-else-if="block.type === 'money'" class="block-money" :class="`money-${block.kind}`" data-block="money" :data-money-kind="block.kind">
+                      <span class="money-main">
+                        <span class="money-icon"><AppIcon :name="MONEY_ICONS[block.kind]" :size="18" /></span>
+                        <span class="money-copy">
+                          <strong>{{ block.amount || block.summary || block.label }}</strong>
+                          <small v-if="block.amount && block.summary">{{ block.summary }}</small>
+                        </span>
+                      </span>
+                      <span class="money-foot">{{ block.label }}<template v-if="block.status"> · {{ block.status }}</template></span>
+                    </div>
+                    <p v-else-if="block.type === 'notice'" class="block-notice" data-block="notice"><AppIcon name="handWave" :size="14" />{{ block.text }}</p>
+                    <span v-else class="block-media" data-block="media" :data-media-kind="block.kind"><AppIcon :name="MEDIA_ICONS[block.kind]" :size="14" />{{ block.label }}</span>
+                  </template>
+                  <div v-for="file in entry.message.attachments" :key="file.id" class="attachment">
+                    <img
+                      v-if="isImage(file)"
+                      class="attachment-image"
+                      :src="filePath(file)"
+                      :alt="file.fileName"
+                      loading="lazy"
+                      @load="setAttachmentImageLoaded(entry.message, file, true)"
+                      @error="setAttachmentImageLoaded(entry.message, file, false)"
+                    >
+                    <video v-else-if="isVideo(file)" class="attachment-video" :src="filePath(file)" controls preload="metadata" />
+                    <a v-else-if="file.downloadable" class="attachment-link" :href="filePath(file)" :download="file.fileName">
+                      <span class="file-icon"><AppIcon name="document" :size="18" /></span>
+                      <span class="file-copy"><strong>{{ file.fileName }}</strong><small>{{ formatBytes(file.sizeBytes) }}</small></span>
+                      <AppIcon class="file-action" name="download" :size="16" />
+                    </a>
+                    <span v-else class="attachment-link pending">
+                      <span class="file-icon"><AppIcon name="document" :size="18" /></span>
+                      <span class="file-copy"><strong>{{ file.fileName }}</strong><small>等待上传</small></span>
+                    </span>
+                  </div>
+                </div>
+                <p v-if="entry.delivery || entry.aiRead !== null" class="message-status">
+                  <span v-if="entry.delivery" class="message-delivery-state" :class="`tone-${entry.delivery.tone}`"><AppIcon :name="entry.delivery.icon" :size="12" />{{ entry.delivery.label }}</span>
+                  <span v-if="entry.aiRead !== null" class="message-ai-read" :class="entry.aiRead ? 'is-read' : 'is-unread'"><AppIcon v-if="entry.aiRead" name="eye" :size="12" /><span v-else class="unread-dot" />{{ entry.aiRead ? 'AI 已读' : 'AI 未读' }}</span>
+                </p>
+              </div>
+            </article>
+          </template>
 
           <div v-if="!snapshot.messages.length && !detailLoading" class="empty-state thread-empty">
-            <span class="empty-glyph">□</span>
+            <span class="empty-glyph"><AppIcon name="chat" :size="22" /></span>
             <p>{{ hasKnownConversationActivity ? '消息内容尚未同步' : '暂无消息' }}</p>
           </div>
           <div v-if="detailLoading" class="loading-overlay"><span class="spinner" /></div>
         </div>
 
         <footer class="composer">
-          <div v-if="staged.length" class="staged-files">
-            <button v-for="(file, index) in staged" :key="file.id" type="button" @click="removeStaged(index)">
-              {{ file.fileName }} <span>×</span>
+          <div v-if="staged.length" class="staged-files" aria-label="待发送附件">
+            <button
+              v-for="(file, index) in staged"
+              :key="file.id"
+              type="button"
+              :aria-label="`移除附件 ${file.fileName}`"
+              :title="`移除 ${file.fileName}`"
+              @click="removeStaged(index)"
+            >
+              <AppIcon name="document" :size="14" />
+              <span>{{ file.fileName }}</span>
+              <AppIcon class="staged-remove" name="dismiss" :size="12" />
             </button>
           </div>
-          <div class="compose-surface">
+          <div class="compose-surface" :class="{ disabled: !canSendText }">
             <textarea
               v-model="draft"
               :disabled="!canSendText"
               :maxlength="maxTextLength"
-              :placeholder="canSendText ? '输入回复…' : '此接入仅接收消息'"
+              :placeholder="canSendText ? `回复 ${selectedConversation.title}` : '此接入仅接收消息'"
+              :aria-label="`回复 ${selectedConversation.title}`"
               rows="2"
               @keydown="onComposerKeydown"
             />
             <div class="compose-toolbar">
-              <label class="quiet-button attachment-button"
-                :class="{ disabled: !canSendFiles || uploadingConversationIds.has(selectedId) }" title="添加附件">
-                ＋
-                <input type="file" multiple :accept="fileAccept"
-                  :disabled="!canSendFiles || uploadingConversationIds.has(selectedId)" @change="uploadFiles">
+              <label
+                class="quiet-button attachment-button"
+                :class="{ disabled: !canSendFiles || uploadingConversationIds.has(selectedId) }"
+                title="添加附件"
+              >
+                <AppIcon name="attach" :size="18" />
+                <input
+                  type="file"
+                  multiple
+                  aria-label="添加附件"
+                  :accept="fileAccept"
+                  :disabled="!canSendFiles || uploadingConversationIds.has(selectedId)"
+                  @change="uploadFiles"
+                >
               </label>
-              <span v-if="!canSendFiles && canSendText" class="capability-hint">不支持发送附件</span>
-              <FluentButton class="accent-button" tone="primary" type="button" :disabled="!canSend" @click="send">发送</FluentButton>
+              <span v-if="uploadingConversationIds.has(selectedId)" class="capability-hint"><span class="spinner small" />正在上传</span>
+              <span v-else-if="!canSendFiles && canSendText" class="capability-hint">此会话不支持发送附件</span>
+              <span
+                v-if="canSendText && deviceConversation && draft.length > maxTextLength * 0.8"
+                class="char-count"
+                aria-live="polite"
+              >{{ draft.length }}/{{ maxTextLength }}</span>
+              <span v-if="canSendText" class="compose-hint">Enter 发送 · Shift+Enter 换行</span>
+              <FluentButton class="accent-button" tone="primary" type="button" :disabled="!canSend" @click="send">
+                <AppIcon name="send" :size="16" /><span>发送</span>
+              </FluentButton>
             </div>
           </div>
         </footer>
       </template>
 
       <div v-else class="empty-state welcome-state">
-        <span class="empty-glyph">□</span>
+        <span class="empty-glyph"><AppIcon name="chat" :size="22" /></span>
         <p>选择一个会话</p>
       </div>
     </section>
 
-    <section v-else class="instances-pane">
+    <section v-else class="instances-pane" aria-label="接入管理">
       <header class="instances-header">
-        <button class="quiet-button" type="button" aria-label="返回收件箱" title="返回收件箱" @click="showInstances = false">←</button>
+        <button class="quiet-button" type="button" aria-label="返回收件箱" title="返回收件箱" @click="showInstances = false">
+          <AppIcon name="back" :size="18" />
+        </button>
         <div>
           <h1>接入管理</h1>
-          <p>{{ snapshot.connectors.length }} 个账号</p>
+          <p>{{ snapshot.connectors.length }} 个账号 · {{ onlineConnectorCount }} 个在线</p>
         </div>
       </header>
       <div class="instance-grid">
-        <article v-for="connector in snapshot.connectors" :key="connector.id" class="instance-card">
+        <article
+          v-for="connector in snapshot.connectors"
+          :key="connector.id"
+          class="instance-card"
+          :class="connector.state"
+          :data-connector-id="connector.id"
+          :data-state="connector.state"
+        >
           <header>
-            <div>
+            <span class="instance-glyph channel-tone" :class="`tone-${channelTone(channelLabel(connector))}`" aria-hidden="true">{{ channelGlyph(channelLabel(connector)) }}</span>
+            <div class="instance-heading">
               <p>{{ channelLabel(connector) }}</p>
               <h2>{{ connector.accountLabel }}</h2>
             </div>
@@ -1236,15 +1544,30 @@ onUnmounted(() => {
               <span class="presence-dot" :class="connector.state" />{{ statusLabel(connector.state) }}
             </span>
           </header>
+          <p v-if="connector.lastSeenAt" class="instance-seen">
+            <AppIcon :name="connector.state === 'online' ? 'plugConnected' : 'plugDisconnected'" :size="14" />
+            最近活动
+            <time :datetime="isoTime(connector.lastSeenAt)" :title="formatFullStamp(connector.lastSeenAt)">{{ relativeAge(connector.lastSeenAt) }}</time>
+          </p>
           <dl>
             <dt>账号</dt><dd>{{ connector.accountLabel }}</dd>
             <dt>渠道</dt><dd>{{ channelLabel(connector) }}</dd>
             <dt>ID</dt><dd class="mono">{{ connector.id }}</dd>
-            <dt>模式</dt><dd class="mono">{{ connector.mode }}</dd>
+            <dt>模式</dt><dd>{{ modeLabel(connector.mode) }}<span v-if="modeLabel(connector.mode) !== connector.mode" class="mono mode-code">{{ connector.mode }}</span></dd>
             <dt>能力</dt>
             <dd class="capability-list">
-              <span v-for="capability in connector.capabilities" :key="capability">{{ capLabel(capability) }}</span>
-              <span v-if="!connector.capabilities.length">未声明</span>
+              <span
+                v-for="group in capabilityGroups(connector.capabilities)"
+                :key="group.id"
+                class="capability-group"
+                :class="`is-${group.id}`"
+              >
+                <span class="capability-group-label">{{ group.label }}</span>
+                <span v-for="capability in group.items" :key="capability" class="capability-chip">{{
+                  group.id === 'other' ? capLabel(capability) : capLabel(capability).replace(/^[收发]/, '')
+                }}</span>
+              </span>
+              <span v-if="!connector.capabilities.length" class="capability-chip">未声明</span>
             </dd>
           </dl>
           <section v-if="supportsLayoutAutoRecovery(connector)" class="instance-control" aria-label="布局控制">
@@ -1262,14 +1585,18 @@ onUnmounted(() => {
           </section>
           <footer class="instance-actions">
             <FluentButton
-              class="quiet-button"
+              class="instance-open-button"
+              tone="subtle"
               type="button"
               :disabled="!snapshot.conversations.some((conversation) => conversation.connectorId === connector.id)"
               @click="selectFilter(`channel:${channelLabel(connector)}`, connector.id)"
-            >查看此账号会话</FluentButton>
+            ><span>查看此账号会话</span><AppIcon name="arrowRight" :size="14" /></FluentButton>
           </footer>
         </article>
-        <div v-if="!snapshot.connectors.length && !loading" class="empty-state"><span class="empty-glyph">□</span><p>尚无接入实例</p></div>
+        <div v-if="!snapshot.connectors.length && !loading" class="empty-state">
+          <span class="empty-glyph"><AppIcon name="plugDisconnected" :size="22" /></span>
+          <p>尚无接入实例</p>
+        </div>
       </div>
     </section>
   </main>

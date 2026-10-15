@@ -5,7 +5,7 @@
 ## 运行架构
 
 - `worker/index.js`：唯一生产运行时入口；不依赖 Pages、Sites、服务器或入站设备端口。
-- `ui/`：Vue 3 + Vite 前端。Worker 在认证后通过静态资产绑定返回带哈希的构建产物；页面与 API 均显式禁用缓存。收件箱在页面可见且联网时轮询，请求结束后才安排下一次刷新；失败时指数退避至最多 60 秒，页面隐藏或离线时暂停，恢复后立即刷新。
+- `ui/`：Vue 3 + Vite 前端。Worker 在认证后通过静态资产绑定返回带哈希的构建产物；页面与 API 均显式禁用缓存。图标为内联的 Fluent UI System Icons；会话行与消息带 `data-*` 状态属性、`<time datetime>` 时间与 ARIA 语义，供浏览器中的 AI agent 直接读取。收件箱在页面可见且联网时轮询，请求结束后才安排下一次刷新；失败时指数退避至最多 60 秒，页面隐藏或离线时暂停，恢复后立即刷新。
 - `worker/schema.sql`：D1 schema。`connector_instances` 是连接实例表，不对渠道类型设置唯一约束。
 - `connector_layout_control` 只服务于显式声明 `layout_control` 的单一设备 owner；云端使用 revision 做 CAS，设备本地动作另用持久化 generation 与 action ID 排序、去重。
 - `wrangler.jsonc`：本地开发与 Wrangler 生产部署配置。
@@ -46,6 +46,8 @@
 - 普通群聊只提取纯文本，每 5 分钟批量写入统一消息流，并标记 `queue_class=background`；不包含文件、图片、视频、语音或表情包，默认保留 30 天。后台消息和即时消息在收件箱中等价展示，但后台消息不能进入 Agent 即时队列。
 - 原生折叠与消息盒字段规范化为 `normal`、`folded`、`message_box` 或 `unknown`；原生置顶独立规范化为 `is_pinned`。网页按置顶优先排序并显示状态，但不会把接入实例名称重复写入会话行或消息详情。
 - 远程 MCP 使用 `listen_messages` 非破坏性查看即时候选、`claim_message` 原子领取、`consume_message` 完成或释放租约，并通过 `reply_message` 形成双向回复；旧工具名保留为兼容别名。
+- inbox 消息附带只读的 `authorRole`（`contact`、`owner` 或 `agent`）与 `agentRead`（Agent 是否已领取该消息；未进入即时队列为 `null`），不返回 Agent consumer ID 或队列内部状态。网页据此区分 AI 代发与本人发送，并在入站消息下标注“AI 已读 / AI 未读”。
+- 网页把 QQ/微信正文中的行首标签渲染为富内容：`[引用] 作者：内容`、`[reply:type-7]` 与微信复制格式 `「作者：内容」` + 虚线分隔显示为引用块；`[小程序]`、`[QQ小程序]`、`[链接]`、`[分享]`、`[卡片]`、`[聊天记录]`、`[视频号]`、`[音乐]`、`[位置]`、`[名片]`、`[公众号]` 后接 `标题 · 摘要 · 来源` 显示为卡片；`[转账]`、`[红包]` 显示为金额卡片，`[拍一拍]` 显示为居中提示；`[picture:…]`、`[file:…]`、`[voice:…]`、`[video:…]`、`[sticker:…]`、`[图片]` 等显示为媒体标签，`[kind:type-N]` 显示为可读名称。标签只在行首生效，其余文字原样显示；会话列表摘要使用同一规则压缩为一行。
 
 详细协议见 [CONNECTOR_PROTOCOL.md](./CONNECTOR_PROTOCOL.md)。
 
