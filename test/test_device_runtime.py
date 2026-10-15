@@ -940,6 +940,72 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(os.path.normpath(value["database"]), os.path.join(self.temp.name, "state", "runtime.sqlite"))
         self.assertEqual(os.path.normpath(value["adapter"]), os.path.join(self.temp.name, "private", "adapter"))
 
+    def test_adapter_retries_pipe_readiness_races_within_deadline(self):
+        class Pipe:
+            def __init__(self, fd):
+                self.fd = fd
+                self.closed = False
+
+            def fileno(self):
+                return self.fd
+
+            def close(self):
+                self.closed = True
+
+        class Process:
+            pid = 123
+
+            def __init__(self):
+                self.stdin = Pipe(101)
+                self.stdout = Pipe(102)
+
+            def wait(self, timeout=None):
+                return 0
+
+        class Selector:
+            def __init__(self):
+                self.keys = {}
+
+            def register(self, fileobj, events, data):
+                self.keys[fileobj] = type("Key", (), {"data": data})()
+
+            def unregister(self, fileobj):
+                del self.keys[fileobj]
+
+            def select(self, timeout=None):
+                return [(key, 0) for key in self.keys.values()]
+
+            def close(self):
+                pass
+
+        process = Process()
+        selectors = Selector()
+        response = iter((b'{"ok":true}', b""))
+        races = {"write": 0, "read": 0}
+
+        def write(fd, data):
+            if races["write"] == 0:
+                races["write"] += 1
+                raise BlockingIOError(11, "temporarily unavailable")
+            return len(data)
+
+        def read(fd, size):
+            if races["read"] == 0:
+                races["read"] += 1
+                raise BlockingIOError(11, "temporarily unavailable")
+            return next(response)
+
+        with patch.object(runtime.subprocess, "Popen", return_value=process), \
+                patch.object(runtime.os, "set_blocking", create=True), \
+                patch.object(runtime.os, "write", side_effect=write), \
+                patch.object(runtime.os, "read", side_effect=read), \
+                patch.object(runtime.selectors, "DefaultSelector", return_value=selectors):
+            result = runtime.run_adapter("adapter", {"op": "ensure-active"}, timeout=2)
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(races, {"write": 1, "read": 1})
+        self.assertTrue(process.stdin.closed)
+        self.assertTrue(process.stdout.closed)
+
     @unittest.skipUnless(os.name == "posix", "device process pipes use POSIX selectors")
     def test_adapter_deadline_bounds_large_input_oversized_output_and_closed_stdout(self):
         script = os.path.join(self.temp.name, "adapter")
@@ -1334,18 +1400,35 @@ class DeviceRuntimeTests(unittest.TestCase):
                             for record in records))
 
     def test_auto_wake_diagnostic_errors_use_fixed_reasons(self):
-        for response, expected in (({}, "invalid_result"),
+        class TrackingStderr(io.StringIO):
+            def __init__(self):
+                super().__init__()
+                self.flush_calls = 0
+
+            def flush(self):
+                self.flush_calls += 1
+                super().flush()
+
+        for response, expected in (({}, "invalid_schema"),
+                                   (RuntimeError("adapter_timeout"), "timeout"),
+                                   (RuntimeError("adapter_failed"), "subprocess_failed"),
+                                   (RuntimeError("adapter_invalid_response"), "invalid_schema"),
+                                   (RuntimeError("adapter_response_too_large"), "response_too_large"),
+                                   (RuntimeError("adapter_spawn_failed"), "spawn_error"),
+                                   (OSError("private path detail"), "io_error"),
+                                   (json.JSONDecodeError("private parse detail", "secret", 0), "invalid_json"),
                                    (RuntimeError("private error detail"), "adapter_error")):
             def adapter(_request, response=response):
                 if isinstance(response, Exception):
                     raise response
                 return response
             relay = runtime.Relay(self.auto_wake_config(), self.db, adapter)
-            captured = io.StringIO()
+            captured = TrackingStderr()
             with redirect_stderr(captured), patch.object(runtime.time, "monotonic", return_value=100):
                 self.assertFalse(relay.ensure_active())
             record = json.loads(captured.getvalue())
             self.assertEqual(record["reason"], expected)
+            self.assertEqual(captured.flush_calls, 1)
             self.assertNotIn("private", captured.getvalue())
 
     def test_auto_wake_not_ready_skips_scans_and_command_polls_but_flushes_outbox(self):

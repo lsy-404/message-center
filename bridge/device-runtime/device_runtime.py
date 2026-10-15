@@ -140,9 +140,12 @@ def resolve_local_paths(config, config_path):
 
 def run_adapter(path, request, timeout=30):
     deadline = time.monotonic() + timeout
-    process = subprocess.Popen([path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, bufsize=0,
-                               start_new_session=(os.name == "posix"))
+    try:
+        process = subprocess.Popen([path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, bufsize=0,
+                                   start_new_session=(os.name == "posix"))
+    except OSError:
+        raise RuntimeError("adapter_spawn_failed") from None
     selector = None
     output = bytearray()
     try:
@@ -166,12 +169,17 @@ def run_adapter(path, request, timeout=30):
                         offset += written
                     except BrokenPipeError:
                         offset = len(request_bytes)
+                    except BlockingIOError:
+                        continue
                     if offset >= len(request_bytes):
                         selector.unregister(process.stdin)
                         process.stdin.close()
                         input_open = False
                 else:
-                    chunk = os.read(process.stdout.fileno(), 16384)
+                    try:
+                        chunk = os.read(process.stdout.fileno(), 16384)
+                    except BlockingIOError:
+                        continue
                     if not chunk:
                         selector.unregister(process.stdout)
                         output_open = False
@@ -221,6 +229,24 @@ def adapter_timeout_for_request(request):
     if operation == "ensure-active":
         return ADAPTER_WAKE_TIMEOUT
     raise ValueError("unsupported_adapter_operation")
+
+
+def wake_error_category(error):
+    if isinstance(error, subprocess.TimeoutExpired):
+        return "timeout"
+    if isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)):
+        return "invalid_json"
+    if isinstance(error, OSError):
+        return "io_error"
+    if isinstance(error, RuntimeError):
+        return {
+            "adapter_timeout": "timeout",
+            "adapter_failed": "subprocess_failed",
+            "adapter_invalid_response": "invalid_schema",
+            "adapter_response_too_large": "response_too_large",
+            "adapter_spawn_failed": "spawn_error",
+        }.get(str(error), "adapter_error")
+    return "adapter_error"
 
 
 class Relay:
@@ -612,7 +638,7 @@ class Relay:
                     (result["ready"] and result["attempted"]) or
                     not isinstance(result.get("reason"), str) or not WAKE_REASON.fullmatch(result["reason"])):
                 self.wake_ready = False
-                self.log_wake_state(False, False, "invalid_result")
+                self.log_wake_state(False, False, "invalid_schema")
                 return False
             self.wake_ready = result["ready"]
             self.wake_ready_at = time.monotonic()
@@ -620,9 +646,9 @@ class Relay:
                 self.wake_scan_pending = set(self.connector_by_id)
             self.log_wake_state(result["ready"], result["attempted"], result["reason"])
             return self.wake_readiness_current()
-        except Exception:
+        except Exception as error:
             self.wake_ready = False
-            self.log_wake_state(False, False, "adapter_error")
+            self.log_wake_state(False, False, wake_error_category(error))
             return False
 
     def log_wake_state(self, ready, attempted, reason):
@@ -633,6 +659,7 @@ class Relay:
         observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
         sys.stderr.write(compact({"observedAt": observed_at, "ready": ready,
                                   "attempted": attempted, "reason": reason}) + "\n")
+        sys.stderr.flush()
 
     def wake_readiness_current(self):
         return (not self.auto_wake or
