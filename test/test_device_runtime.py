@@ -187,6 +187,118 @@ class DeviceRuntimeTests(unittest.TestCase):
         relay.source_read_failed("connector-a")
         self.assertTrue(relay.scan_profile("primary"))
         self.assertEqual(relay.source_failures["connector-a"], 0)
+        self.assertEqual(relay.attach_failure_streak["connector-a"], (None, 0))
+
+    def test_native_attach_failure_classification_requires_exact_safe_metadata(self):
+        valid = {"stage": "attach", "errorCode": "attach_failed", "dispatch": "not_started", "processId": 12345}
+        self.assertTrue(runtime.explicit_native_attach_failure(valid))
+        self.assertTrue(runtime.explicit_native_attach_failure(
+            {**valid, "errorCode": "timeout"}))
+        for invalid in (
+            None,
+            {key: value for key, value in valid.items() if key != "processId"},
+            {**valid, "processId": True},
+            {**valid, "processId": 1},
+            {**valid, "processId": 0},
+            {**valid, "processId": -1},
+            {**valid, "stage": "native-helper"},
+            {**valid, "errorCode": "page_read_failed"},
+            {**valid, "dispatch": "unknown"},
+            {**valid, "detail": "ignored"},
+        ):
+            self.assertFalse(runtime.explicit_native_attach_failure(invalid))
+
+        relay = runtime.Relay(self.config, self.db, lambda _request: {
+            "ok": False, "sourceReadOk": False, "nativeFailure": valid})
+        with self.assertRaises(runtime.SourceReadError) as caught:
+            relay.scan_profile("primary")
+        self.assertEqual(caught.exception.attach_failure_pid, 12345)
+
+    def test_changed_process_resets_attach_streak_and_requests_observed_pid(self):
+        config = self.auto_wake_config()
+        config["connectors"] = config["connectors"][:1]
+        requests = []
+        relay = runtime.Relay(config, self.db,
+                              lambda request: requests.append(dict(request)) or self.wake_result(True))
+        relay.source_read_failed("connector-a", attach_failure_pid=12345)
+        relay.source_read_failed("connector-a", attach_failure_pid=12345)
+        relay.source_read_failed("connector-a", attach_failure_pid=12346)
+        self.assertEqual(relay.attach_failure_streak["connector-a"], (12346, 1))
+        self.assertFalse(relay.recover_attach_after_failures("connector-a"))
+        relay.source_read_failed("connector-a", attach_failure_pid=12346)
+        relay.source_read_failed("connector-a", attach_failure_pid=12346)
+        self.assertTrue(relay.recover_attach_after_failures("connector-a"))
+        self.assertEqual(requests, [{"op": "ensure-active", "reason": "attach_failure",
+                                    "driver": "qq", "observedPid": 12346}])
+
+    def test_attach_recovery_rejects_pid_one(self):
+        config = self.auto_wake_config()
+        config["connectors"] = config["connectors"][:1]
+        requests = []
+        relay = runtime.Relay(config, self.db,
+                              lambda request: requests.append(dict(request)) or self.wake_result(True))
+        self.assertFalse(relay.ensure_active(
+            recovery_driver="qq", recovery_reason="attach_failure", observed_pid=1))
+        relay.source_read_failed("connector-a", attach_failure_pid=1)
+        self.assertEqual(relay.attach_failure_streak["connector-a"], (None, 0))
+        self.assertEqual(requests, [])
+
+    def test_attach_failure_streak_requires_three_consecutive_failures_and_respects_cooldown(self):
+        config = self.auto_wake_config()
+        config["connectors"] = config["connectors"][:1]
+        requests = []
+        relay = runtime.Relay(config, self.db,
+                              lambda request: requests.append(dict(request)) or self.wake_result(True))
+        relay.source_read_failed("connector-a", attach_failure_pid=12345)
+        relay.source_read_failed("connector-a", attach_failure_pid=12345)
+        relay.source_read_failed("connector-a")
+        self.assertEqual(relay.attach_failure_streak["connector-a"], (None, 0))
+        relay.source_read_failed("connector-a", attach_failure_pid=12345)
+        relay.source_read_failed("connector-a", attach_failure_pid=12345)
+        self.assertFalse(relay.recover_attach_after_failures("connector-a"))
+        relay.source_read_failed("connector-a", attach_failure_pid=12345)
+        self.assertTrue(relay.recover_attach_after_failures("connector-a"))
+        self.assertEqual(requests, [{"op": "ensure-active", "reason": "attach_failure",
+                                    "driver": "qq", "observedPid": 12345}])
+        self.assertFalse(relay.recover_attach_after_failures("connector-a"))
+
+        self.db.execute(
+            "INSERT INTO command_ledger(connector_id,idempotency_key,fingerprint,state,result,retryable) "
+            "VALUES(?,?,?,?,?,?)",
+            ("connector-a", "sent-unknown", "fingerprint", "done",
+             runtime.compact({"uncertain": True, "error": "device_send_outcome_uncertain"}), 0),
+        )
+        self.db.commit()
+        self.assertFalse(any(request.get("op") == "send" for request in requests))
+
+    def test_attach_streak_does_not_survive_runtime_restart(self):
+        config = self.auto_wake_config()
+        config["connectors"] = config["connectors"][:1]
+        requests = []
+        relay = runtime.Relay(config, self.db,
+                              lambda request: requests.append(dict(request)) or self.wake_result(True))
+        relay.source_read_failed("connector-a", attach_failure_pid=12345)
+        relay.source_read_failed("connector-a", attach_failure_pid=12345)
+        self.assertEqual(relay.attach_failure_streak["connector-a"], (12345, 2))
+        self.db.execute(
+            "UPDATE source_recovery SET consecutive_failures=153 WHERE connector_id=?",
+            ("connector-a",),
+        )
+        self.db.commit()
+        self.db.close()
+        restarted_db = runtime.open_database(self.db_path)
+        try:
+            restarted = runtime.Relay(config, restarted_db,
+                                      lambda request: requests.append(dict(request)) or self.wake_result(True))
+            self.assertEqual(restarted.source_failures["connector-a"], 153)
+            self.assertEqual(restarted.attach_failure_streak["connector-a"], (None, 0))
+            self.assertFalse(restarted.recover_attach_after_failures("connector-a"))
+            restarted.source_read_failed("connector-a", attach_failure_pid=12345)
+            restarted.source_read_failed("connector-a", attach_failure_pid=12345)
+            self.assertFalse(restarted.recover_attach_after_failures("connector-a"))
+        finally:
+            restarted_db.close()
+            self.db = sqlite3.connect(self.db_path)
 
     def test_backpressure_skip_does_not_refresh_scan_health_or_clear_forced_scan(self):
         relay = runtime.Relay(self.auto_wake_config(), self.db,
