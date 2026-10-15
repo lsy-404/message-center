@@ -1203,18 +1203,22 @@ class DeviceRuntimeTests(unittest.TestCase):
         time.sleep(1)
         self.assertFalse(os.path.exists(marker))
 
-    @unittest.skipUnless(os.name == "posix", "adapter process groups are POSIX-only")
     def test_adapter_invalid_json_kills_remaining_group_children(self):
         script = os.path.join(self.temp.name, "adapter")
         marker = os.path.join(self.temp.name, "survived-invalid-json")
         started = os.path.join(self.temp.name, "child-started")
         child = "open(" + repr(started) + ", 'w').close();import time;time.sleep(.8);open(" + repr(marker) + ", 'w').close()"
+        compile(child, "<adapter-child>", "exec")
+        script_text = ("#!/usr/bin/env python3\nimport os,subprocess,sys,time\n"
+                       "subprocess.Popen([sys.executable, '-c', " + repr(child) + "], "
+                       "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                       "while not os.path.exists(" + repr(started) + "): time.sleep(.01)\n"
+                       "sys.stdout.close()\n")
+        compile(script_text, script, "exec")
+        if os.name != "posix":
+            self.skipTest("adapter process groups are POSIX-only")
         with open(script, "w", encoding="utf-8") as output:
-            output.write("#!/usr/bin/env python3\nimport os,subprocess,sys,time\n"
-                         "subprocess.Popen([sys.executable, '-c', " + repr(child) + ", "
-                         "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
-                         "while not os.path.exists(" + repr(started) + "): time.sleep(.01)\n"
-                         "sys.stdout.close()\n")
+            output.write(script_text)
         os.chmod(script, 0o700)
         with self.assertRaises(json.JSONDecodeError):
             runtime.run_adapter(script, {"input": "x"}, timeout=2)

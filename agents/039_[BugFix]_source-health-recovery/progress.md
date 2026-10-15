@@ -20,3 +20,4 @@
 - Increased public wake helper timeout from 20 to 30 seconds and updated its runtime timeout expectation to match the bounded multi-stage recovery contract.
 - Moved exit-code, JSON decode, and response-shape validation into `run_adapter` cleanup scope. Added a POSIX child-leak regression test for invalid JSON and corrected its generated script to contain actual line breaks. Existing oversized-input/output and early-closed-stdout assertions were preserved.
 - `py -m unittest test.test_device_runtime`: 72 tests passed, 2 platform-specific skips on Windows. POSIX process-group behavior still requires the parent isolated iPad rerun.
+- Corrected the generated child-launch script syntax and added `compile()` checks for both child and adapter snippets before the POSIX-only execution skip. Focused fixture test compiles then skips on Windows; full `/test` suite passes 105 tests with 2 platform-specific skips.

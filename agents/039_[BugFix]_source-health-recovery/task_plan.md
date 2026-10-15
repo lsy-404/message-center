@@ -10,3 +10,5 @@
 - [x] Extend adapter cleanup to invalid output and raise wake helper deadline to cover bounded recovery stages.
 - [x] Add a POSIX regression test proving invalid JSON still terminates inherited process-group children; retain existing deadline assertions.
 - [x] Validate the focused suite and full public test set, then commit the follow-up.
+- [x] Fix the generated POSIX child-launch script and compile both generated snippets before the platform skip.
+- [x] Re-run the full public test set and commit the fixture correction.
