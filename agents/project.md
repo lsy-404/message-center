@@ -33,3 +33,4 @@ Cloudflare Worker、D1、R2；Vue 前端与 @platform-kit/fluent；通用连接�
 ## 当前任务
 - [036_[Feature]_device-auto-wake](036_[Feature]_device-auto-wake/task_plan.md)：公开设备 runtime 的 opt-in 自动唤醒编排。
 - [037_[BugFix]_auto-wake-diagnostics](037_[BugFix]_auto-wake-diagnostics/task_plan.md)：为自动唤醒状态变化增加有界诊断日志。
+- [038_[BugFix]_wake-pipe-reliability](038_[BugFix]_wake-pipe-reliability/task_plan.md)：适配器管道就绪竞态与脱敏唤醒错误分类已本地修复并验证；未据此认定实机根因。
