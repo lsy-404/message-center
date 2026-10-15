@@ -16,3 +16,5 @@
 
 - Added only `ProcessType=Interactive` to the public launchd example after the `LowPriorityIO`-only live trial failed to improve startup. The operational root generator and device were not touched.
 - Parsed the plist and verified its dictionary equals the prior configuration plus only `ProcessType=Interactive`.
+- Integrated runtime/outbox verification: 74 tests passed on the actual device with no skips; Windows ran the same 74 cases with one POSIX-only skip. The device update preserved runtime data and existing recovery budgets.
+- Live scheduling comparison: removing LowPriorityIO alone left startup delayed beyond 83 seconds. Adding Interactive produced verified readiness about 10 seconds after launch; the runtime still had 64 MiB active/inactive fatal memory limits. A subsequent autonomous receive/upload advanced cloud history by 19 records. One connector still reported source failure, so this is not full dual-source or long-duration acceptance.
