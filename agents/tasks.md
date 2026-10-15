@@ -3,7 +3,7 @@
 
 | 编号 | 任务名称 | 任务描述 | 变更动机 | 状态 |
 | :--: | :-- | :-- | :-- | :-- |
-| 039 | [Feature] 收件箱外观与AI状态 | 重做收件箱视觉层级与图标，显示未读、渠道色标、AI 代发与 AI 已读状态，渲染 QQ/微信引用与小程序等卡片，并补充语义与机器可读标记 | 本人需要快速扫读信息，AI 代收代发的结果需要一眼可见，页面同时供浏览器中的 AI 读取 | ✅ 本地验证通过；Safari/iPad 实机未验证 |
+| 041 | [Feature] 收件箱外观与AI状态 | 重做收件箱视觉层级与图标，显示未读、渠道色标、AI 代发与 AI 已读状态，渲染 QQ/微信引用与小程序等卡片，并补充语义与机器可读标记 | 本人需要快速扫读信息，AI 代收代发的结果需要一眼可见，页面同时供浏览器中的 AI 读取 | ✅ 本地验证通过；Safari/iPad 实机未验证 |
 | 038 | [BugFix] wake-pipe-reliability | Retry transient nonblocking adapter-pipe readiness races and categorize redacted wake failures | Avoid losing bounded wake attempts to EAGAIN and make adapter failures diagnosable without leaking private details | ✅ Locally verified |
 | 039 | [BugFix] source-health-recovery | Recover bounded repeated native source read failures without cursor inactivity inference or launch loops | Improve device collection stability while keeping source reads, activation retries, and send safety bounded | 🔄 In progress |
 | 037 | [BugFix] auto-wake-diagnostics | Emit one compact diagnostic when the validated wake state tuple changes | Explain silent wake failures without logging private data or repeating unchanged status | ✅ Implemented and locally verified |
