@@ -38,12 +38,19 @@ ADAPTER_SCAN_TIMEOUT = 60
 ADAPTER_SEND_TIMEOUT = 90
 ADAPTER_WAKE_TIMEOUT = 20
 AUTO_WAKE_INTERVAL = 60
+SOURCE_RECOVERY_FAILURE_THRESHOLD = 3
+SOURCE_RECOVERY_COOLDOWN = 300
+SOURCE_STARTUP_SETTLE = 60
 WAKE_REASON = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, response, code, message, headers, new_url):
         raise urllib.error.HTTPError(request.full_url, code, "redirect_refused", headers, response)
+
+
+class SourceReadError(RuntimeError):
+    pass
 
 
 def _event_route(message):
@@ -121,6 +128,10 @@ def open_database(path):
         state TEXT NOT NULL,
         result TEXT, retryable INTEGER NOT NULL DEFAULT 0);
       CREATE UNIQUE INDEX IF NOT EXISTS command_ledger_key ON command_ledger(connector_id,idempotency_key);
+      CREATE TABLE IF NOT EXISTS source_recovery(
+        connector_id TEXT PRIMARY KEY, consecutive_failures INTEGER NOT NULL DEFAULT 0,
+        last_success_at REAL NOT NULL DEFAULT 0, retry_after REAL NOT NULL DEFAULT 0,
+        settle_until REAL NOT NULL DEFAULT 0);
     """)
     return db
 
@@ -290,6 +301,16 @@ class Relay:
         self.wake_scan_pending = set()
         self.wake_scan_failures = {item["id"]: 0 for item in self.connectors}
         self.wake_scan_retry_at = {item["id"]: 0 for item in self.connectors}
+        recovery_rows = {row[0]: row[1:] for row in self.db.execute(
+            "SELECT connector_id,consecutive_failures,last_success_at,retry_after,settle_until FROM source_recovery")}
+        self.source_failures = {item["id"]: recovery_rows.get(item["id"], (0, 0, 0))[0]
+                                for item in self.connectors}
+        self.source_last_success = {item["id"]: recovery_rows.get(item["id"], (0, 0, 0, 0))[1]
+                                    for item in self.connectors}
+        self.source_recovery_after = {item["id"]: recovery_rows.get(item["id"], (0, 0, 0, 0))[2]
+                                      for item in self.connectors}
+        self.source_settle_until = {item["id"]: recovery_rows.get(item["id"], (0, 0, 0, 0))[3]
+                                    for item in self.connectors}
         self.connector = self.connectors[0]["id"]
         self.health = {item["id"]: False for item in self.connectors}
         self.last_scan = {item["id"]: float("-inf") for item in self.connectors}
@@ -326,6 +347,44 @@ class Relay:
     def succeeded(self, connector_id):
         self.failures[connector_id] = 0
         self.retry_at[connector_id] = 0
+
+    def persist_source_state(self, connector_id):
+        self.db.execute(
+            "INSERT INTO source_recovery(connector_id,consecutive_failures,last_success_at,retry_after,settle_until) "
+            "VALUES(?,?,?,?,?) ON CONFLICT(connector_id) DO UPDATE SET "
+            "consecutive_failures=excluded.consecutive_failures,last_success_at=excluded.last_success_at,"
+            "retry_after=excluded.retry_after,"
+            "settle_until=excluded.settle_until",
+            (connector_id, self.source_failures[connector_id], self.source_last_success[connector_id],
+             self.source_recovery_after[connector_id], self.source_settle_until[connector_id]),
+        )
+        self.db.commit()
+
+    def source_read_failed(self, connector_id):
+        self.source_failures[connector_id] += 1
+        self.persist_source_state(connector_id)
+
+    def source_read_succeeded(self, connector_id):
+        self.source_failures[connector_id] = 0
+        self.source_last_success[connector_id] = time.time()
+        self.persist_source_state(connector_id)
+
+    def recover_source_after_failures(self, connector_id):
+        now = time.time()
+        if (not self.auto_wake
+                or self.source_last_success[connector_id] <= 0
+                or self.source_failures[connector_id] < SOURCE_RECOVERY_FAILURE_THRESHOLD
+                or now < self.source_recovery_after[connector_id]
+                or now < self.source_settle_until[connector_id]):
+            return False
+        self.source_recovery_after[connector_id] = now + SOURCE_RECOVERY_COOLDOWN
+        self.persist_source_state(connector_id)
+        self.health[connector_id] = False
+        try:
+            result = self.ensure_active(recovery_driver=self.connector_by_id[connector_id].get("kind"))
+        except Exception:
+            return False
+        return result
 
     def heartbeat_failed(self, connector_id):
         count = self.heartbeat_failures[connector_id] + 1
@@ -481,13 +540,20 @@ class Relay:
         driver = connector.get("kind")
         if driver not in {"qq", "wechat"}:
             raise RuntimeError("unsupported_connector_driver")
-        result = self.adapter_call({"op": "scan", "driver": driver,
-                                    "profile": profile, "cursor": cursor,
-                                    "limit": limit, "maxBytes": MAX_SCAN_RESPONSE,
-                                    "maxEventBytes": MAX_EVENT, "mediaDirectory": self.media_directory_for(self.connector),
-                                    "maxMediaBytes": remaining, "history": bool(history)})
+        try:
+            result = self.adapter_call({"op": "scan", "driver": driver,
+                                        "profile": profile, "cursor": cursor,
+                                        "limit": limit, "maxBytes": MAX_SCAN_RESPONSE,
+                                        "maxEventBytes": MAX_EVENT, "mediaDirectory": self.media_directory_for(self.connector),
+                                        "maxMediaBytes": remaining, "history": bool(history)})
+        except Exception as error:
+            raise SourceReadError("source_read_failed") from error
+        if not isinstance(result, dict):
+            raise RuntimeError("invalid_scan_result")
+        if result.get("health") != "online":
+            raise SourceReadError("source_read_failed")
         if result.get("ok") is not True or "cursor" not in result or not isinstance(result.get("messages"), list):
-            raise RuntimeError("scan_failed")
+            raise SourceReadError("scan_failed")
         if len(compact(result).encode("utf-8")) > MAX_SCAN_RESPONSE:
             raise RuntimeError("scan_response_too_large")
         messages = result["messages"]
@@ -619,19 +685,25 @@ class Relay:
             raise
         active = result.get("active") is True
         self.scan_interval[self.connector] = 15 if result.get("more") is True else (60 if active else 300)
+        self.source_read_succeeded(self.connector)
         return result.get("health") == "online"
 
-    def ensure_active(self):
+    def ensure_active(self, recovery_driver=None):
         if not self.auto_wake:
             return True
         now = time.monotonic()
-        if now - self.last_wake_attempt < AUTO_WAKE_INTERVAL:
+        if (recovery_driver is None and now - self.last_wake_attempt < AUTO_WAKE_INTERVAL):
             return self.wake_readiness_current()
         self.last_wake_attempt = now
         was_ready = self.wake_ready
         self.wake_ready = False
         try:
-            result = self.adapter_call({"op": "ensure-active"})
+            request = {"op": "ensure-active"}
+            if recovery_driver is not None:
+                if recovery_driver not in {"qq", "wechat"}:
+                    raise RuntimeError("invalid_recovery_driver")
+                request.update({"reason": "read_failure", "driver": recovery_driver})
+            result = self.adapter_call(request)
             if (not isinstance(result, dict) or set(result) != {"ok", "ready", "attempted", "reason"} or
                     result.get("ok") is not True or type(result.get("ready")) is not bool or
                     type(result.get("attempted")) is not bool or
@@ -644,6 +716,12 @@ class Relay:
             self.wake_ready_at = time.monotonic()
             if self.wake_ready and not was_ready:
                 self.wake_scan_pending = set(self.connector_by_id)
+            if result["attempted"]:
+                settle_until = time.time() + SOURCE_STARTUP_SETTLE
+                for connector_id in self.connector_by_id:
+                    self.health[connector_id] = False
+                    self.source_settle_until[connector_id] = settle_until
+                    self.persist_source_state(connector_id)
             self.log_wake_state(result["ready"], result["attempted"], result["reason"])
             return self.wake_readiness_current()
         except Exception as error:
@@ -944,6 +1022,7 @@ class Relay:
             scan_allowed = (ready if self.auto_wake else self.eligible(connector_id))
             scan_retry_allowed = (force_scan or time.monotonic() >= self.wake_scan_retry_at[connector_id])
             if (connector_id not in pending_connectors and scan_allowed and scan_retry_allowed and
+                    time.time() >= self.source_settle_until[connector_id] and
                     (force_scan or scan_due)):
                 try:
                     self.health[connector_id] = self.scan_profile(profile)
@@ -952,6 +1031,15 @@ class Relay:
                         self.wake_scan_succeeded(connector_id)
                     else:
                         self.succeeded(connector_id)
+                except SourceReadError:
+                    self.health[connector_id] = False
+                    self.last_scan[connector_id] = time.monotonic() - self.scan_interval[connector_id]
+                    self.source_read_failed(connector_id)
+                    if self.auto_wake:
+                        self.wake_scan_failed(connector_id)
+                        self.recover_source_after_failures(connector_id)
+                    else:
+                        self.failed(connector_id)
                 except Exception:
                     self.health[connector_id] = False
                     self.last_scan[connector_id] = time.monotonic() - self.scan_interval[connector_id]
