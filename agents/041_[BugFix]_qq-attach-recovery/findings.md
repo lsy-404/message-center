@@ -8,3 +8,4 @@
 - [Decision] Attach failures count only while the observed QQ process ID remains unchanged. A changed PID starts a new streak, and attach recovery forwards that PID as `observedPid` so a stale failure cannot close a replacement process.
 - [Observed] The latest operational note reports the failure counter rising from one to five while the QQ process remains present, but the runtime had no per-scan source-failure stderr record. The noted 14-minute stability interval did not pass because the cursor stopped advancing for the last four minutes.
 - [Decision] Add one fixed-shape stderr record per `SourceReadError` with timestamp, allowlisted driver, existing consecutive failure count, strict classification, and validated PID or null. This is diagnostic-only and does not change recovery thresholds or scan state.
+- [Decision] Failure-record formatting and writes are best-effort so a broken stderr stream cannot interrupt recovery handling.

@@ -354,6 +354,49 @@ class DeviceRuntimeTests(unittest.TestCase):
         finally:
             valid_db.close()
 
+    def test_stderr_failure_does_not_interrupt_attach_recovery_threshold(self):
+        config = self.auto_wake_config()
+        config["connectors"] = config["connectors"][:1]
+        requests = []
+        valid_failure = {"stage": "attach", "errorCode": "timeout",
+                         "dispatch": "not_started", "processId": 12345}
+
+        def adapter(request):
+            requests.append(dict(request))
+            if request["op"] == "ensure-active":
+                return self.wake_result(True)
+            return {"ok": False, "sourceReadOk": False, "nativeFailure": valid_failure}
+
+        relay = runtime.Relay(config, self.db, adapter,
+                              lambda *_args: {"ok": True, "commands": []})
+        relay.wake_ready = True
+        relay.wake_readiness_established = True
+        relay.wake_ready_at = 100
+        relay.last_wake_attempt = 0
+        relay.last_logged_wake_state = (True, False, "ready")
+        relay.source_settle_until["connector-a"] = 0
+
+        class BrokenStderr:
+            def write(self, _value):
+                raise OSError("stream unavailable")
+
+            def flush(self):
+                raise OSError("stream unavailable")
+
+        now = [100.0]
+        with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]), patch.object(
+                runtime.time, "time", side_effect=lambda: now[0]), patch.object(
+                    runtime.sys, "stderr", BrokenStderr()):
+            for scan_time in (100.0, 116.0, 147.0):
+                now[0] = scan_time
+                relay.pass_once()
+
+        recoveries = [request for request in requests
+                      if request.get("op") == "ensure-active" and request.get("reason")]
+        self.assertEqual(recoveries, [{"op": "ensure-active", "reason": "attach_failure",
+                                      "driver": "qq", "observedPid": 12345}])
+        self.assertEqual(relay.attach_failure_streak["connector-a"], (12345, 3))
+
     def test_backpressure_skip_does_not_refresh_scan_health_or_clear_forced_scan(self):
         relay = runtime.Relay(self.auto_wake_config(), self.db,
                               lambda _request: self.wake_result(True),

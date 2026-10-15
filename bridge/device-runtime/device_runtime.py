@@ -1122,16 +1122,19 @@ class Relay:
                                    else None)
                     driver = self.connector_by_id[connector_id].get("kind")
                     if driver in {"qq", "wechat"}:
-                        observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
-                            "+00:00", "Z")
-                        sys.stderr.write(compact({
-                            "observedAt": observed_at,
-                            "driver": driver,
-                            "consecutiveFailures": self.source_failures[connector_id],
-                            "classification": "explicit_attach" if failure_pid is not None else "source_unclassified",
-                            "processId": failure_pid,
-                        }) + "\n")
-                        sys.stderr.flush()
+                        try:
+                            observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
+                                "+00:00", "Z")
+                            sys.stderr.write(compact({
+                                "observedAt": observed_at,
+                                "driver": driver,
+                                "consecutiveFailures": self.source_failures[connector_id],
+                                "classification": "explicit_attach" if failure_pid is not None else "source_unclassified",
+                                "processId": failure_pid,
+                            }) + "\n")
+                            sys.stderr.flush()
+                        except Exception:
+                            pass
                     if self.auto_wake:
                         self.wake_scan_failed(connector_id)
                         if source_state_saved:
