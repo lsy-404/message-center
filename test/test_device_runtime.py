@@ -1538,7 +1538,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         with patch.object(runtime.time, "monotonic", return_value=160):
             self.assertTrue(relay.ensure_active())
         self.assertEqual(calls, [{"op": "ensure-active"}, {"op": "ensure-active"}])
-        self.assertEqual(runtime.adapter_timeout_for_request({"op": "ensure-active"}), 30)
+        self.assertEqual(runtime.adapter_timeout_for_request({"op": "ensure-active"}), 55)
 
     def test_auto_wake_invalid_and_exception_results_fail_closed(self):
         responses = [

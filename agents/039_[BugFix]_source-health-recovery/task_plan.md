@@ -12,3 +12,6 @@
 - [x] Validate the focused suite and full public test set, then commit the follow-up.
 - [x] Fix the generated POSIX child-launch script and compile both generated snippets before the platform skip.
 - [x] Re-run the full public test set and commit the fixture correction.
+
+- [x] Align the public wake deadline and documentation with the private helper cancellation/cleanup budget.
+- [x] Add a focused timeout-contract assertion, run the public runtime suite, and commit.
