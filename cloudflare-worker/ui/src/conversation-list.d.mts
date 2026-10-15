@@ -2,6 +2,7 @@ export type ConversationListFilter = {
   connectorId?: string
   channelLabel?: string
   query?: string
+  unreadOnly?: boolean
   getChannelLabel?: (conversation: any) => string
 }
 

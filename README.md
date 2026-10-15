@@ -20,6 +20,7 @@
 - 普通 `background` 群消息只抽取文字元素，每 5 分钟批量提交；不包含文件、图片、视频、语音或表情包。Worker 会把它们规范化到统一消息流，但不会放入 Agent 即时领取队列；旧备份查询端点仅作为兼容接口保留。
 - 原生折叠与消息盒字段规范化为 `normal / folded / message_box / unknown`，置顶状态独立保存并用于会话排序；收件箱在可见且联网时轮询，等待当前读取结束后再刷新，隐藏/离线时暂停，恢复后立即刷新并对失败退避。
 - MCP 使用 `listen_messages` 领取短期租约，以 `reply_message` 排队回复，并用 `complete_message` 完成、重试或转入人工检查。
+- 网页收件箱标出 AI 代发的消息，并在入站消息下显示其 Agent 队列状态（等待 AI、AI 处理中、AI 已处理、需人工处理）；“未读”切换只列出有未读的会话。
 
 ## 验证
 
@@ -42,6 +43,8 @@ node --check worker/index.js
 node ../test/worker-smoke.test.mjs
 node ../test/inbox-refresh.test.mjs
 node ../test/worker-schema.test.mjs
+node ../test/worker-inbox-agent-activity.test.mjs
+node --test ../test/ui-presentation.test.mjs
 pnpm dlx wrangler deploy --dry-run
 
 Set-Location ..

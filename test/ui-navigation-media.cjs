@@ -20,7 +20,7 @@ async function main() {
       connectorChannelLabel: connector.channelLabel,
       title: `会话 ${index + 1}`,
       avatarLabel: '会',
-      unreadCount: 0,
+      unreadCount: index === 2 ? 3 : 0,
       lastMessagePreview: '本地合成检查',
       lastMessageAt: new Date().toISOString(),
       connectorState: 'online',
@@ -41,7 +41,9 @@ async function main() {
         { id: 'failed-message', direction: 'outbound', senderName: 'Bob Lee', body: '失败消息', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'failed', attachments: [] },
         { id: 'uncertain-message', direction: 'outbound', senderName: 'Bob Lee', body: '待确认消息', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'uncertain', attachments: [] },
         { id: 'delivered-message', direction: 'outbound', senderName: 'Bob Lee', body: '已发送消息', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'delivered', attachments: [] },
-        { id: 'inbound-state-message', direction: 'inbound', senderName: '张三', body: '入站消息', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'queued', attachments: [] },
+        { id: 'inbound-state-message', direction: 'inbound', senderName: '张三', body: '入站消息', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'queued', authorRole: 'contact', agentState: 'dead_letter', attachments: [] },
+        { id: 'agent-message', direction: 'outbound', senderName: 'Agent', body: '代理回复', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'delivered', authorRole: 'agent', attachments: [] },
+        { id: 'agent-working-message', direction: 'inbound', senderName: '张三', body: '等待代理', contentType: 'text', occurredAt: new Date().toISOString(), authorRole: 'contact', agentState: 'leased', attachments: [] },
       ],
     }
     let inboxRequestCount = 0
@@ -76,6 +78,20 @@ async function main() {
     assert.equal(await page.locator('.message-row[data-message-id="uncertain-message"] .message-delivery-state').textContent(), '待确认（不可自动重发）')
     assert.equal(await page.locator('.message-row[data-message-id="delivered-message"] .message-delivery-state').textContent(), '已发送')
     assert.equal(await page.locator('.message-row[data-message-id="inbound-state-message"] .message-delivery-state').count(), 0, 'inbound messages do not show outbound delivery state')
+    const agentRow = page.locator('.message-row[data-message-id="agent-message"]')
+    assert.equal(await agentRow.getAttribute('data-author-role'), 'agent', 'agent replies expose their author role')
+    assert.equal(await agentRow.locator('.message-sender').textContent(), 'AI 代理', 'agent replies are labelled as the AI agent')
+    assert.equal(await agentRow.locator('.role-chip').textContent(), '代你发送')
+    assert.equal(await agentRow.locator('.message-avatar img').count(), 0, 'agent replies use the agent avatar')
+    assert.equal(await page.locator('.message-row[data-message-id="pending-message"] .role-chip').count(), 0, 'owner replies are not labelled as agent replies')
+    assert.equal(await page.locator('.message-row[data-message-id="inbound-state-message"] .message-agent-state').textContent(), '需人工处理')
+    assert.equal(await page.locator('.message-row[data-message-id="agent-working-message"] .message-agent-state').textContent(), 'AI 处理中')
+    assert.equal(await page.locator('.message-row[data-message-id="agent-message"] .message-agent-state').count(), 0, 'outbound messages do not show agent queue state')
+    assert.match(await page.locator('.thread-agent-summary').textContent(), /需人工\s*1/)
+    assert.match(await page.locator('.thread-agent-summary').textContent(), /AI 处理中\s*1/)
+    assert.ok(await page.locator('.day-divider time[datetime]').count() >= 1, 'thread shows a dated day divider')
+    const stamp = await page.locator('.message-row[data-message-id="text-message"] .message-meta time').getAttribute('datetime')
+    assert.ok(!Number.isNaN(Date.parse(stamp)), 'message time exposes a machine-readable timestamp')
 
     assert.equal(await page.locator('.nav-section:first-child .nav-item').count(), 3, 'all + two channel entries')
     assert.equal(await page.locator('.management-nav .nav-item').count(), 1, 'one management entry')
@@ -120,8 +136,15 @@ async function main() {
     assert.equal(await imageBody.textContent(), '描述\n后续文字\n[图片]\n教程里写[图片]作为占位', 'hide one standalone marker only after one image loads; keep the failed and literal markers')
     assert.equal(await page.locator('.message-row').nth(1).locator('.message-bubble p').textContent(), '[图片]', 'keep marker when there is no image attachment')
     assert.equal(await page.locator('.message-row').nth(2).locator('.message-bubble p').textContent(), '[图片]', 'keep marker for a pending image')
-    assert.equal(await page.locator('.message-row').nth(2).locator('.attachment').textContent(), '▤pending.png等待上传')
+    assert.equal(await page.locator('.message-row').nth(2).locator('.attachment').textContent(), 'pending.png等待上传')
     if (process.env.UI_PREVIEW_OUTPUT) await page.screenshot({ path: process.env.UI_PREVIEW_OUTPUT, fullPage: true })
+
+    await page.getByRole('button', { name: '返回收件箱' }).click()
+    await page.getByRole('button', { name: '未读', exact: true }).click()
+    assert.equal(await page.locator('.conversation-row').count(), 1, 'unread filter keeps only unread conversations')
+    assert.equal(await page.locator('.conversation-row').getAttribute('data-unread-count'), '3')
+    await page.getByRole('button', { name: '全部', exact: true }).click()
+    assert.equal(await page.locator('.conversation-row').count(), 3, 'all filter restores every conversation')
 
     await page.getByRole('button', { name: '接入管理' }).click()
     assert.equal(await page.locator('.instance-card').count(), 3, 'management shows each account')
