@@ -50,7 +50,19 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class SourceReadError(RuntimeError):
-    pass
+    def __init__(self, code, *, attach_failure_pid=None):
+        super().__init__(code)
+        self.attach_failure_pid = attach_failure_pid
+
+
+def explicit_native_attach_failure(value):
+    if type(value) is not dict or set(value) != {"stage", "errorCode", "dispatch", "processId"}:
+        return False
+    return (type(value["stage"]) is str and value["stage"] == "attach"
+            and type(value["errorCode"]) is str
+            and value["errorCode"] in {"attach_failed", "timeout"}
+            and type(value["dispatch"]) is str and value["dispatch"] == "not_started"
+            and type(value["processId"]) is int and value["processId"] > 0)
 
 
 def _event_route(message):
@@ -305,6 +317,7 @@ class Relay:
             "SELECT connector_id,consecutive_failures,last_success_at,retry_after,settle_until FROM source_recovery")}
         self.source_failures = {item["id"]: recovery_rows.get(item["id"], (0, 0, 0))[0]
                                 for item in self.connectors}
+        self.attach_failure_streak = {item["id"]: (None, 0) for item in self.connectors}
         self.source_last_success = {item["id"]: recovery_rows.get(item["id"], (0, 0, 0, 0))[1]
                                     for item in self.connectors}
         self.source_recovery_after = {item["id"]: recovery_rows.get(item["id"], (0, 0, 0, 0))[2]
@@ -370,12 +383,19 @@ class Relay:
         self.source_state_durable[connector_id] = True
         return True
 
-    def source_read_failed(self, connector_id):
+    def source_read_failed(self, connector_id, attach_failure_pid=None):
         self.source_failures[connector_id] += 1
+        current_pid, count = self.attach_failure_streak[connector_id]
+        if self.auto_wake and type(attach_failure_pid) is int and attach_failure_pid > 0:
+            self.attach_failure_streak[connector_id] = (
+                attach_failure_pid, count + 1 if current_pid == attach_failure_pid else 1)
+        else:
+            self.attach_failure_streak[connector_id] = (None, 0)
         return self.persist_source_state(connector_id)
 
     def source_read_succeeded(self, connector_id):
         self.source_failures[connector_id] = 0
+        self.attach_failure_streak[connector_id] = (None, 0)
         self.source_last_success[connector_id] = time.time()
         self.persist_source_state(connector_id)
 
@@ -396,6 +416,27 @@ class Relay:
         except Exception:
             return False
         return result
+
+    def recover_attach_after_failures(self, connector_id):
+        now = time.time()
+        if (not self.auto_wake
+                or not self.source_state_durable[connector_id]
+                or self.attach_failure_streak[connector_id][1] < SOURCE_RECOVERY_FAILURE_THRESHOLD
+                or now < self.source_recovery_after[connector_id]
+                or now < self.source_settle_until[connector_id]):
+            return False
+        self.source_recovery_after[connector_id] = now + SOURCE_RECOVERY_COOLDOWN
+        if not self.persist_source_state(connector_id):
+            return False
+        self.health[connector_id] = False
+        try:
+            return self.ensure_active(
+                recovery_driver=self.connector_by_id[connector_id].get("kind"),
+                recovery_reason="attach_failure",
+                observed_pid=self.attach_failure_streak[connector_id][0],
+            )
+        except Exception:
+            return False
 
     def heartbeat_failed(self, connector_id):
         count = self.heartbeat_failures[connector_id] + 1
@@ -565,7 +606,11 @@ class Relay:
         if type(source_read_ok) is not bool:
             raise RuntimeError("invalid_scan_result")
         if source_read_ok is False:
-            raise SourceReadError("source_read_failed")
+            raise SourceReadError(
+                "source_read_failed",
+                attach_failure_pid=(result["nativeFailure"]["processId"]
+                                    if explicit_native_attach_failure(result.get("nativeFailure")) else None),
+            )
         if (result.get("ok") is not True or "cursor" not in result or
                 not isinstance(result.get("messages"), list)):
             raise RuntimeError("invalid_scan_result")
@@ -706,7 +751,7 @@ class Relay:
         self.source_read_succeeded(self.connector)
         return result.get("health") == "online"
 
-    def ensure_active(self, recovery_driver=None):
+    def ensure_active(self, recovery_driver=None, recovery_reason="read_failure", observed_pid=None):
         if not self.auto_wake:
             return True
         now = time.monotonic()
@@ -718,9 +763,14 @@ class Relay:
         try:
             request = {"op": "ensure-active", "driver": "qq"}
             if recovery_driver is not None:
-                if recovery_driver != "qq":
+                if (recovery_driver != "qq"
+                        or recovery_reason not in {"read_failure", "attach_failure"}
+                        or (recovery_reason == "attach_failure"
+                            and (type(observed_pid) is not int or observed_pid <= 0))):
                     raise RuntimeError("invalid_recovery_driver")
-                request.update({"reason": "read_failure", "driver": recovery_driver})
+                request.update({"reason": recovery_reason, "driver": recovery_driver})
+                if recovery_reason == "attach_failure":
+                    request["observedPid"] = observed_pid
             result = self.adapter_call(request)
             if (not isinstance(result, dict) or set(result) != {"ok", "ready", "attempted", "reason"} or
                     result.get("ok") is not True or type(result.get("ready")) is not bool or
@@ -1061,18 +1111,24 @@ class Relay:
                             self.wake_scan_succeeded(connector_id)
                         else:
                             self.succeeded(connector_id)
-                except SourceReadError:
+                except SourceReadError as error:
                     self.health[connector_id] = False
                     self.last_scan[connector_id] = time.monotonic() - self.scan_interval[connector_id]
-                    source_state_saved = self.source_read_failed(connector_id)
+                    source_state_saved = self.source_read_failed(
+                        connector_id, attach_failure_pid=error.attach_failure_pid,
+                    )
                     if self.auto_wake:
                         self.wake_scan_failed(connector_id)
                         if source_state_saved:
-                            self.recover_source_after_failures(connector_id)
+                            if error.attach_failure_pid is not None:
+                                self.recover_attach_after_failures(connector_id)
+                            else:
+                                self.recover_source_after_failures(connector_id)
                     else:
                         self.failed(connector_id)
                 except Exception:
                     self.health[connector_id] = False
+                    self.attach_failure_streak[connector_id] = (None, 0)
                     self.last_scan[connector_id] = time.monotonic() - self.scan_interval[connector_id]
                     if self.auto_wake:
                         self.wake_scan_failed(connector_id)

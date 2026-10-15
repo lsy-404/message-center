@@ -1,0 +1,7 @@
+# Progress
+
+- Created a clean task worktree from public `main` at `9832568` after confirming the destination path and branch were unused.
+- Read the project index, project rules, device runtime contract, and prior auto-wake/source-health recovery plans.
+- Confirmed the private adapter failure metadata contract with its owner. No runtime/device/cloud operations performed.
+- Implemented strict four-field attach diagnostics, a process-local same-PID streak, and `observedPid` forwarding for attach recovery. Focused runtime tests pass (76 tests, 2 platform skips); no device or cloud operations were performed.
+- Full public test suite passes (109 tests, 2 platform skips), Python compilation and whitespace checks pass. Task-owned changes are ready for local commit; no device, cloud, or remote Git operations were performed.
