@@ -10,3 +10,9 @@
 - `git diff --check` identified CRLF on the newly appended audit lines; audit files were normalized to LF before final review.
 - Final `git diff --check` passed; reviewed only the runtime adapter, focused tests, and task audit changes.
 - Committed on the isolated task branch after the staged-diff self-check; the working tree is clean.
+
+- Removed only `LowPriorityIO` from the public launchd example for a controlled scheduling trial; retained Nice, ThrottleInterval, KeepAlive, launcher arguments, and all other plist settings.
+- Parsed the edited plist and compared dictionaries after removing that one key; every remaining key/value matched the original.
+
+- Added only `ProcessType=Interactive` to the public launchd example after the `LowPriorityIO`-only live trial failed to improve startup. The operational root generator and device were not touched.
+- Parsed the plist and verified its dictionary equals the prior configuration plus only `ProcessType=Interactive`.
