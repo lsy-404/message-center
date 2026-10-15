@@ -5,3 +5,4 @@
 - Confirmed the private adapter failure metadata contract with its owner. No runtime/device/cloud operations performed.
 - Implemented strict four-field attach diagnostics, a process-local same-PID streak, and `observedPid` forwarding for attach recovery. Focused runtime tests pass (76 tests, 2 platform skips); no device or cloud operations were performed.
 - Full public test suite passes (109 tests, 2 platform skips), Python compilation and whitespace checks pass. Task-owned changes are ready for local commit; no device, cloud, or remote Git operations were performed.
+- Added fixed-shape source-failure stderr diagnostics without changing scheduling or recovery behavior. Failure-path privacy and strict-classification tests pass; the reported 14-minute device stability interval remains failed because the cursor stopped advancing during its final four minutes. No live validation was performed.

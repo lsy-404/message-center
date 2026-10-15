@@ -300,6 +300,60 @@ class DeviceRuntimeTests(unittest.TestCase):
             restarted_db.close()
             self.db = sqlite3.connect(self.db_path)
 
+    def test_source_read_failure_logs_only_allowlisted_fields(self):
+        relay = runtime.Relay(self.config, self.db, lambda _request: (_ for _ in ()).throw(
+            RuntimeError("private-profile body target secret")),
+            lambda *_args: {"ok": True, "commands": []})
+        captured = io.StringIO()
+        with redirect_stderr(captured):
+            relay.pass_once()
+        records = [json.loads(line) for line in captured.getvalue().splitlines()]
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(set(record), {
+            "observedAt", "driver", "consecutiveFailures", "classification", "processId",
+        })
+        self.assertEqual(record["driver"], "qq")
+        self.assertEqual(record["consecutiveFailures"], 1)
+        self.assertEqual(record["classification"], "source_unclassified")
+        self.assertIsNone(record["processId"])
+        self.assertTrue(record["observedAt"].endswith("Z"))
+        self.assertNotIn("private-profile", captured.getvalue())
+        self.assertNotIn("target", captured.getvalue())
+        self.assertNotIn("secret", captured.getvalue())
+
+    def test_source_read_failure_logs_explicit_attach_only_after_strict_validation(self):
+        valid = {"stage": "attach", "errorCode": "timeout",
+                 "dispatch": "not_started", "processId": 12345}
+        relay = runtime.Relay(self.config, self.db, lambda _request: {
+            "ok": False, "sourceReadOk": False,
+            "nativeFailure": {**valid, "detail": "private target body"},
+        }, lambda *_args: {"ok": True, "commands": []})
+        captured = io.StringIO()
+        with redirect_stderr(captured):
+            relay.pass_once()
+        record = json.loads(captured.getvalue())
+        self.assertEqual(set(record), {
+            "observedAt", "driver", "consecutiveFailures", "classification", "processId",
+        })
+        self.assertEqual(record["classification"], "source_unclassified")
+        self.assertIsNone(record["processId"])
+        self.assertNotIn("private", captured.getvalue())
+
+        valid_db = runtime.open_database(os.path.join(self.temp.name, "valid.sqlite3"))
+        try:
+            relay = runtime.Relay(self.config, valid_db, lambda _request: {
+                "ok": False, "sourceReadOk": False, "nativeFailure": valid,
+            }, lambda *_args: {"ok": True, "commands": []})
+            captured = io.StringIO()
+            with redirect_stderr(captured):
+                relay.pass_once()
+            record = json.loads(captured.getvalue())
+            self.assertEqual(record["classification"], "explicit_attach")
+            self.assertEqual(record["processId"], 12345)
+        finally:
+            valid_db.close()
+
     def test_backpressure_skip_does_not_refresh_scan_health_or_clear_forced_scan(self):
         relay = runtime.Relay(self.auto_wake_config(), self.db,
                               lambda _request: self.wake_result(True),
