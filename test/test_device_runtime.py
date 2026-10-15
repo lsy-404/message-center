@@ -1203,6 +1203,24 @@ class DeviceRuntimeTests(unittest.TestCase):
         time.sleep(1)
         self.assertFalse(os.path.exists(marker))
 
+    @unittest.skipUnless(os.name == "posix", "adapter process groups are POSIX-only")
+    def test_adapter_invalid_json_kills_remaining_group_children(self):
+        script = os.path.join(self.temp.name, "adapter")
+        marker = os.path.join(self.temp.name, "survived-invalid-json")
+        started = os.path.join(self.temp.name, "child-started")
+        child = "open(" + repr(started) + ", 'w').close();import time;time.sleep(.8);open(" + repr(marker) + ", 'w').close()"
+        with open(script, "w", encoding="utf-8") as output:
+            output.write("#!/usr/bin/env python3\nimport os,subprocess,sys,time\n"
+                         "subprocess.Popen([sys.executable, '-c', " + repr(child) + ", "
+                         "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                         "while not os.path.exists(" + repr(started) + "): time.sleep(.01)\n"
+                         "sys.stdout.close()\n")
+        os.chmod(script, 0o700)
+        with self.assertRaises(json.JSONDecodeError):
+            runtime.run_adapter(script, {"input": "x"}, timeout=2)
+        time.sleep(1)
+        self.assertFalse(os.path.exists(marker))
+
     def test_register_failure_does_not_starve_other_connector(self):
         self.config["connectors"] = [
             {"id": "connector-a", "token": "a" * 40, "profile": "primary",
@@ -1516,7 +1534,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         with patch.object(runtime.time, "monotonic", return_value=160):
             self.assertTrue(relay.ensure_active())
         self.assertEqual(calls, [{"op": "ensure-active"}, {"op": "ensure-active"}])
-        self.assertEqual(runtime.adapter_timeout_for_request({"op": "ensure-active"}), 20)
+        self.assertEqual(runtime.adapter_timeout_for_request({"op": "ensure-active"}), 30)
 
     def test_auto_wake_invalid_and_exception_results_fail_closed(self):
         responses = [

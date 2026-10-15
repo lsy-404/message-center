@@ -36,7 +36,7 @@ DEFAULT_OUTBOX_BYTES = 128 * 1024 * 1024
 MAX_DELIVERIES_PER_PASS = 5
 ADAPTER_SCAN_TIMEOUT = 60
 ADAPTER_SEND_TIMEOUT = 90
-ADAPTER_WAKE_TIMEOUT = 20
+ADAPTER_WAKE_TIMEOUT = 30
 AUTO_WAKE_INTERVAL = 60
 SOURCE_RECOVERY_FAILURE_THRESHOLD = 3
 SOURCE_RECOVERY_COOLDOWN = 300
@@ -202,6 +202,12 @@ def run_adapter(path, request, timeout=30):
         if remaining <= 0:
             raise RuntimeError("adapter_timeout")
         return_code = process.wait(timeout=remaining)
+        if return_code != 0:
+            raise RuntimeError("adapter_failed")
+        value = json.loads(bytes(output).decode("utf-8"))
+        if not isinstance(value, dict):
+            raise RuntimeError("adapter_invalid_response")
+        return value
     except Exception:
         if os.name == "posix":
             try:
@@ -223,12 +229,6 @@ def run_adapter(path, request, timeout=30):
             process.stdin.close()
         if process.stdout:
             process.stdout.close()
-    if return_code != 0:
-        raise RuntimeError("adapter_failed")
-    value = json.loads(bytes(output).decode("utf-8"))
-    if not isinstance(value, dict):
-        raise RuntimeError("adapter_invalid_response")
-    return value
 
 
 def adapter_timeout_for_request(request):
