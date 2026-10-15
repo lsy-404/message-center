@@ -71,16 +71,17 @@ const byId = new Map(inbox.messages.map((message) => [message.id, message]))
 assert.equal(inbox.messages.length, rows.length, 'agent queue join does not duplicate or drop messages')
 assert.deepEqual(inbox.messages.map((message) => message.id), rows.map(([id]) => id), 'chronological order is unchanged')
 
-assert.equal(byId.get('in-pending').agentState, 'pending')
-assert.equal(byId.get('in-leased').agentState, 'leased')
-assert.equal(byId.get('in-escalated').agentState, 'dead_letter')
-assert.equal(byId.get('in-background').agentState, null, 'background group text never reaches the agent queue')
-assert.equal(byId.get('out-agent').agentState, null)
+assert.equal(byId.get('in-pending').agentRead, false, 'unclaimed queue entries are unread by the agent')
+assert.equal(byId.get('in-leased').agentRead, true, 'a claimed message has been read by the agent')
+assert.equal(byId.get('in-escalated').agentRead, true, 'a message handed to manual review was read by the agent')
+assert.equal(byId.get('in-background').agentRead, null, 'background group text never reaches the agent queue')
+assert.equal(byId.get('out-agent').agentRead, null)
 
 assert.equal(byId.get('in-pending').authorRole, 'contact')
 assert.equal(byId.get('out-agent').authorRole, 'agent', 'agent:* creators are reported as agent replies')
 assert.equal(byId.get('out-owner').authorRole, 'owner', 'administrator sends are reported as owner replies')
 for (const message of inbox.messages) {
   assert.equal('createdBy' in message, false, 'raw creator identities stay server-side')
+  assert.equal('agentState' in message, false, 'queue internals stay server-side')
 }
-console.log('Inbox agent activity fields passed.')
+console.log('Inbox agent read fields passed.')

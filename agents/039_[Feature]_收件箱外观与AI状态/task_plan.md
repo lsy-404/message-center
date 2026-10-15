@@ -16,3 +16,7 @@
 - [x] inbox 消息返回 `authorRole` 与 `agentState`；补充 Worker、纯函数与 Playwright 测试。
 - [x] 语义与机器可读：landmark、aria-current/aria-pressed、`<time datetime>`、`data-*` 属性。
 - [x] 运行类型检查、构建、全部 Node 测试与页面测试，更新文档。
+
+## 反馈修订
+- [x] AI 状态只标注“AI 已读 / AI 未读”，不显示处理、待处理或转人工；inbox 改为返回 `agentRead`。
+- [x] 渲染 QQ/微信引用、小程序、链接、卡片、转账、红包、拍一拍与媒体占位，会话列表摘要同步压缩。

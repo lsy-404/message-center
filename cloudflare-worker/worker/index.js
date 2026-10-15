@@ -1887,7 +1887,7 @@ async function readInbox(env, selectedConversationId) {
       deliveryState: row.delivery_state, queueClass: row.queue_class, occurredAt: row.occurred_at,
       authorRole: row.direction !== "outbound" ? "contact"
         : String(row.created_by || "").startsWith("agent:") ? "agent" : "owner",
-      agentState: row.agent_state || null,
+      agentRead: row.agent_state ? row.agent_state !== "pending" : null,
       attachments: attachmentMap.get(row.id) || [],
     }));
   }

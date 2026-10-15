@@ -41,9 +41,9 @@ async function main() {
         { id: 'failed-message', direction: 'outbound', senderName: 'Bob Lee', body: '失败消息', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'failed', attachments: [] },
         { id: 'uncertain-message', direction: 'outbound', senderName: 'Bob Lee', body: '待确认消息', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'uncertain', attachments: [] },
         { id: 'delivered-message', direction: 'outbound', senderName: 'Bob Lee', body: '已发送消息', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'delivered', attachments: [] },
-        { id: 'inbound-state-message', direction: 'inbound', senderName: '张三', body: '入站消息', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'queued', authorRole: 'contact', agentState: 'dead_letter', attachments: [] },
+        { id: 'inbound-state-message', direction: 'inbound', senderName: '张三', body: '入站消息', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'queued', authorRole: 'contact', agentRead: true, attachments: [] },
         { id: 'agent-message', direction: 'outbound', senderName: 'Agent', body: '代理回复', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'delivered', authorRole: 'agent', attachments: [] },
-        { id: 'agent-working-message', direction: 'inbound', senderName: '张三', body: '等待代理', contentType: 'text', occurredAt: new Date().toISOString(), authorRole: 'contact', agentState: 'leased', attachments: [] },
+        { id: 'agent-unread-message', direction: 'inbound', senderName: '张三', body: '「李四：原文」\n- - - - - - - - - - - - - - -\n回复内容\n[小程序] 腾讯文档 · 排期表 · 腾讯文档', contentType: 'text', occurredAt: new Date().toISOString(), authorRole: 'contact', agentRead: false, attachments: [] },
       ],
     }
     let inboxRequestCount = 0
@@ -84,11 +84,20 @@ async function main() {
     assert.equal(await agentRow.locator('.role-chip').textContent(), '代你发送')
     assert.equal(await agentRow.locator('.message-avatar img').count(), 0, 'agent replies use the agent avatar')
     assert.equal(await page.locator('.message-row[data-message-id="pending-message"] .role-chip').count(), 0, 'owner replies are not labelled as agent replies')
-    assert.equal(await page.locator('.message-row[data-message-id="inbound-state-message"] .message-agent-state').textContent(), '需人工处理')
-    assert.equal(await page.locator('.message-row[data-message-id="agent-working-message"] .message-agent-state').textContent(), 'AI 处理中')
-    assert.equal(await page.locator('.message-row[data-message-id="agent-message"] .message-agent-state').count(), 0, 'outbound messages do not show agent queue state')
-    assert.match(await page.locator('.thread-agent-summary').textContent(), /需人工\s*1/)
-    assert.match(await page.locator('.thread-agent-summary').textContent(), /AI 处理中\s*1/)
+    assert.equal(await page.locator('.message-row[data-message-id="inbound-state-message"] .message-ai-read').textContent(), 'AI 已读')
+    const unreadRow = page.locator('.message-row[data-message-id="agent-unread-message"]')
+    assert.equal(await unreadRow.getAttribute('data-ai-read'), 'false')
+    assert.equal(await unreadRow.locator('.message-ai-read').textContent(), 'AI 未读')
+    assert.equal(await page.locator('.message-row[data-message-id="agent-message"] .message-ai-read').count(), 0, 'outbound messages do not show an AI read marker')
+    assert.equal(await page.locator('.message-row[data-message-id="text-message"] .message-ai-read').count(), 0, 'messages outside the agent queue show no AI read marker')
+    assert.match(await page.locator('.ai-unread-chip').textContent(), /AI 未读\s*1/)
+    assert.equal(await unreadRow.locator('.block-quote .quote-author').textContent(), '李四')
+    assert.equal(await unreadRow.locator('.block-quote .quote-text').textContent(), '原文')
+    assert.equal(await unreadRow.locator('.block-text').textContent(), '回复内容')
+    const card = unreadRow.locator('.block-card')
+    assert.equal(await card.getAttribute('data-card-kind'), 'miniprogram')
+    assert.equal(await card.locator('.card-title').textContent(), '腾讯文档')
+    assert.equal(await card.locator('.card-summary').textContent(), '排期表')
     assert.ok(await page.locator('.day-divider time[datetime]').count() >= 1, 'thread shows a dated day divider')
     const stamp = await page.locator('.message-row[data-message-id="text-message"] .message-meta time').getAttribute('datetime')
     assert.ok(!Number.isNaN(Date.parse(stamp)), 'message time exposes a machine-readable timestamp')
@@ -132,10 +141,11 @@ async function main() {
       const image = Array.from(document.querySelectorAll('img.attachment-image')).find((item) => item.alt === 'image-failed.gif')
       return image?.complete && image.naturalWidth === 0
     })
-    const imageBody = aliceRow.locator('.message-bubble p')
-    assert.equal(await imageBody.textContent(), '描述\n后续文字\n[图片]\n教程里写[图片]作为占位', 'hide one standalone marker only after one image loads; keep the failed and literal markers')
-    assert.equal(await page.locator('.message-row').nth(1).locator('.message-bubble p').textContent(), '[图片]', 'keep marker when there is no image attachment')
-    assert.equal(await page.locator('.message-row').nth(2).locator('.message-bubble p').textContent(), '[图片]', 'keep marker for a pending image')
+    const bodyBlocks = (row) => row.locator('.message-bubble > :not(.attachment)').evaluateAll((items) => items.map((item) =>
+      item.classList.contains('block-media') ? `[media:${item.textContent}]` : item.textContent))
+    assert.deepEqual(await bodyBlocks(aliceRow), ['描述\n后续文字', '[media:图片]', '教程里写[图片]作为占位'], 'hide one standalone marker only after one image loads; keep the failed and literal markers')
+    assert.deepEqual(await bodyBlocks(page.locator('.message-row').nth(1)), ['[media:图片]'], 'keep marker when there is no image attachment')
+    assert.deepEqual(await bodyBlocks(page.locator('.message-row').nth(2)), ['[media:图片]'], 'keep marker for a pending image')
     assert.equal(await page.locator('.message-row').nth(2).locator('.attachment').textContent(), 'pending.png等待上传')
     if (process.env.UI_PREVIEW_OUTPUT) await page.screenshot({ path: process.env.UI_PREVIEW_OUTPUT, fullPage: true })
 

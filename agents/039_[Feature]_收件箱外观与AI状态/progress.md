@@ -8,3 +8,4 @@
 - 新增 `test/ui-presentation.test.mjs`、`test/worker-inbox-agent-activity.test.mjs`（未改 Worker 时失败、改后通过）；扩展 `test/ui-navigation-media.cjs` 覆盖 AI 代发、队列状态、未读筛选与时间戳。
 - `pnpm run check`、`pnpm run build`（Safari 15 目标）、`node --check worker/index.js`、`node --test test/*.test.mjs`（88 项）与 `test/ui-navigation-media.cjs` 通过。
 - 截图验证基于合成 fixture 与 Chromium（桌面浅/深色、768×1024、1024×768），Safari/iPad 实机未验证；未部署、未操作设备。
+- 反馈修订：`agentState` 改为 `agentRead`，页面只显示“AI 已读 / AI 未读”及头部未读数；新增 `ui/src/rich-body.mjs` 把正文解析为引用、卡片、金额、提示与媒体块，单独的卡片/转账去掉外层气泡，拍一拍居中显示；会话列表摘要使用同一规则。新增 `test/ui-rich-body.test.mjs`，更新 Worker 与 Playwright 测试。

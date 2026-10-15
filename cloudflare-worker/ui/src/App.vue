@@ -28,6 +28,7 @@ import {
   formatListTime,
   formatRelativeAge,
 } from './presentation.mjs'
+import { parseMessageBody, previewText, type CardKind, type MediaKind, type MoneyKind } from './rich-body.mjs'
 
 type LayoutAcknowledgement = {
   enabled: boolean
@@ -104,11 +105,11 @@ type Message = {
   deliveryState?: string | null
   queueClass?: string | null
   authorRole?: 'contact' | 'owner' | 'agent' | string | null
-  agentState?: string | null
+  agentRead?: boolean | null
   attachments: Attachment[]
 }
 
-type StatusInfo = { label: string, tone: 'muted' | 'success' | 'warning' | 'danger' | 'ai', icon: IconName }
+type StatusInfo = { label: string, tone: 'muted' | 'success' | 'warning' | 'danger', icon: IconName }
 
 type Snapshot = {
   connectors: Connector[]
@@ -244,22 +245,23 @@ watch([activeFilter, activeConnectorId, conversationSearch, unreadOnly], async (
 })
 
 const threadEntries = computed(() => buildThreadEntries(snapshot.value.messages, nowTick.value))
-const threadAgentSummary = computed(() => {
-  const summary = { working: 0, waiting: 0, escalated: 0 }
-  for (const message of snapshot.value.messages) {
-    if (message.direction === 'outbound') continue
-    if (message.agentState === 'leased') summary.working += 1
-    else if (message.agentState === 'pending') summary.waiting += 1
-    else if (message.agentState === 'dead_letter') summary.escalated += 1
-  }
-  return summary
-})
+const aiUnreadCount = computed(() => snapshot.value.messages
+  .filter((message) => message.direction !== 'outbound' && message.agentRead === false).length)
 
-const threadRows = computed(() => threadEntries.value.map((entry) => entry.kind === 'day' ? entry : {
-  ...entry,
-  byAgent: isAgentMessage(entry.message),
-  delivery: deliveryStateInfo(entry.message),
-  agent: agentStateInfo(entry.message),
+const threadRows = computed(() => threadEntries.value.map((entry) => {
+  if (entry.kind === 'day') return entry
+  const blocks = parseMessageBody(messageBody(entry.message))
+  const solo = blocks.length === 1 && !entry.message.attachments.length ? blocks[0] : null
+  return {
+    ...entry,
+    byAgent: isAgentMessage(entry.message),
+    delivery: deliveryStateInfo(entry.message),
+    aiRead: entry.message.direction === 'outbound' ? null : entry.message.agentRead ?? null,
+    blocks,
+    // A lone pat reads as a system line; a lone card or transfer is its own bubble.
+    systemText: solo?.type === 'notice' ? solo.text : '',
+    bare: solo?.type === 'card' || solo?.type === 'money',
+  }
 }))
 
 const hasKnownConversationActivity = computed(() => Boolean(
@@ -371,15 +373,14 @@ function deliveryStateInfo(message: Message): StatusInfo | null {
   } as Record<string, StatusInfo>)[message.deliveryState || ''] || null
 }
 
-function agentStateInfo(message: Message): StatusInfo | null {
-  if (message.direction === 'outbound') return null
-  return ({
-    pending: { label: '等待 AI 处理', tone: 'muted', icon: 'hourglass' },
-    leased: { label: 'AI 处理中', tone: 'ai', icon: 'bot' },
-    completed: { label: 'AI 已处理', tone: 'muted', icon: 'checkCircle' },
-    dead_letter: { label: '需人工处理', tone: 'warning', icon: 'personAlert' },
-  } as Record<string, StatusInfo>)[message.agentState || ''] || null
+const CARD_ICONS: Record<CardKind, IconName> = {
+  miniprogram: 'miniProgram', link: 'link', app: 'miniProgram', forward: 'forward', channels: 'channels',
+  music: 'music', location: 'location', contact: 'contact', article: 'article',
 }
+const MEDIA_ICONS: Record<MediaKind, IconName> = {
+  image: 'image', voice: 'voice', video: 'video', file: 'file', sticker: 'sticker', unknown: 'unknown',
+}
+const MONEY_ICONS: Record<MoneyKind, IconName> = { transfer: 'money', redpacket: 'gift' }
 
 function isAgentMessage(message: Message) {
   return message.direction === 'outbound' && message.authorRole === 'agent'
@@ -417,7 +418,7 @@ function conversationStateText(conversation: ConversationListItem) {
 }
 
 function conversationPreview(conversation: ConversationListItem) {
-  const preview = String(conversation.lastMessagePreview || '').trim()
+  const preview = previewText(conversation.lastMessagePreview)
   if (preview) return preview
   return conversation.lastMessageAt ? '最近消息尚未同步' : '暂无消息'
 }
@@ -644,7 +645,7 @@ function sameInbox(left: Snapshot, right: Snapshot) {
         || a.senderAvatarPath !== b.senderAvatarPath
         || a.body !== b.body || a.contentType !== b.contentType || a.occurredAt !== b.occurredAt
         || a.deliveryState !== b.deliveryState || a.queueClass !== b.queueClass
-        || a.authorRole !== b.authorRole || a.agentState !== b.agentState
+        || a.authorRole !== b.authorRole || a.agentRead !== b.agentRead
         || a.attachments.length !== b.attachments.length) return false
     for (let attachmentIndex = 0; attachmentIndex < a.attachments.length; attachmentIndex += 1) {
       const file = a.attachments[attachmentIndex]
@@ -1321,15 +1322,9 @@ onUnmounted(() => {
               </span>
             </p>
           </div>
-          <div
-            v-if="threadAgentSummary.escalated || threadAgentSummary.working || threadAgentSummary.waiting"
-            class="thread-agent-summary"
-            aria-label="AI 处理概况"
-          >
-            <span v-if="threadAgentSummary.escalated" class="status-chip tone-warning" title="需人工处理"><AppIcon name="personAlert" :size="14" /><span class="chip-label">需人工</span> {{ threadAgentSummary.escalated }}</span>
-            <span v-if="threadAgentSummary.working" class="status-chip tone-ai" title="AI 处理中"><AppIcon name="bot" :size="14" /><span class="chip-label">AI 处理中</span> {{ threadAgentSummary.working }}</span>
-            <span v-if="threadAgentSummary.waiting" class="status-chip tone-muted" title="等待 AI 处理"><AppIcon name="hourglass" :size="14" /><span class="chip-label">待 AI</span> {{ threadAgentSummary.waiting }}</span>
-          </div>
+          <span v-if="aiUnreadCount" class="status-chip ai-unread-chip" :title="`AI 未读 ${aiUnreadCount} 条`">
+            <span class="unread-dot" /><span class="chip-label">AI 未读</span> {{ aiUnreadCount }}
+          </span>
         </header>
 
         <div class="message-scroll" :class="{ busy: detailLoading }" role="log" aria-label="消息记录" :aria-busy="detailLoading">
@@ -1338,6 +1333,18 @@ onUnmounted(() => {
               <time :datetime="entry.dateTime">{{ entry.label }}</time>
             </div>
             <article
+              v-else-if="entry.systemText"
+              :data-message-id="entry.message.id"
+              class="message-row system"
+              :data-direction="entry.message.direction"
+              :data-ai-read="entry.aiRead === null ? undefined : String(entry.aiRead)"
+            >
+              <p class="system-notice" data-block="notice">
+                <AppIcon name="handWave" :size="14" />{{ entry.systemText }}
+                <time class="sr-only" :datetime="isoTime(entry.message.occurredAt)">{{ formatFullStamp(entry.message.occurredAt) }}</time>
+              </p>
+            </article>
+            <article
               v-else
               :data-message-id="entry.message.id"
               class="message-row"
@@ -1345,7 +1352,7 @@ onUnmounted(() => {
               :data-direction="entry.message.direction"
               :data-author-role="entry.message.authorRole || undefined"
               :data-delivery-state="entry.message.direction === 'outbound' ? entry.message.deliveryState || undefined : undefined"
-              :data-agent-state="entry.message.agentState || undefined"
+              :data-ai-read="entry.aiRead === null ? undefined : String(entry.aiRead)"
             >
               <span
                 class="avatar message-avatar"
@@ -1375,8 +1382,39 @@ onUnmounted(() => {
                     :title="formatFullStamp(entry.message.occurredAt)"
                   >{{ formatClock(entry.message.occurredAt) }}</time>
                 </p>
-                <div class="message-bubble" :title="entry.continuation ? formatFullStamp(entry.message.occurredAt) : undefined">
-                  <p v-if="messageBody(entry.message)">{{ messageBody(entry.message) }}</p>
+                <div
+                  class="message-bubble"
+                  :class="{ bare: entry.bare }"
+                  :title="entry.continuation ? formatFullStamp(entry.message.occurredAt) : undefined"
+                >
+                  <template v-for="(block, blockIndex) in entry.blocks" :key="blockIndex">
+                    <p v-if="block.type === 'text'" class="block-text">{{ block.text }}</p>
+                    <blockquote v-else-if="block.type === 'quote'" class="block-quote" data-block="quote">
+                      <AppIcon class="quote-icon" name="quote" :size="14" />
+                      <span class="quote-copy">
+                        <span v-if="block.author" class="quote-author">{{ block.author }}</span>
+                        <span class="quote-text">{{ block.text || '引用了一条消息' }}</span>
+                      </span>
+                    </blockquote>
+                    <div v-else-if="block.type === 'card'" class="block-card" :class="`card-${block.kind}`" data-block="card" :data-card-kind="block.kind">
+                      <span v-if="block.source" class="card-source"><AppIcon :name="CARD_ICONS[block.kind]" :size="14" />{{ block.source }}</span>
+                      <strong class="card-title">{{ block.title || block.label }}</strong>
+                      <span v-if="block.summary" class="card-summary">{{ block.summary }}</span>
+                      <span class="card-type"><AppIcon :name="CARD_ICONS[block.kind]" :size="12" />{{ block.label }}</span>
+                    </div>
+                    <div v-else-if="block.type === 'money'" class="block-money" :class="`money-${block.kind}`" data-block="money" :data-money-kind="block.kind">
+                      <span class="money-main">
+                        <span class="money-icon"><AppIcon :name="MONEY_ICONS[block.kind]" :size="18" /></span>
+                        <span class="money-copy">
+                          <strong>{{ block.amount || block.summary || block.label }}</strong>
+                          <small v-if="block.amount && block.summary">{{ block.summary }}</small>
+                        </span>
+                      </span>
+                      <span class="money-foot">{{ block.label }}<template v-if="block.status"> · {{ block.status }}</template></span>
+                    </div>
+                    <p v-else-if="block.type === 'notice'" class="block-notice" data-block="notice"><AppIcon name="handWave" :size="14" />{{ block.text }}</p>
+                    <span v-else class="block-media" data-block="media" :data-media-kind="block.kind"><AppIcon :name="MEDIA_ICONS[block.kind]" :size="14" />{{ block.label }}</span>
+                  </template>
                   <div v-for="file in entry.message.attachments" :key="file.id" class="attachment">
                     <img
                       v-if="isImage(file)"
@@ -1399,14 +1437,9 @@ onUnmounted(() => {
                     </span>
                   </div>
                 </div>
-                <p v-if="entry.delivery || entry.agent" class="message-status">
+                <p v-if="entry.delivery || entry.aiRead !== null" class="message-status">
                   <span v-if="entry.delivery" class="message-delivery-state" :class="`tone-${entry.delivery.tone}`"><AppIcon :name="entry.delivery.icon" :size="12" />{{ entry.delivery.label }}</span>
-                  <span
-                    v-if="entry.agent"
-                    class="message-agent-state"
-                    :class="[`tone-${entry.agent.tone}`, { compact: entry.message.agentState === 'completed' }]"
-                    :title="entry.agent.label"
-                  ><AppIcon :name="entry.agent.icon" :size="12" /><span class="status-text">{{ entry.agent.label }}</span></span>
+                  <span v-if="entry.aiRead !== null" class="message-ai-read" :class="entry.aiRead ? 'is-read' : 'is-unread'"><AppIcon v-if="entry.aiRead" name="eye" :size="12" /><span v-else class="unread-dot" />{{ entry.aiRead ? 'AI 已读' : 'AI 未读' }}</span>
                 </p>
               </div>
             </article>
