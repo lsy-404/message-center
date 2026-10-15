@@ -13,3 +13,6 @@
 
 - Removed only `LowPriorityIO` from the public launchd example for a controlled scheduling trial; retained Nice, ThrottleInterval, KeepAlive, launcher arguments, and all other plist settings.
 - Parsed the edited plist and compared dictionaries after removing that one key; every remaining key/value matched the original.
+
+- Added only `ProcessType=Interactive` to the public launchd example after the `LowPriorityIO`-only live trial failed to improve startup. The operational root generator and device were not touched.
+- Parsed the plist and verified its dictionary equals the prior configuration plus only `ProcessType=Interactive`.
