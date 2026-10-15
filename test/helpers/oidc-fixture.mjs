@@ -78,6 +78,9 @@ export async function createOidcFixture(options = {}) {
     authorizationHeaders: [],
     bodyContainsClientSecret: false,
     tokenRequestHook: null,
+    refreshTokenMode: options.refreshTokenMode ?? "rotate",
+    refreshFailure: options.refreshFailure ?? null,
+    introspectionFailure: false,
     async authenticated() {
       const { response } = await this.login();
       const cookieHeaders = response.headers.getSetCookie();
@@ -136,12 +139,19 @@ export async function createOidcFixture(options = {}) {
       }
       if (form.get("grant_type") === "refresh_token") {
         fixture.refreshCalls += 1;
-        return responseJson({ access_token: `access-refreshed-${fixture.refreshCalls}`, refresh_token: `refresh-rotated-${fixture.refreshCalls}`, token_type: "Bearer", expires_in: 300 });
+        if (fixture.refreshFailure === "network") throw new Error("provider unavailable");
+        if (fixture.refreshFailure === "invalid_grant") return responseJson({ error: "invalid_grant" }, 400);
+        if (fixture.refreshFailure === "server_error") return responseJson({ error: "server_error" }, 503);
+        const tokens = { access_token: `access-refreshed-${fixture.refreshCalls}`, token_type: "Bearer", expires_in: 300 };
+        if (fixture.refreshTokenMode === "same") tokens.refresh_token = "refresh-initial";
+        else if (fixture.refreshTokenMode !== "omit") tokens.refresh_token = `refresh-rotated-${fixture.refreshCalls}`;
+        return responseJson(tokens);
       }
       return responseJson({ error: "unsupported_grant_type" }, 400);
     }
     if (url.href === `${ENDPOINT_ROOT}introspect`) {
       fixture.introspectionCalls += 1;
+      if (fixture.introspectionFailure) return responseJson({ error: "server_error" }, 503);
       const form = new URLSearchParams(init.body);
       const token = form.get("token");
       fixture.introspectedTokens.push(token);

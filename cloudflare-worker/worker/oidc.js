@@ -9,6 +9,7 @@ import {
   randomNonce,
   randomPKCECodeVerifier,
   randomState,
+  ResponseBodyError,
   refreshTokenGrant,
   tokenIntrospection,
   tokenRevocation,
@@ -33,6 +34,36 @@ export class OidcAuthError extends Error {
     this.status = status;
     if (code === "auth_refresh_pending") this.retryAfter = 1;
   }
+}
+
+export function clearOidcSessionCookie() {
+  return clearCookie(SESSION_COOKIE);
+}
+
+function isInvalidGrant(error) {
+  return error instanceof ResponseBodyError && error.error === "invalid_grant";
+}
+
+function refreshAccessExpiry(tokens) {
+  const expiresIn = tokens.expires_in;
+  return Math.floor(Date.now() / 1000) + (Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn : 0);
+}
+
+async function persistRotatedTokens(env, cfg, session, owner, updated) {
+  const refreshToken = updated.refresh_token === undefined ? session.tokens.refresh_token : updated.refresh_token;
+  if (typeof updated.access_token !== "string" || !updated.access_token ||
+      typeof refreshToken !== "string" || !refreshToken) return false;
+  const envelope = await encryptTokens({
+    ...updated,
+    refresh_token: refreshToken,
+    access_exp: refreshAccessExpiry(updated),
+    name: session.tokens.name,
+    email: session.tokens.email,
+  }, cfg, session.tokens.subject, Date.parse(session.row.expires_at));
+  const committed = await env.DB.prepare(`UPDATE oidc_sessions SET token_envelope = ?, refresh_owner = NULL, refresh_until = NULL
+    WHERE session_hash = ? AND token_envelope = ? AND refresh_owner = ?`)
+    .bind(envelope, session.hash, session.row.token_envelope, owner).run();
+  return committed.meta?.changes === 1;
 }
 
 function configuration(env) {
@@ -297,15 +328,9 @@ async function refreshSession(env, cfg, session) {
   if (acquired.meta?.changes !== 1) {
     const current = await env.DB.prepare("SELECT * FROM oidc_sessions WHERE session_hash = ?").bind(session.hash).first();
     if (current?.token_envelope === session.row.token_envelope && current.refresh_owner && current.refresh_until < currentTime) {
-      const expired = await env.DB.prepare(`DELETE FROM oidc_sessions WHERE session_hash = ? AND token_envelope = ?
-        AND refresh_owner = ? AND refresh_until < ?`).bind(session.hash, session.row.token_envelope, current.refresh_owner, currentTime).run();
-      if (expired.meta?.changes === 1) {
-        await Promise.all([
-          revoke(cfg, session.tokens.refresh_token, "refresh_token"),
-          revoke(cfg, session.tokens.access_token, "access_token"),
-        ]);
-        throw new OidcAuthError("auth_refresh_failed", 401);
-      }
+      const error = new OidcAuthError("auth_refresh_failed", 401);
+      error.preserveSession = true;
+      throw error;
     }
     throw new OidcAuthError("auth_refresh_pending", 503);
   }
@@ -313,8 +338,11 @@ async function refreshSession(env, cfg, session) {
   try {
     const updated = await refreshTokenGrant(cfg.oidc, session.tokens.refresh_token, { scope: "openid profile email offline_access" });
     rotated = updated;
-    if (typeof updated.access_token !== "string" || typeof updated.refresh_token !== "string" ||
-        updated.refresh_token === session.tokens.refresh_token) throw new OidcAuthError("auth_refresh_failed", 401);
+    if (typeof updated.access_token !== "string" || !updated.access_token ||
+        (updated.refresh_token !== undefined && (typeof updated.refresh_token !== "string" || !updated.refresh_token))) {
+      throw new OidcAuthError("auth_refresh_pending", 503);
+    }
+    updated.refresh_token ??= session.tokens.refresh_token;
     const identity = await introspect(cfg, updated.access_token);
     validateAdminIntrospection(identity, cfg, session.tokens.subject);
     const envelope = await encryptTokens({ ...updated, access_exp: identity.exp, name: session.tokens.name, email: session.tokens.email }, cfg, session.tokens.subject, Date.parse(session.row.expires_at));
@@ -328,23 +356,36 @@ async function refreshSession(env, cfg, session) {
       tokens: { ...(await decryptTokens(envelope, cfg)), envelope },
     };
   } catch (error) {
-    const removed = await env.DB.prepare("DELETE FROM oidc_sessions WHERE session_hash = ? AND refresh_owner = ?")
-      .bind(session.hash, owner).run();
-    if (removed.meta?.changes === 1) {
-      await Promise.all([
-        revoke(cfg, session.tokens.refresh_token, "refresh_token"),
-        revoke(cfg, session.tokens.access_token, "access_token"),
-        revoke(cfg, rotated?.refresh_token, "refresh_token"),
-        revoke(cfg, rotated?.access_token, "access_token"),
-      ]);
-    } else if (rotated?.refresh_token) {
-      await Promise.all([
-        revoke(cfg, rotated.refresh_token, "refresh_token"),
-        revoke(cfg, rotated.access_token, "access_token"),
-      ]);
+    const terminal = (error instanceof OidcAuthError && [401, 403].includes(error.status)) || isInvalidGrant(error);
+    if (terminal) {
+      const removed = await env.DB.prepare("DELETE FROM oidc_sessions WHERE session_hash = ? AND token_envelope = ? AND refresh_owner = ?")
+        .bind(session.hash, session.row.token_envelope, owner).run();
+      if (removed.meta?.changes === 1) {
+        await Promise.all([
+          revoke(cfg, session.tokens.refresh_token, "refresh_token"),
+          revoke(cfg, session.tokens.access_token, "access_token"),
+          revoke(cfg, rotated?.refresh_token, "refresh_token"),
+          revoke(cfg, rotated?.access_token, "access_token"),
+        ]);
+      }
+      throw error instanceof OidcAuthError ? error : new OidcAuthError("auth_refresh_failed", 401);
     }
-    if (error instanceof OidcAuthError && error.status === 503) throw error;
-    throw new OidcAuthError("auth_refresh_failed", 401);
+    if (rotated) {
+      const committed = await persistRotatedTokens(env, cfg, session, owner, rotated);
+      if (!committed) {
+        const current = await env.DB.prepare("SELECT session_hash FROM oidc_sessions WHERE session_hash = ?")
+          .bind(session.hash).first();
+        if (!current) {
+          await Promise.all([
+            revoke(cfg, rotated.refresh_token, "refresh_token"),
+            revoke(cfg, rotated.access_token, "access_token"),
+          ]);
+        }
+      }
+    }
+    throw error instanceof OidcAuthError && error.status === 503
+      ? error
+      : new OidcAuthError("auth_refresh_pending", 503);
   }
 }
 
@@ -375,7 +416,12 @@ export async function oidcIdentity(request, env) {
     return { id: `oidc:${identity.sub}`, name: typeof session.tokens.name === "string" ? session.tokens.name : "", email: typeof session.tokens.email === "string" ? session.tokens.email : "", authLabel: "OIDC" };
   } catch (error) {
     if (error instanceof OidcAuthError && [401, 403].includes(error.status)) {
-      if (session) await invalidateSession(env, session.hash, cfg, session.tokens);
+      if (session && !error.preserveSession) {
+        await invalidateSession(env, session.hash, cfg, session.tokens);
+      }
+      if (session) {
+        error.clearSessionCookie = true;
+      }
       throw error;
     }
     throw error instanceof OidcAuthError ? error : new OidcAuthError("identity_unavailable");

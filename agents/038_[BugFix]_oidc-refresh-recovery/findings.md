@@ -1,0 +1,8 @@
+# Findings
+
+- RFC 6749 section 6 makes `refresh_token` in a successful access-token response optional. Current code rejects missing or unchanged refresh tokens, despite the library's response type permitting the RFC response. This is a concrete candidate for the post-expiry failure.
+- Current `refreshSession` catch deletes the D1 session and revokes the old tokens on every non-503 exception. Network failures, provider 5xx and failed introspection can occur after the provider may have rotated the refresh token; deleting/revoking the old session is destructive and cannot safely be treated as proof of invalid credentials.
+- Current `oidcIdentity` returns `auth_refresh_failed` as 401, and Worker top-level catch serializes all OIDC exceptions as JSON. Root `/` therefore surfaces JSON instead of terminal reauthentication navigation; Vue fetch already redirects on 401.
+- `openid-client` 6.8.8 exports `ResponseBodyError`; OAuth error responses expose `error`, so only explicit `invalid_grant` is terminal. Transport, 5xx, and introspection outages do not prove refresh-token invalidity.
+- Final lease behavior preserves single-flight protection: ambiguous outcomes keep the lease, then an expired lease quarantines the row and clears the browser cookie without deleting or revoking potentially live rotated tokens. If a rotated response was received before introspection failed, it is durably stored before returning a retryable error.
+- RFC source: [RFC 6749 section 6](https://www.rfc-editor.org/rfc/rfc6749.html#section-6) makes the replacement refresh token optional in a successful refresh response.

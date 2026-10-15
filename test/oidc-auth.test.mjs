@@ -147,7 +147,7 @@ test("refresh is leased, rotates once, and rejects concurrent requests without r
   });
 });
 
-test("an expired refresh lease invalidates the session and the late owner cannot restore it", async () => {
+test("an expired refresh lease quarantines the session while the late owner can finish", async () => {
   await withFixture({ tokenExpiry: Math.floor(Date.now() / 1000) + 10 }, async (fixture) => {
     const { cookie } = await fixture.authenticated();
     let arrivalCount = 0;
@@ -161,12 +161,14 @@ test("an expired refresh lease invalidates the session and the late owner cannot
     const oldOwner = oidcIdentity(identityRequest(cookie), fixture.env);
     while (arrivalCount < 1) await new Promise((resolve) => setTimeout(resolve, 0));
     fixture.sqlite.prepare("UPDATE oidc_sessions SET refresh_until = ?").run("2000-01-01T00:00:00.000Z");
-    await assert.rejects(oidcIdentity(identityRequest(cookie), fixture.env), (error) => error.code === "auth_refresh_failed");
-    assert.equal(fixture.sqlite.prepare("SELECT count(*) AS count FROM oidc_sessions").get().count, 0);
+    await assert.rejects(oidcIdentity(identityRequest(cookie), fixture.env), (error) => error.code === "auth_refresh_failed" && error.clearSessionCookie === true);
+    assert.equal(fixture.sqlite.prepare("SELECT count(*) AS count FROM oidc_sessions").get().count, 1);
     release();
-    await assert.rejects(oldOwner, (error) => error.code === "auth_refresh_pending");
-    assert.equal(fixture.sqlite.prepare("SELECT count(*) AS count FROM oidc_sessions").get().count, 0);
-    assert.ok(fixture.revocations.includes("refresh-rotated-1"));
+    assert.equal((await oldOwner).id, "oidc:subject-123");
+    const row = fixture.sqlite.prepare("SELECT * FROM oidc_sessions").get();
+    assert.ok(row.token_envelope);
+    assert.equal(row.refresh_owner, null);
+    assert.equal(fixture.revocations.length, 0);
   });
 });
 
@@ -197,13 +199,62 @@ test("logout racing a refresh removes the row and the late rotated token", async
   });
 });
 
-test("failed refresh invalidates the session instead of restoring old tokens", async () => {
+test("refresh responses may omit or reuse the refresh token", async (t) => {
+  for (const mode of ["omit", "same"]) {
+    await t.test(mode, async () => withFixture({ tokenExpiry: Math.floor(Date.now() / 1000) + 10, refreshTokenMode: mode }, async (fixture) => {
+      const { cookie } = await fixture.authenticated();
+      assert.equal((await oidcIdentity(identityRequest(cookie), fixture.env)).id, "oidc:subject-123");
+      const row = fixture.sqlite.prepare("SELECT * FROM oidc_sessions").get();
+      assert.equal(row.refresh_owner, null);
+      assert.equal(fixture.refreshCalls, 1);
+      assert.equal(fixture.revocations.length, 0);
+      assert.equal((await oidcIdentity(identityRequest(cookie), fixture.env)).id, "oidc:subject-123");
+      assert.equal(fixture.refreshCalls, 1);
+    }));
+  }
+});
+
+test("ambiguous provider errors retain the session lease and do not retry the old token", async (t) => {
+  for (const failure of ["server_error", "network"]) {
+    await t.test(failure, async () => withFixture({ tokenExpiry: Math.floor(Date.now() / 1000) + 10 }, async (fixture) => {
+      const { cookie } = await fixture.authenticated();
+      fixture.refreshFailure = failure;
+      await assert.rejects(oidcIdentity(identityRequest(cookie), fixture.env), (error) => error.code === "auth_refresh_pending" && error.status === 503);
+      const row = fixture.sqlite.prepare("SELECT * FROM oidc_sessions").get();
+      assert.ok(row);
+      assert.ok(row.refresh_owner);
+      assert.equal(fixture.revocations.length, 0);
+      await assert.rejects(oidcIdentity(identityRequest(cookie), fixture.env), (error) => error.code === "auth_refresh_pending" && error.status === 503);
+      assert.equal(fixture.refreshCalls, 1);
+      fixture.sqlite.prepare("UPDATE oidc_sessions SET refresh_until = ?").run("2000-01-01T00:00:00.000Z");
+      await assert.rejects(oidcIdentity(identityRequest(cookie), fixture.env), (error) => error.code === "auth_refresh_failed" && error.clearSessionCookie === true);
+      assert.equal(fixture.sqlite.prepare("SELECT count(*) AS count FROM oidc_sessions").get().count, 1);
+      assert.equal(fixture.revocations.length, 0);
+    }));
+  }
+});
+
+test("a rotated refresh token is saved when introspection is temporarily unavailable", async () => {
   await withFixture({ tokenExpiry: Math.floor(Date.now() / 1000) + 10 }, async (fixture) => {
     const { cookie } = await fixture.authenticated();
-    fixture.tokenRequestHook = async (form) => {
-      if (form.get("grant_type") === "refresh_token") throw new Error("provider outcome unknown");
-    };
-    await assert.rejects(oidcIdentity(identityRequest(cookie), fixture.env), (error) => error.code === "auth_refresh_failed");
+    fixture.introspectionFailure = true;
+    await assert.rejects(oidcIdentity(identityRequest(cookie), fixture.env), (error) => error.code === "auth_refresh_pending" && error.status === 503);
+    const row = fixture.sqlite.prepare("SELECT * FROM oidc_sessions").get();
+    assert.ok(row);
+    assert.equal(row.refresh_owner, null);
+    assert.equal(fixture.revocations.length, 0);
+    fixture.introspectionFailure = false;
+    assert.equal((await oidcIdentity(identityRequest(cookie), fixture.env)).id, "oidc:subject-123");
+    assert.equal(fixture.refreshCalls, 1);
+    assert.ok(fixture.introspectedTokens.includes("access-refreshed-1"));
+  });
+});
+
+test("an explicit invalid_grant is terminal and removes the session", async () => {
+  await withFixture({ tokenExpiry: Math.floor(Date.now() / 1000) + 10 }, async (fixture) => {
+    const { cookie } = await fixture.authenticated();
+    fixture.refreshFailure = "invalid_grant";
+    await assert.rejects(oidcIdentity(identityRequest(cookie), fixture.env), (error) => error.code === "auth_refresh_failed" && error.status === 401);
     assert.equal(fixture.sqlite.prepare("SELECT count(*) AS count FROM oidc_sessions").get().count, 0);
     assert.ok(fixture.revocations.includes("refresh-initial"));
   });

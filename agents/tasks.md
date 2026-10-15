@@ -49,3 +49,5 @@
 | 033 | [Feature] admin-oidc | Replace human password access with administrator-only confidential OIDC login | Use the existing auth provider and private client requested by the user | ✅ Deployed; live login, refresh and denial verified; manual logout user-confirmed, browser automation blocked |
 | 034 | [Feature] oidc-session-module | Add strict confidential OIDC and encrypted server sessions | Require live admin authorization and serialize rotating refresh tokens | ✅ Integrated and locally verified |
 | 035 | [Feature] oidc-ops | Configure OIDC secrets and document private deployment | Keep secrets in protected storage and preserve independent machine credentials | ✅ Integrated and locally verified |
+
+| 038 | [BugFix] oidc-refresh-recovery | Preserve valid sessions through optional/ambiguous token refresh and restore browser reauthentication flow | Users receive auth_refresh_failed after sessions age; classify refresh failure and route terminal browser auth correctly | ✅ Implemented and locally verified; deployment pending coordinator |

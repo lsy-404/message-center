@@ -1,4 +1,4 @@
-import { OidcAuthError, beginOidcLogin, completeOidcLogin, oidcIdentity, logoutOidc, cleanupOidcSessions } from "./oidc.js";
+import { OidcAuthError, beginOidcLogin, completeOidcLogin, oidcIdentity, logoutOidc, cleanupOidcSessions, clearOidcSessionCookie } from "./oidc.js";
 
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
@@ -2899,6 +2899,11 @@ function authenticationResult(response) {
   return authenticationPage(message, response.status, response.headers);
 }
 
+function isHtmlNavigation(request, path) {
+  return request.method === "GET" && request.headers.get("accept")?.includes("text/html") &&
+    new Set(["/", "/app", "/index.html", "/login"]).has(path);
+}
+
 async function appAssetResponse(request, env, assetPath) {
   if (!env.ASSETS || typeof env.ASSETS.fetch !== "function") {
     return fail("app_assets_unavailable", 503);
@@ -3047,8 +3052,17 @@ export default {
       return fail("not_found", 404);
     } catch (caught) {
       if (caught instanceof OidcAuthError) {
-        const headers = caught.status === 503 ? { "retry-after": "1" } : {};
-        return json({ ok: false, error: caught.code }, caught.status, headers);
+        const headers = new Headers(caught.status === 503 ? { "retry-after": String(caught.retryAfter || 1) } : {});
+        if (caught.clearSessionCookie) headers.set("set-cookie", clearOidcSessionCookie());
+        if (isHtmlNavigation(request, url.pathname)) {
+          if (caught.status < 500) {
+            headers.set("location", "/login");
+            headers.set("cache-control", "no-store");
+            return new Response(null, { status: 303, headers });
+          }
+          return authenticationPage("登录服务暂时不可用，请稍后重试。", caught.status, headers);
+        }
+        return json({ ok: false, error: caught.code }, caught.status, Object.fromEntries(headers));
       }
       const message = caught instanceof Error ? caught.message : String(caught);
       console.error(JSON.stringify({ event: "request_failed", path: url.pathname, message }));
