@@ -198,6 +198,7 @@ class DeviceRuntimeTests(unittest.TestCase):
             None,
             {key: value for key, value in valid.items() if key != "processId"},
             {**valid, "processId": True},
+            {**valid, "processId": 1},
             {**valid, "processId": 0},
             {**valid, "processId": -1},
             {**valid, "stage": "native-helper"},
@@ -229,6 +230,18 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertTrue(relay.recover_attach_after_failures("connector-a"))
         self.assertEqual(requests, [{"op": "ensure-active", "reason": "attach_failure",
                                     "driver": "qq", "observedPid": 12346}])
+
+    def test_attach_recovery_rejects_pid_one(self):
+        config = self.auto_wake_config()
+        config["connectors"] = config["connectors"][:1]
+        requests = []
+        relay = runtime.Relay(config, self.db,
+                              lambda request: requests.append(dict(request)) or self.wake_result(True))
+        self.assertFalse(relay.ensure_active(
+            recovery_driver="qq", recovery_reason="attach_failure", observed_pid=1))
+        relay.source_read_failed("connector-a", attach_failure_pid=1)
+        self.assertEqual(relay.attach_failure_streak["connector-a"], (None, 0))
+        self.assertEqual(requests, [])
 
     def test_attach_failure_streak_requires_three_consecutive_failures_and_respects_cooldown(self):
         config = self.auto_wake_config()

@@ -62,7 +62,7 @@ def explicit_native_attach_failure(value):
             and type(value["errorCode"]) is str
             and value["errorCode"] in {"attach_failed", "timeout"}
             and type(value["dispatch"]) is str and value["dispatch"] == "not_started"
-            and type(value["processId"]) is int and value["processId"] > 0)
+            and type(value["processId"]) is int and value["processId"] > 1)
 
 
 def _event_route(message):
@@ -386,7 +386,7 @@ class Relay:
     def source_read_failed(self, connector_id, attach_failure_pid=None):
         self.source_failures[connector_id] += 1
         current_pid, count = self.attach_failure_streak[connector_id]
-        if self.auto_wake and type(attach_failure_pid) is int and attach_failure_pid > 0:
+        if self.auto_wake and type(attach_failure_pid) is int and attach_failure_pid > 1:
             self.attach_failure_streak[connector_id] = (
                 attach_failure_pid, count + 1 if current_pid == attach_failure_pid else 1)
         else:
@@ -766,7 +766,7 @@ class Relay:
                 if (recovery_driver != "qq"
                         or recovery_reason not in {"read_failure", "attach_failure"}
                         or (recovery_reason == "attach_failure"
-                            and (type(observed_pid) is not int or observed_pid <= 0))):
+                            and (type(observed_pid) is not int or observed_pid <= 1))):
                     raise RuntimeError("invalid_recovery_driver")
                 request.update({"reason": recovery_reason, "driver": recovery_driver})
                 if recovery_reason == "attach_failure":
