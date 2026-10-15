@@ -36,14 +36,33 @@ DEFAULT_OUTBOX_BYTES = 128 * 1024 * 1024
 MAX_DELIVERIES_PER_PASS = 5
 ADAPTER_SCAN_TIMEOUT = 60
 ADAPTER_SEND_TIMEOUT = 90
-ADAPTER_WAKE_TIMEOUT = 20
+ADAPTER_WAKE_TIMEOUT = 55
 AUTO_WAKE_INTERVAL = 60
+SOURCE_RECOVERY_FAILURE_THRESHOLD = 3
+SOURCE_RECOVERY_COOLDOWN = 300
+SOURCE_STARTUP_SETTLE = 60
 WAKE_REASON = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, response, code, message, headers, new_url):
         raise urllib.error.HTTPError(request.full_url, code, "redirect_refused", headers, response)
+
+
+class SourceReadError(RuntimeError):
+    def __init__(self, code, *, attach_failure_pid=None):
+        super().__init__(code)
+        self.attach_failure_pid = attach_failure_pid
+
+
+def explicit_native_attach_failure(value):
+    if type(value) is not dict or set(value) != {"stage", "errorCode", "dispatch", "processId"}:
+        return False
+    return (type(value["stage"]) is str and value["stage"] == "attach"
+            and type(value["errorCode"]) is str
+            and value["errorCode"] in {"attach_failed", "timeout"}
+            and type(value["dispatch"]) is str and value["dispatch"] == "not_started"
+            and type(value["processId"]) is int and value["processId"] > 1)
 
 
 def _event_route(message):
@@ -121,6 +140,10 @@ def open_database(path):
         state TEXT NOT NULL,
         result TEXT, retryable INTEGER NOT NULL DEFAULT 0);
       CREATE UNIQUE INDEX IF NOT EXISTS command_ledger_key ON command_ledger(connector_id,idempotency_key);
+      CREATE TABLE IF NOT EXISTS source_recovery(
+        connector_id TEXT PRIMARY KEY, consecutive_failures INTEGER NOT NULL DEFAULT 0,
+        last_success_at REAL NOT NULL DEFAULT 0, retry_after REAL NOT NULL DEFAULT 0,
+        settle_until REAL NOT NULL DEFAULT 0);
     """)
     return db
 
@@ -191,6 +214,12 @@ def run_adapter(path, request, timeout=30):
         if remaining <= 0:
             raise RuntimeError("adapter_timeout")
         return_code = process.wait(timeout=remaining)
+        if return_code != 0:
+            raise RuntimeError("adapter_failed")
+        value = json.loads(bytes(output).decode("utf-8"))
+        if not isinstance(value, dict):
+            raise RuntimeError("adapter_invalid_response")
+        return value
     except Exception:
         if os.name == "posix":
             try:
@@ -212,12 +241,6 @@ def run_adapter(path, request, timeout=30):
             process.stdin.close()
         if process.stdout:
             process.stdout.close()
-    if return_code != 0:
-        raise RuntimeError("adapter_failed")
-    value = json.loads(bytes(output).decode("utf-8"))
-    if not isinstance(value, dict):
-        raise RuntimeError("adapter_invalid_response")
-    return value
 
 
 def adapter_timeout_for_request(request):
@@ -280,16 +303,28 @@ class Relay:
                 raise ValueError("invalid_connector_configuration")
         self.connector_by_id = {item["id"]: item for item in self.connectors}
         self.auto_wake = config.get("autoWake") is True
-        if self.auto_wake and (len(self.connectors) != 2 or
-                               {item.get("kind") for item in self.connectors} != {"qq", "wechat"}):
-            raise ValueError("auto_wake_requires_qq_and_wechat")
+        if self.auto_wake and any(item.get("kind") != "qq" for item in self.connectors):
+            raise ValueError("auto_wake_requires_qq_only")
         self.wake_ready = not self.auto_wake
+        self.wake_readiness_established = not self.auto_wake
         self.last_wake_attempt = float("-inf")
         self.wake_ready_at = float("-inf")
         self.last_logged_wake_state = None
         self.wake_scan_pending = set()
         self.wake_scan_failures = {item["id"]: 0 for item in self.connectors}
         self.wake_scan_retry_at = {item["id"]: 0 for item in self.connectors}
+        recovery_rows = {row[0]: row[1:] for row in self.db.execute(
+            "SELECT connector_id,consecutive_failures,last_success_at,retry_after,settle_until FROM source_recovery")}
+        self.source_failures = {item["id"]: recovery_rows.get(item["id"], (0, 0, 0))[0]
+                                for item in self.connectors}
+        self.attach_failure_streak = {item["id"]: (None, 0) for item in self.connectors}
+        self.source_last_success = {item["id"]: recovery_rows.get(item["id"], (0, 0, 0, 0))[1]
+                                    for item in self.connectors}
+        self.source_recovery_after = {item["id"]: recovery_rows.get(item["id"], (0, 0, 0, 0))[2]
+                                      for item in self.connectors}
+        self.source_settle_until = {item["id"]: recovery_rows.get(item["id"], (0, 0, 0, 0))[3]
+                                    for item in self.connectors}
+        self.source_state_durable = {item["id"]: True for item in self.connectors}
         self.connector = self.connectors[0]["id"]
         self.health = {item["id"]: False for item in self.connectors}
         self.last_scan = {item["id"]: float("-inf") for item in self.connectors}
@@ -326,6 +361,82 @@ class Relay:
     def succeeded(self, connector_id):
         self.failures[connector_id] = 0
         self.retry_at[connector_id] = 0
+
+    def persist_source_state(self, connector_id):
+        try:
+            self.db.execute(
+                "INSERT INTO source_recovery(connector_id,consecutive_failures,last_success_at,retry_after,settle_until) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(connector_id) DO UPDATE SET "
+                "consecutive_failures=excluded.consecutive_failures,last_success_at=excluded.last_success_at,"
+                "retry_after=excluded.retry_after,settle_until=excluded.settle_until",
+                (connector_id, self.source_failures[connector_id], self.source_last_success[connector_id],
+                 self.source_recovery_after[connector_id], self.source_settle_until[connector_id]),
+            )
+            self.db.commit()
+        except sqlite3.Error:
+            self.source_state_durable[connector_id] = False
+            try:
+                self.db.rollback()
+            except sqlite3.Error:
+                pass
+            return False
+        self.source_state_durable[connector_id] = True
+        return True
+
+    def source_read_failed(self, connector_id, attach_failure_pid=None):
+        self.source_failures[connector_id] += 1
+        current_pid, count = self.attach_failure_streak[connector_id]
+        if self.auto_wake and type(attach_failure_pid) is int and attach_failure_pid > 1:
+            self.attach_failure_streak[connector_id] = (
+                attach_failure_pid, count + 1 if current_pid == attach_failure_pid else 1)
+        else:
+            self.attach_failure_streak[connector_id] = (None, 0)
+        return self.persist_source_state(connector_id)
+
+    def source_read_succeeded(self, connector_id):
+        self.source_failures[connector_id] = 0
+        self.attach_failure_streak[connector_id] = (None, 0)
+        self.source_last_success[connector_id] = time.time()
+        self.persist_source_state(connector_id)
+
+    def recover_source_after_failures(self, connector_id):
+        now = time.time()
+        if (not self.auto_wake
+                or not self.source_state_durable[connector_id]
+                or self.source_failures[connector_id] < SOURCE_RECOVERY_FAILURE_THRESHOLD
+                or now < self.source_recovery_after[connector_id]
+                or now < self.source_settle_until[connector_id]):
+            return False
+        self.source_recovery_after[connector_id] = now + SOURCE_RECOVERY_COOLDOWN
+        if not self.persist_source_state(connector_id):
+            return False
+        self.health[connector_id] = False
+        try:
+            result = self.ensure_active(recovery_driver=self.connector_by_id[connector_id].get("kind"))
+        except Exception:
+            return False
+        return result
+
+    def recover_attach_after_failures(self, connector_id):
+        now = time.time()
+        if (not self.auto_wake
+                or not self.source_state_durable[connector_id]
+                or self.attach_failure_streak[connector_id][1] < SOURCE_RECOVERY_FAILURE_THRESHOLD
+                or now < self.source_recovery_after[connector_id]
+                or now < self.source_settle_until[connector_id]):
+            return False
+        self.source_recovery_after[connector_id] = now + SOURCE_RECOVERY_COOLDOWN
+        if not self.persist_source_state(connector_id):
+            return False
+        self.health[connector_id] = False
+        try:
+            return self.ensure_active(
+                recovery_driver=self.connector_by_id[connector_id].get("kind"),
+                recovery_reason="attach_failure",
+                observed_pid=self.attach_failure_streak[connector_id][0],
+            )
+        except Exception:
+            return False
 
     def heartbeat_failed(self, connector_id):
         count = self.heartbeat_failures[connector_id] + 1
@@ -481,13 +592,31 @@ class Relay:
         driver = connector.get("kind")
         if driver not in {"qq", "wechat"}:
             raise RuntimeError("unsupported_connector_driver")
-        result = self.adapter_call({"op": "scan", "driver": driver,
-                                    "profile": profile, "cursor": cursor,
-                                    "limit": limit, "maxBytes": MAX_SCAN_RESPONSE,
-                                    "maxEventBytes": MAX_EVENT, "mediaDirectory": self.media_directory_for(self.connector),
-                                    "maxMediaBytes": remaining, "history": bool(history)})
-        if result.get("ok") is not True or "cursor" not in result or not isinstance(result.get("messages"), list):
-            raise RuntimeError("scan_failed")
+        try:
+            result = self.adapter_call({"op": "scan", "driver": driver,
+                                        "profile": profile, "cursor": cursor,
+                                        "limit": limit, "maxBytes": MAX_SCAN_RESPONSE,
+                                        "maxEventBytes": MAX_EVENT, "mediaDirectory": self.media_directory_for(self.connector),
+                                        "maxMediaBytes": remaining, "history": bool(history)})
+        except Exception as error:
+            raise SourceReadError("source_read_failed") from error
+        if not isinstance(result, dict):
+            raise RuntimeError("invalid_scan_result")
+        source_read_ok = result.get("sourceReadOk")
+        if type(source_read_ok) is not bool:
+            raise RuntimeError("invalid_scan_result")
+        if source_read_ok is False:
+            raise SourceReadError(
+                "source_read_failed",
+                attach_failure_pid=(result["nativeFailure"]["processId"]
+                                    if explicit_native_attach_failure(result.get("nativeFailure")) else None),
+            )
+        if (result.get("ok") is not True or "cursor" not in result or
+                not isinstance(result.get("messages"), list)):
+            raise RuntimeError("invalid_scan_result")
+        health = result.get("health")
+        if not isinstance(health, str) or health not in {"online", "degraded"}:
+            raise RuntimeError("invalid_scan_health")
         if len(compact(result).encode("utf-8")) > MAX_SCAN_RESPONSE:
             raise RuntimeError("scan_response_too_large")
         messages = result["messages"]
@@ -619,19 +748,30 @@ class Relay:
             raise
         active = result.get("active") is True
         self.scan_interval[self.connector] = 15 if result.get("more") is True else (60 if active else 300)
+        self.source_read_succeeded(self.connector)
         return result.get("health") == "online"
 
-    def ensure_active(self):
+    def ensure_active(self, recovery_driver=None, recovery_reason="read_failure", observed_pid=None):
         if not self.auto_wake:
             return True
         now = time.monotonic()
-        if now - self.last_wake_attempt < AUTO_WAKE_INTERVAL:
+        if (recovery_driver is None and now - self.last_wake_attempt < AUTO_WAKE_INTERVAL):
             return self.wake_readiness_current()
         self.last_wake_attempt = now
         was_ready = self.wake_ready
         self.wake_ready = False
         try:
-            result = self.adapter_call({"op": "ensure-active"})
+            request = {"op": "ensure-active", "driver": "qq"}
+            if recovery_driver is not None:
+                if (recovery_driver != "qq"
+                        or recovery_reason not in {"read_failure", "attach_failure"}
+                        or (recovery_reason == "attach_failure"
+                            and (type(observed_pid) is not int or observed_pid <= 1))):
+                    raise RuntimeError("invalid_recovery_driver")
+                request.update({"reason": recovery_reason, "driver": recovery_driver})
+                if recovery_reason == "attach_failure":
+                    request["observedPid"] = observed_pid
+            result = self.adapter_call(request)
             if (not isinstance(result, dict) or set(result) != {"ok", "ready", "attempted", "reason"} or
                     result.get("ok") is not True or type(result.get("ready")) is not bool or
                     type(result.get("attempted")) is not bool or
@@ -644,6 +784,19 @@ class Relay:
             self.wake_ready_at = time.monotonic()
             if self.wake_ready and not was_ready:
                 self.wake_scan_pending = set(self.connector_by_id)
+                if not self.wake_readiness_established:
+                    self.wake_readiness_established = True
+                    settle_until = time.time() + SOURCE_STARTUP_SETTLE
+                    for connector_id in self.connector_by_id:
+                        self.health[connector_id] = False
+                        self.source_settle_until[connector_id] = settle_until
+                        self.persist_source_state(connector_id)
+            if result["attempted"]:
+                settle_until = time.time() + SOURCE_STARTUP_SETTLE
+                for connector_id in self.connector_by_id:
+                    self.health[connector_id] = False
+                    self.source_settle_until[connector_id] = settle_until
+                    self.persist_source_state(connector_id)
             self.log_wake_state(result["ready"], result["attempted"], result["reason"])
             return self.wake_readiness_current()
         except Exception as error:
@@ -944,23 +1097,63 @@ class Relay:
             scan_allowed = (ready if self.auto_wake else self.eligible(connector_id))
             scan_retry_allowed = (force_scan or time.monotonic() >= self.wake_scan_retry_at[connector_id])
             if (connector_id not in pending_connectors and scan_allowed and scan_retry_allowed and
+                    time.time() >= self.source_settle_until[connector_id] and
                     (force_scan or scan_due)):
+                backpressured = False
                 try:
-                    self.health[connector_id] = self.scan_profile(profile)
-                    self.last_scan[connector_id] = time.monotonic()
-                    if self.auto_wake:
-                        self.wake_scan_succeeded(connector_id)
+                    scan_health = self.scan_profile(profile)
+                    if scan_health is None:
+                        backpressured = True
                     else:
-                        self.succeeded(connector_id)
+                        self.health[connector_id] = scan_health
+                        self.last_scan[connector_id] = time.monotonic()
+                        if self.auto_wake:
+                            self.wake_scan_succeeded(connector_id)
+                        else:
+                            self.succeeded(connector_id)
+                except SourceReadError as error:
+                    self.health[connector_id] = False
+                    self.last_scan[connector_id] = time.monotonic() - self.scan_interval[connector_id]
+                    source_state_saved = self.source_read_failed(
+                        connector_id, attach_failure_pid=error.attach_failure_pid,
+                    )
+                    failure_pid = (error.attach_failure_pid
+                                   if type(error.attach_failure_pid) is int and error.attach_failure_pid > 1
+                                   else None)
+                    driver = self.connector_by_id[connector_id].get("kind")
+                    if driver in {"qq", "wechat"}:
+                        try:
+                            observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
+                                "+00:00", "Z")
+                            sys.stderr.write(compact({
+                                "observedAt": observed_at,
+                                "driver": driver,
+                                "consecutiveFailures": self.source_failures[connector_id],
+                                "classification": "explicit_attach" if failure_pid is not None else "source_unclassified",
+                                "processId": failure_pid,
+                            }) + "\n")
+                            sys.stderr.flush()
+                        except Exception:
+                            pass
+                    if self.auto_wake:
+                        self.wake_scan_failed(connector_id)
+                        if source_state_saved:
+                            if error.attach_failure_pid is not None:
+                                self.recover_attach_after_failures(connector_id)
+                            else:
+                                self.recover_source_after_failures(connector_id)
+                    else:
+                        self.failed(connector_id)
                 except Exception:
                     self.health[connector_id] = False
+                    self.attach_failure_streak[connector_id] = (None, 0)
                     self.last_scan[connector_id] = time.monotonic() - self.scan_interval[connector_id]
                     if self.auto_wake:
                         self.wake_scan_failed(connector_id)
                     else:
                         self.failed(connector_id)
                 finally:
-                    if force_scan:
+                    if force_scan and not backpressured:
                         self.wake_scan_pending.discard(connector_id)
                     self.cleanup_unreferenced_media()
             if time.monotonic() >= self.heartbeat_retry_at[connector_id]:
@@ -983,6 +1176,7 @@ class Relay:
             ready = self.wake_readiness_current()
             if (not ready or connector.get("receiveOnly") is True or not self.eligible(connector_id) or
                     not self.health.get(connector_id) or
+                    time.time() < self.source_settle_until[connector_id] or
                     time.monotonic() - self.last_scan[connector_id] > self.scan_interval[connector_id] + 30):
                 continue
             path = "/api/connectors/commands?connectorId=" + urllib.parse.quote(self.connector, safe="") + "&limit=1"

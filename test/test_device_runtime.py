@@ -58,7 +58,7 @@ class DeviceRuntimeTests(unittest.TestCase):
                 "retentionDays": 30}
 
     def test_profile_sync_failure_preserves_cursor_and_outbox(self):
-        result = {"ok": True, "health": "online", "cursor": {"next": "2"},
+        result = {"ok": True, "sourceReadOk": True, "health": "online", "cursor": {"next": "2"},
                   "messages": [self.event("new-1")],
                   "conversationProfiles": [{"conversationExternalId": "primary:conversation-aaaaaaaa", "displayName": "中文 😀"}]}
         relay = runtime.Relay(self.config, self.db, lambda _: result)
@@ -73,8 +73,376 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM cursors").fetchone()[0], 1)
 
+    def test_failed_native_read_does_not_commit_cursor_messages_or_profiles(self):
+        self.db.execute(
+            "INSERT INTO cursors(connector_id,profile,value) VALUES(?,?,?)",
+            ("connector-a", "primary", runtime.compact({"next": "old"})),
+        )
+        self.db.commit()
+        result = {"ok": True, "sourceReadOk": False, "health": "offline",
+                  "cursor": {"next": "new"}, "messages": [self.event("must-not-spool")],
+                  "conversationProfiles": [{"conversationExternalId": "private", "displayName": "ignored"}]}
+        relay = runtime.Relay(self.config, self.db, lambda _request: result)
+        with patch.object(runtime, "sync_profiles") as sync_profiles:
+            with self.assertRaises(runtime.SourceReadError):
+                relay.scan_profile("primary")
+        sync_profiles.assert_not_called()
+        self.assertEqual(json_cursor(self.db), runtime.compact({"next": "old"}))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+
+    def test_source_read_ok_commits_degraded_thumbnail_backlog_without_failure_recovery(self):
+        result = {"ok": True, "sourceReadOk": True, "health": "degraded",
+                  "cursor": {"next": "new"}, "messages": [self.event("new-1")],
+                  "error": "thumbnail-backlog"}
+        relay = runtime.Relay(self.config, self.db, lambda _request: result)
+        relay.source_read_failed("connector-a")
+        self.assertFalse(relay.scan_profile("primary"))
+        self.assertEqual(json_cursor(self.db), runtime.compact({"next": "new"}))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
+        self.assertEqual(relay.source_failures["connector-a"], 0)
+
+    def test_source_read_ok_false_or_missing_rejects_scan_payload(self):
+        false_result = {"ok": False, "sourceReadOk": False, "health": "offline",
+                        "cursor": {"next": "new"}, "messages": [self.event("ignored-false")]}
+        relay = runtime.Relay(self.config, self.db, lambda _request: false_result)
+        with self.assertRaises(runtime.SourceReadError):
+            relay.scan_profile("primary")
+        missing_result = {"ok": True, "health": "online", "cursor": {"next": "new"},
+                          "messages": [self.event("ignored-missing")]}
+        relay = runtime.Relay(self.config, self.db, lambda _request: missing_result)
+        with self.assertRaisesRegex(RuntimeError, "invalid_scan_result"):
+            relay.scan_profile("primary")
+        self.assertIsNone(self.db.execute("SELECT value FROM cursors WHERE connector_id='connector-a' "
+                                          "AND profile='primary'").fetchone())
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+
+    def test_repeated_source_read_failures_request_one_bounded_targeted_recovery(self):
+        config = self.auto_wake_config()
+        calls = []
+        now = [1000.0]
+
+        def adapter(request):
+            calls.append(dict(request))
+            if request["op"] == "ensure-active":
+                return self.wake_result(False) if request.get("reason") else self.wake_result(True)
+            raise OSError("native read unavailable")
+
+        http_calls = []
+        relay = runtime.Relay(config, self.db, adapter,
+                              lambda method, path, payload=None: http_calls.append((method, path)) or
+                                  {"ok": True, "commands": []})
+        with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]), patch.object(
+            runtime.time, "time", side_effect=lambda: now[0]
+        ):
+            relay.pass_once()
+            now[0] += 60
+            relay.pass_once()
+            now[0] += 15
+            relay.pass_once()
+            now[0] += 30
+            relay.pass_once()
+            recovery = [call for call in calls if call.get("reason") == "read_failure"]
+            self.assertEqual(len(recovery), 1)
+            self.assertEqual(recovery[0], {"op": "ensure-active", "reason": "read_failure", "driver": "qq"})
+            self.assertGreater(relay.source_settle_until["connector-a"], now[0])
+            self.assertFalse(relay.health["connector-a"])
+            self.assertEqual(relay.db.execute(
+                "SELECT consecutive_failures FROM source_recovery WHERE connector_id='connector-a'"
+            ).fetchone()[0], 3)
+            self.assertGreater(relay.source_settle_until["connector-b"], now[0])
+            self.assertFalse(relay.health["connector-b"])
+            now[0] += 15
+            relay.wake_ready = True
+            relay.wake_ready_at = now[0]
+            relay.wake_scan_pending = set(relay.connector_by_id)
+            before = len([call for call in calls if call.get("op") == "scan"])
+            http_calls.clear()
+            relay.pass_once()
+            self.assertEqual(len([call for call in calls if call.get("op") == "scan"]), before)
+            self.assertFalse(any("/commands?" in path for _method, path in http_calls))
+
+        self.db.close()
+        db2 = runtime.open_database(self.db_path)
+        try:
+            recovery_calls = []
+            restarted = runtime.Relay(config, db2,
+                                      lambda request: recovery_calls.append(request) or self.wake_result(False),
+                                      lambda *_args: {"ok": True})
+            self.assertEqual(restarted.source_failures["connector-a"], 3)
+            self.assertEqual(restarted.source_last_success["connector-a"], 0)
+            self.assertGreater(restarted.source_recovery_after["connector-a"], now[0])
+            self.assertGreater(restarted.source_settle_until["connector-a"], now[0])
+            with patch.object(runtime.time, "time", return_value=1200.0):
+                self.assertFalse(restarted.recover_source_after_failures("connector-a"))
+            self.assertEqual(recovery_calls, [])
+        finally:
+            db2.close()
+            self.db = sqlite3.connect(self.db_path)
+
+    def test_successful_empty_native_read_resets_failure_streak(self):
+        relay = runtime.Relay(self.config, self.db, lambda _request: {
+            "ok": True, "sourceReadOk": True, "health": "online",
+            "cursor": {"next": "same"}, "messages": []})
+        relay.source_read_failed("connector-a")
+        relay.source_read_failed("connector-a")
+        self.assertTrue(relay.scan_profile("primary"))
+        self.assertEqual(relay.source_failures["connector-a"], 0)
+        self.assertEqual(relay.attach_failure_streak["connector-a"], (None, 0))
+
+    def test_native_attach_failure_classification_requires_exact_safe_metadata(self):
+        valid = {"stage": "attach", "errorCode": "attach_failed", "dispatch": "not_started", "processId": 12345}
+        self.assertTrue(runtime.explicit_native_attach_failure(valid))
+        self.assertTrue(runtime.explicit_native_attach_failure(
+            {**valid, "errorCode": "timeout"}))
+        for invalid in (
+            None,
+            {key: value for key, value in valid.items() if key != "processId"},
+            {**valid, "processId": True},
+            {**valid, "processId": 1},
+            {**valid, "processId": 0},
+            {**valid, "processId": -1},
+            {**valid, "stage": "native-helper"},
+            {**valid, "errorCode": "page_read_failed"},
+            {**valid, "dispatch": "unknown"},
+            {**valid, "detail": "ignored"},
+        ):
+            self.assertFalse(runtime.explicit_native_attach_failure(invalid))
+
+        relay = runtime.Relay(self.config, self.db, lambda _request: {
+            "ok": False, "sourceReadOk": False, "nativeFailure": valid})
+        with self.assertRaises(runtime.SourceReadError) as caught:
+            relay.scan_profile("primary")
+        self.assertEqual(caught.exception.attach_failure_pid, 12345)
+
+    def test_changed_process_resets_attach_streak_and_requests_observed_pid(self):
+        config = self.auto_wake_config()
+        config["connectors"] = config["connectors"][:1]
+        requests = []
+        relay = runtime.Relay(config, self.db,
+                              lambda request: requests.append(dict(request)) or self.wake_result(True))
+        relay.source_read_failed("connector-a", attach_failure_pid=12345)
+        relay.source_read_failed("connector-a", attach_failure_pid=12345)
+        relay.source_read_failed("connector-a", attach_failure_pid=12346)
+        self.assertEqual(relay.attach_failure_streak["connector-a"], (12346, 1))
+        self.assertFalse(relay.recover_attach_after_failures("connector-a"))
+        relay.source_read_failed("connector-a", attach_failure_pid=12346)
+        relay.source_read_failed("connector-a", attach_failure_pid=12346)
+        self.assertTrue(relay.recover_attach_after_failures("connector-a"))
+        self.assertEqual(requests, [{"op": "ensure-active", "reason": "attach_failure",
+                                    "driver": "qq", "observedPid": 12346}])
+
+    def test_attach_recovery_rejects_pid_one(self):
+        config = self.auto_wake_config()
+        config["connectors"] = config["connectors"][:1]
+        requests = []
+        relay = runtime.Relay(config, self.db,
+                              lambda request: requests.append(dict(request)) or self.wake_result(True))
+        self.assertFalse(relay.ensure_active(
+            recovery_driver="qq", recovery_reason="attach_failure", observed_pid=1))
+        relay.source_read_failed("connector-a", attach_failure_pid=1)
+        self.assertEqual(relay.attach_failure_streak["connector-a"], (None, 0))
+        self.assertEqual(requests, [])
+
+    def test_attach_failure_streak_requires_three_consecutive_failures_and_respects_cooldown(self):
+        config = self.auto_wake_config()
+        config["connectors"] = config["connectors"][:1]
+        requests = []
+        relay = runtime.Relay(config, self.db,
+                              lambda request: requests.append(dict(request)) or self.wake_result(True))
+        relay.source_read_failed("connector-a", attach_failure_pid=12345)
+        relay.source_read_failed("connector-a", attach_failure_pid=12345)
+        relay.source_read_failed("connector-a")
+        self.assertEqual(relay.attach_failure_streak["connector-a"], (None, 0))
+        relay.source_read_failed("connector-a", attach_failure_pid=12345)
+        relay.source_read_failed("connector-a", attach_failure_pid=12345)
+        self.assertFalse(relay.recover_attach_after_failures("connector-a"))
+        relay.source_read_failed("connector-a", attach_failure_pid=12345)
+        self.assertTrue(relay.recover_attach_after_failures("connector-a"))
+        self.assertEqual(requests, [{"op": "ensure-active", "reason": "attach_failure",
+                                    "driver": "qq", "observedPid": 12345}])
+        self.assertFalse(relay.recover_attach_after_failures("connector-a"))
+
+        self.db.execute(
+            "INSERT INTO command_ledger(connector_id,idempotency_key,fingerprint,state,result,retryable) "
+            "VALUES(?,?,?,?,?,?)",
+            ("connector-a", "sent-unknown", "fingerprint", "done",
+             runtime.compact({"uncertain": True, "error": "device_send_outcome_uncertain"}), 0),
+        )
+        self.db.commit()
+        self.assertFalse(any(request.get("op") == "send" for request in requests))
+
+    def test_attach_streak_does_not_survive_runtime_restart(self):
+        config = self.auto_wake_config()
+        config["connectors"] = config["connectors"][:1]
+        requests = []
+        relay = runtime.Relay(config, self.db,
+                              lambda request: requests.append(dict(request)) or self.wake_result(True))
+        relay.source_read_failed("connector-a", attach_failure_pid=12345)
+        relay.source_read_failed("connector-a", attach_failure_pid=12345)
+        self.assertEqual(relay.attach_failure_streak["connector-a"], (12345, 2))
+        self.db.execute(
+            "UPDATE source_recovery SET consecutive_failures=153 WHERE connector_id=?",
+            ("connector-a",),
+        )
+        self.db.commit()
+        self.db.close()
+        restarted_db = runtime.open_database(self.db_path)
+        try:
+            restarted = runtime.Relay(config, restarted_db,
+                                      lambda request: requests.append(dict(request)) or self.wake_result(True))
+            self.assertEqual(restarted.source_failures["connector-a"], 153)
+            self.assertEqual(restarted.attach_failure_streak["connector-a"], (None, 0))
+            self.assertFalse(restarted.recover_attach_after_failures("connector-a"))
+            restarted.source_read_failed("connector-a", attach_failure_pid=12345)
+            restarted.source_read_failed("connector-a", attach_failure_pid=12345)
+            self.assertFalse(restarted.recover_attach_after_failures("connector-a"))
+        finally:
+            restarted_db.close()
+            self.db = sqlite3.connect(self.db_path)
+
+    def test_source_read_failure_logs_only_allowlisted_fields(self):
+        relay = runtime.Relay(self.config, self.db, lambda _request: (_ for _ in ()).throw(
+            RuntimeError("private-profile body target secret")),
+            lambda *_args: {"ok": True, "commands": []})
+        captured = io.StringIO()
+        with redirect_stderr(captured):
+            relay.pass_once()
+        records = [json.loads(line) for line in captured.getvalue().splitlines()]
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(set(record), {
+            "observedAt", "driver", "consecutiveFailures", "classification", "processId",
+        })
+        self.assertEqual(record["driver"], "qq")
+        self.assertEqual(record["consecutiveFailures"], 1)
+        self.assertEqual(record["classification"], "source_unclassified")
+        self.assertIsNone(record["processId"])
+        self.assertTrue(record["observedAt"].endswith("Z"))
+        self.assertNotIn("private-profile", captured.getvalue())
+        self.assertNotIn("target", captured.getvalue())
+        self.assertNotIn("secret", captured.getvalue())
+
+    def test_source_read_failure_logs_explicit_attach_only_after_strict_validation(self):
+        valid = {"stage": "attach", "errorCode": "timeout",
+                 "dispatch": "not_started", "processId": 12345}
+        relay = runtime.Relay(self.config, self.db, lambda _request: {
+            "ok": False, "sourceReadOk": False,
+            "nativeFailure": {**valid, "detail": "private target body"},
+        }, lambda *_args: {"ok": True, "commands": []})
+        captured = io.StringIO()
+        with redirect_stderr(captured):
+            relay.pass_once()
+        record = json.loads(captured.getvalue())
+        self.assertEqual(set(record), {
+            "observedAt", "driver", "consecutiveFailures", "classification", "processId",
+        })
+        self.assertEqual(record["classification"], "source_unclassified")
+        self.assertIsNone(record["processId"])
+        self.assertNotIn("private", captured.getvalue())
+
+        valid_db = runtime.open_database(os.path.join(self.temp.name, "valid.sqlite3"))
+        try:
+            relay = runtime.Relay(self.config, valid_db, lambda _request: {
+                "ok": False, "sourceReadOk": False, "nativeFailure": valid,
+            }, lambda *_args: {"ok": True, "commands": []})
+            captured = io.StringIO()
+            with redirect_stderr(captured):
+                relay.pass_once()
+            record = json.loads(captured.getvalue())
+            self.assertEqual(record["classification"], "explicit_attach")
+            self.assertEqual(record["processId"], 12345)
+        finally:
+            valid_db.close()
+
+    def test_stderr_failure_does_not_interrupt_attach_recovery_threshold(self):
+        config = self.auto_wake_config()
+        config["connectors"] = config["connectors"][:1]
+        requests = []
+        valid_failure = {"stage": "attach", "errorCode": "timeout",
+                         "dispatch": "not_started", "processId": 12345}
+
+        def adapter(request):
+            requests.append(dict(request))
+            if request["op"] == "ensure-active":
+                return self.wake_result(True)
+            return {"ok": False, "sourceReadOk": False, "nativeFailure": valid_failure}
+
+        relay = runtime.Relay(config, self.db, adapter,
+                              lambda *_args: {"ok": True, "commands": []})
+        relay.wake_ready = True
+        relay.wake_readiness_established = True
+        relay.wake_ready_at = 100
+        relay.last_wake_attempt = 0
+        relay.last_logged_wake_state = (True, False, "ready")
+        relay.source_settle_until["connector-a"] = 0
+
+        class BrokenStderr:
+            def write(self, _value):
+                raise OSError("stream unavailable")
+
+            def flush(self):
+                raise OSError("stream unavailable")
+
+        now = [100.0]
+        with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]), patch.object(
+                runtime.time, "time", side_effect=lambda: now[0]), patch.object(
+                    runtime.sys, "stderr", BrokenStderr()):
+            for scan_time in (100.0, 116.0, 147.0):
+                now[0] = scan_time
+                relay.pass_once()
+
+        recoveries = [request for request in requests
+                      if request.get("op") == "ensure-active" and request.get("reason")]
+        self.assertEqual(recoveries, [{"op": "ensure-active", "reason": "attach_failure",
+                                      "driver": "qq", "observedPid": 12345}])
+        self.assertEqual(relay.attach_failure_streak["connector-a"], (12345, 3))
+
+    def test_backpressure_skip_does_not_refresh_scan_health_or_clear_forced_scan(self):
+        relay = runtime.Relay(self.auto_wake_config(), self.db,
+                              lambda _request: self.wake_result(True),
+                              lambda *_args: {"ok": True, "commands": []})
+        relay.wake_ready = True
+        relay.wake_readiness_established = True
+        relay.wake_ready_at = 1000
+        relay.last_wake_attempt = 990
+        relay.health.update({"connector-a": True, "connector-b": True})
+        relay.last_scan.update({"connector-a": 990, "connector-b": 990})
+        relay.wake_scan_pending = set(relay.connector_by_id)
+        relay.wake_scan_failures["connector-a"] = 2
+        relay.wake_scan_retry_at["connector-a"] = 5000
+        with patch.object(runtime.time, "monotonic", return_value=1000), patch.object(
+            runtime.time, "time", return_value=1000
+        ), patch.object(relay, "scan_profile", return_value=None) as scan:
+            relay.pass_once()
+        self.assertEqual(scan.call_count, 2)
+        self.assertEqual(relay.last_scan, {"connector-a": 990, "connector-b": 990})
+        self.assertEqual(relay.health, {"connector-a": True, "connector-b": True})
+        self.assertEqual(relay.wake_scan_failures["connector-a"], 2)
+        self.assertEqual(relay.wake_scan_pending, {"connector-a", "connector-b"})
+
+    def test_startup_settle_suppresses_scan_and_command_poll(self):
+        config = self.auto_wake_config()
+        http_calls = []
+        relay = runtime.Relay(config, self.db,
+                              lambda _request: self.wake_result(True),
+                              lambda method, path, payload=None: http_calls.append((method, path)) or
+                                  {"ok": True, "commands": []})
+        relay.ensure_active = lambda: True
+        relay.wake_ready = True
+        relay.wake_readiness_established = True
+        relay.wake_ready_at = 1000
+        relay.health.update({connector_id: True for connector_id in relay.connector_by_id})
+        relay.last_scan.update({connector_id: 990 for connector_id in relay.connector_by_id})
+        relay.source_settle_until.update({connector_id: 1100 for connector_id in relay.connector_by_id})
+        with patch.object(runtime.time, "monotonic", return_value=1000), patch.object(
+            runtime.time, "time", return_value=1000
+        ), patch.object(relay, "scan_profile") as scan:
+            relay.pass_once()
+        scan.assert_not_called()
+        self.assertFalse(any("/commands?" in path for _method, path in http_calls))
+
     def test_sender_avatar_sync_failure_preserves_cursor_and_outbox(self):
-        result = {"ok": True, "health": "online", "cursor": {"next": "2"},
+        result = {"ok": True, "sourceReadOk": True, "health": "online", "cursor": {"next": "2"},
                   "messages": [self.event("new-1")], "senderAvatars": [{"senderId": "sender-1"}]}
         relay = runtime.Relay(self.config, self.db, lambda _: result)
         with patch.object(runtime, "sync_profiles", return_value=0), patch.object(
@@ -97,7 +465,7 @@ class DeviceRuntimeTests(unittest.TestCase):
     def test_offline_spool_survives_restart_and_response_loss_reuses_event_id(self):
         calls = []
         def scan(_request):
-            return {"ok": True, "health": "online", "cursor": {"next": "2"},
+            return {"ok": True, "sourceReadOk": True, "health": "online", "cursor": {"next": "2"},
                     "messages": [self.event("stable-1")]}
         def lose_response(method, path, payload=None):
             calls.append((method, path, payload))
@@ -132,7 +500,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.config["outboxMaxBytes"] = 99
         calls = []
         relay = runtime.Relay(self.config, self.db,
-                              lambda req: calls.append(req) or {"ok": True, "health": "online",
+                              lambda req: calls.append(req) or {"ok": True, "sourceReadOk": True, "health": "online",
                                   "cursor": {"next": "new"}, "messages": [self.event("next")]},
                               lambda *args: {"ok": True})
         self.assertFalse(relay.scan_profile("primary"))
@@ -144,7 +512,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         relay = runtime.Relay(
             self.config, self.db,
             lambda request: captured.append(request) or {
-                "ok": True, "health": "offline", "active": False,
+                "ok": True, "sourceReadOk": True, "health": "online", "active": False,
                 "cursor": None, "messages": [],
             },
         )
@@ -155,7 +523,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(captured[1]["driver"], "wechat")
 
     def test_default_relay_adapter_uses_scan_operation_deadline(self):
-        result = {"ok": True, "health": "offline", "active": False,
+        result = {"ok": True, "sourceReadOk": True, "health": "online", "active": False,
                   "cursor": None, "messages": []}
         with patch.object(runtime, "run_adapter", return_value=result) as run:
             relay = runtime.Relay(self.config, self.db)
@@ -193,7 +561,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.db.execute("INSERT INTO cursors(connector_id,profile,value) VALUES('connector-a','primary',?)", (old,))
         self.db.commit()
         relay = runtime.Relay(self.config, self.db,
-                              lambda req: {"ok": True, "health": "online", "cursor": {"next": "new"},
+                              lambda req: {"ok": True, "sourceReadOk": True, "health": "online", "cursor": {"next": "new"},
                                            "messages": [dict(self.event("file"), attachments=[{"externalId": "f"}])]},
                               lambda *args: {"ok": True})
         with self.assertRaisesRegex(RuntimeError, "invalid_staging_key"):
@@ -215,7 +583,7 @@ class DeviceRuntimeTests(unittest.TestCase):
                       body="", attachments=[attachment])
         relay = runtime.Relay(self.config, self.db,
                               lambda request: request_seen.append(request) or {
-                                  "ok": True, "health": "online", "cursor": {"n": 1},
+                                  "ok": True, "sourceReadOk": True, "health": "online", "cursor": {"n": 1},
                                   "messages": [event]},
                               lambda *args: {"ok": True, "received": 1})
         relay.media_directory = media_root
@@ -250,7 +618,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         enriched = dict(placeholder, contentType="mixed", attachments=[attachment])
         current = {"event": placeholder, "cursor": {"n": 1}}
         relay = runtime.Relay(self.config, self.db,
-                              lambda _request: {"ok": True, "health": "online",
+                              lambda _request: {"ok": True, "sourceReadOk": True, "health": "online",
                                   "cursor": current["cursor"], "messages": [current["event"]]},
                               lambda *_args: {"ok": True})
         relay.media_directory = media_root
@@ -285,7 +653,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         enriched = dict(placeholder, contentType="mixed", attachments=[attachment])
         current = {"event": placeholder, "cursor": {"n": 1}}
         relay = runtime.Relay(self.config, self.db,
-                              lambda _request: {"ok": True, "health": "online",
+                              lambda _request: {"ok": True, "sourceReadOk": True, "health": "online",
                                   "cursor": current["cursor"], "messages": [current["event"]]},
                               lambda *_args: {"ok": True})
         relay.media_directory = media_root
@@ -326,7 +694,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         enriched = dict(placeholder, contentType="mixed", attachments=[attachment])
         current = {"event": placeholder, "cursor": {"n": 1}}
         relay = runtime.Relay(self.config, self.db,
-                              lambda _request: {"ok": True, "health": "online",
+                              lambda _request: {"ok": True, "sourceReadOk": True, "health": "online",
                                   "cursor": current["cursor"], "messages": [current["event"]]},
                               lambda *_args: {"ok": True})
         relay.media_directory = media_root
@@ -357,7 +725,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         enriched = dict(placeholder, contentType="mixed", attachments=[attachment])
         current = {"event": placeholder, "cursor": {"n": 1}}
         relay = runtime.Relay(self.config, self.db,
-                              lambda _request: {"ok": True, "health": "online",
+                              lambda _request: {"ok": True, "sourceReadOk": True, "health": "online",
                                   "cursor": current["cursor"], "messages": [current["event"]]},
                               lambda *_args: {"ok": True})
         relay.media_directory = media_root
@@ -439,7 +807,7 @@ class DeviceRuntimeTests(unittest.TestCase):
             "externalId": "file-unsafe", "fileName": "photo.png", "mimeType": "image/png",
             "sizeBytes": 1, "sha256": "0" * 64, "stagingKey": "../escape.png"}])
         relay = runtime.Relay(self.config, self.db,
-                              lambda req: {"ok": True, "health": "online", "cursor": {"n": 1},
+                              lambda req: {"ok": True, "sourceReadOk": True, "health": "online", "cursor": {"n": 1},
                                            "messages": [message]}, lambda *args: {"ok": True})
         relay.media_directory = media_root
         with self.assertRaisesRegex(RuntimeError, "invalid_staging_key"):
@@ -502,7 +870,7 @@ class DeviceRuntimeTests(unittest.TestCase):
                         "BEGIN SELECT RAISE(ABORT, 'disk write failed'); END")
         self.db.commit()
         relay = runtime.Relay(self.config, self.db,
-                              lambda req: {"ok": True, "health": "online", "cursor": {"next": "new"},
+                              lambda req: {"ok": True, "sourceReadOk": True, "health": "online", "cursor": {"next": "new"},
                                            "messages": [self.event("uncommitted")]},
                               lambda *args: {"ok": True})
         with self.assertRaises(sqlite3.IntegrityError):
@@ -519,12 +887,12 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.db.commit()
         invalid = dict(self.event("poison"), senderName=None)
         relay = runtime.Relay(self.config, self.db,
-                              lambda req: {"ok": True, "health": "online", "cursor": {"next": "bad"},
+                              lambda req: {"ok": True, "sourceReadOk": True, "health": "online", "cursor": {"next": "bad"},
                                            "messages": [invalid]}, lambda *args: {"ok": True})
         with self.assertRaisesRegex(RuntimeError, "invalid_event"):
             relay.scan_profile("primary")
         conflict = dict(self.event("stable"), body="different")
-        relay.adapter_call = lambda req: {"ok": True, "health": "online", "cursor": {"next": "bad"},
+        relay.adapter_call = lambda req: {"ok": True, "sourceReadOk": True, "health": "online", "cursor": {"next": "bad"},
                                           "messages": [conflict]}
         with self.assertRaisesRegex(RuntimeError, "event_id_conflict_in_outbox"):
             relay.scan_profile("primary")
@@ -537,7 +905,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         first = self.event("duplicate-id")
         second = dict(first, body="different")
         relay = runtime.Relay(self.config, self.db,
-                              lambda _request: {"ok": True, "health": "online", "cursor": {"next": "new"},
+                              lambda _request: {"ok": True, "sourceReadOk": True, "health": "online", "cursor": {"next": "new"},
                                                 "messages": [first, second]},
                               lambda *_args: {"ok": True})
         with self.assertRaisesRegex(RuntimeError, "event_id_conflict_in_page"):
@@ -550,7 +918,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         expected_size = len(runtime.compact({"connectorId": "connector-a", "messages": [message]}).encode())
         self.config["outboxMaxBytes"] = expected_size
         relay = runtime.Relay(self.config, self.db,
-                              lambda _request: {"ok": True, "health": "online", "cursor": {"next": "new"},
+                              lambda _request: {"ok": True, "sourceReadOk": True, "health": "online", "cursor": {"next": "new"},
                                                 "messages": [message, dict(message)]},
                               lambda *_args: {"ok": True})
         self.assertTrue(relay.scan_profile("primary"))
@@ -567,7 +935,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.db.commit()
         self.config["outboxMaxBytes"] = 100
         relay = runtime.Relay(self.config, self.db,
-                              lambda req: {"ok": True, "health": "online", "cursor": {"next": "new"},
+                              lambda req: {"ok": True, "sourceReadOk": True, "health": "online", "cursor": {"next": "new"},
                                            "messages": [dict(self.event("next"), body="x" * 150)]},
                               lambda *args: {"ok": True})
         self.assertIsNone(relay.scan_profile("primary"))
@@ -578,7 +946,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         requests = []
         relay = runtime.Relay(self.config, self.db,
                               lambda request: requests.append(request) or {
-                                  "ok": True, "health": "online", "active": False,
+                                  "ok": True, "sourceReadOk": True, "health": "online", "active": False,
                                   "cursor": {"next": 1}, "messages": [self.event("one")]},
                               lambda *args: {"ok": True})
         self.assertTrue(relay.scan_profile("primary"))
@@ -598,7 +966,7 @@ class DeviceRuntimeTests(unittest.TestCase):
             for item in source[offset:]:
                 candidate = page + [item]
                 candidate_cursor = offset + len(candidate)
-                envelope = {"ok": True, "health": "online", "active": False,
+                envelope = {"ok": True, "sourceReadOk": True, "health": "online", "active": False,
                             "cursor": candidate_cursor, "messages": candidate}
                 single = runtime.compact({"connectorId": "connector-a", "messages": [item]}).encode("utf-8")
                 if (len(candidate) > request["limit"] or len(single) > request["maxEventBytes"] or
@@ -606,7 +974,7 @@ class DeviceRuntimeTests(unittest.TestCase):
                     break
                 page = candidate
                 next_offset = candidate_cursor
-            return {"ok": True, "health": "online", "active": False,
+            return {"ok": True, "sourceReadOk": True, "health": "online", "active": False,
                     "cursor": next_offset, "messages": page}
         relay = runtime.Relay(self.config, self.db, adapter, lambda *args: {"ok": True})
         relay.scan_profile("primary")
@@ -623,7 +991,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.db.execute("INSERT INTO cursors(connector_id,profile,value) VALUES('connector-a','primary',?)", (old,))
         self.db.commit()
         relay = runtime.Relay(self.config, self.db,
-                              lambda request: {"ok": True, "health": "online", "cursor": {"next": "new"},
+                              lambda request: {"ok": True, "sourceReadOk": True, "health": "online", "cursor": {"next": "new"},
                                   "messages": [], "padding": "x" * (runtime.MAX_SCAN_RESPONSE + 1)},
                               lambda *args: {"ok": True})
         with self.assertRaisesRegex(RuntimeError, "scan_response_too_large"):
@@ -632,7 +1000,7 @@ class DeviceRuntimeTests(unittest.TestCase):
 
     def test_scan_commits_cursor_atomically_with_durable_outbox(self):
         relay = runtime.Relay(self.config, self.db,
-                              lambda req: {"ok": True, "health": "online", "cursor": {"n": 3},
+                              lambda req: {"ok": True, "sourceReadOk": True, "health": "online", "cursor": {"n": 3},
                                            "messages": [self.event("next")]},
                               lambda *args: {"ok": True})
         self.assertTrue(relay.scan_profile("primary"))
@@ -650,7 +1018,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         requests = []
         def adapter(request):
             adapter_profiles.append(request["profile"])
-            return {"ok": True, "health": "online", "cursor": request["profile"],
+            return {"ok": True, "sourceReadOk": True, "health": "online", "cursor": request["profile"],
                     "messages": [self.event(request["profile"])]}
         def http(method, path, payload=None):
             requests.append((method, path, payload))
@@ -784,7 +1152,7 @@ class DeviceRuntimeTests(unittest.TestCase):
             if attachments is not None:
                 event["attachments"] = attachments
             relay.adapter_call = lambda request, item=event: {
-                "ok": True, "health": "online", "cursor": {"next": "new"}, "messages": [item]}
+                "ok": True, "sourceReadOk": True, "health": "online", "cursor": {"next": "new"}, "messages": [item]}
             expected = "invalid_staging_key" if attachments else "invalid_group_text_backup"
             with self.assertRaisesRegex(RuntimeError, expected):
                 relay.scan_profile("primary")
@@ -796,7 +1164,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         calls = []
         relay = runtime.Relay(
             self.config, self.db,
-            lambda request: {"ok": True, "health": "online", "active": False,
+            lambda request: {"ok": True, "sourceReadOk": True, "health": "online", "active": False,
                              "cursor": None, "messages": []},
             lambda method, path, payload=None: calls.append((method, path, payload)) or
                 ({"ok": True, "commands": []} if path.endswith("/commands") else {"ok": True}))
@@ -1044,6 +1412,28 @@ class DeviceRuntimeTests(unittest.TestCase):
         time.sleep(1)
         self.assertFalse(os.path.exists(marker))
 
+    def test_adapter_invalid_json_kills_remaining_group_children(self):
+        script = os.path.join(self.temp.name, "adapter")
+        marker = os.path.join(self.temp.name, "survived-invalid-json")
+        started = os.path.join(self.temp.name, "child-started")
+        child = "open(" + repr(started) + ", 'w').close();import time;time.sleep(.8);open(" + repr(marker) + ", 'w').close()"
+        compile(child, "<adapter-child>", "exec")
+        script_text = ("#!/usr/bin/env python3\nimport os,subprocess,sys,time\n"
+                       "subprocess.Popen([sys.executable, '-c', " + repr(child) + "], "
+                       "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                       "while not os.path.exists(" + repr(started) + "): time.sleep(.01)\n"
+                       "sys.stdout.close()\n")
+        compile(script_text, script, "exec")
+        if os.name != "posix":
+            self.skipTest("adapter process groups are POSIX-only")
+        with open(script, "w", encoding="utf-8") as output:
+            output.write(script_text)
+        os.chmod(script, 0o700)
+        with self.assertRaises(json.JSONDecodeError):
+            runtime.run_adapter(script, {"input": "x"}, timeout=2)
+        time.sleep(1)
+        self.assertFalse(os.path.exists(marker))
+
     def test_register_failure_does_not_starve_other_connector(self):
         self.config["connectors"] = [
             {"id": "connector-a", "token": "a" * 40, "profile": "primary",
@@ -1076,7 +1466,7 @@ class DeviceRuntimeTests(unittest.TestCase):
             scanned.append(relay.connector)
             if relay.connector == "connector-a":
                 raise OSError("adapter offline")
-            return {"ok": True, "health": "online", "cursor": None, "messages": []}
+            return {"ok": True, "sourceReadOk": True, "health": "online", "cursor": None, "messages": []}
         relay = runtime.Relay(self.config, self.db, adapter, lambda *args: {"ok": True, "commands": []})
         with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]):
             relay.pass_once()
@@ -1091,7 +1481,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         now = [1000.0]
         def adapter(request):
             scans.append(request)
-            return {"ok": True, "health": "online", "active": False, "cursor": None, "messages": []}
+            return {"ok": True, "sourceReadOk": True, "health": "online", "active": False, "cursor": None, "messages": []}
         def http(method, path, payload=None):
             calls.append((method, path, payload))
             return {"ok": True, "commands": []}
@@ -1219,7 +1609,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         now = [1000.0]
 
         def adapter(_request):
-            return {"ok": True, "health": "online", "active": False,
+            return {"ok": True, "sourceReadOk": True, "health": "online", "active": False,
                     "cursor": None, "messages": []}
 
         def http(method, path, payload=None):
@@ -1254,11 +1644,11 @@ class DeviceRuntimeTests(unittest.TestCase):
         scans = []
         now = [1000.0]
         results = [
-            {"ok": True, "health": "online", "active": False, "more": True,
+            {"ok": True, "sourceReadOk": True, "health": "online", "active": False, "more": True,
              "cursor": None, "messages": []},
-            {"ok": True, "health": "online", "active": False,
+            {"ok": True, "sourceReadOk": True, "health": "online", "active": False,
              "cursor": None, "messages": []},
-            {"ok": True, "health": "online", "active": True, "more": False,
+            {"ok": True, "sourceReadOk": True, "health": "online", "active": True, "more": False,
              "cursor": None, "messages": []},
         ]
         relay = runtime.Relay(
@@ -1286,7 +1676,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         scans = []
         relay = runtime.Relay(self.config, self.db,
                               lambda request: scans.append(request) or {
-                                  "ok": True, "health": "online", "active": False,
+                                  "ok": True, "sourceReadOk": True, "health": "online", "active": False,
                                   "cursor": None, "messages": []},
                               lambda *args: {"ok": True, "commands": []})
         with patch.object(runtime.time, "monotonic", return_value=0):
@@ -1338,7 +1728,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         config["autoWake"] = True
         config["connectors"] = [
             {**self.config["connectors"][0], "kind": "qq"},
-            {"id": "connector-b", "token": "y" * 40, "kind": "wechat",
+            {"id": "connector-b", "token": "y" * 40, "kind": "qq",
              "accountLabel": "test", "displayName": "device", "profile": "secondary"},
         ]
         return config
@@ -1356,8 +1746,9 @@ class DeviceRuntimeTests(unittest.TestCase):
             self.assertTrue(relay.ensure_active())
         with patch.object(runtime.time, "monotonic", return_value=160):
             self.assertTrue(relay.ensure_active())
-        self.assertEqual(calls, [{"op": "ensure-active"}, {"op": "ensure-active"}])
-        self.assertEqual(runtime.adapter_timeout_for_request({"op": "ensure-active"}), 20)
+        self.assertEqual(calls, [{"op": "ensure-active", "driver": "qq"},
+                                 {"op": "ensure-active", "driver": "qq"}])
+        self.assertEqual(runtime.adapter_timeout_for_request({"op": "ensure-active"}), 55)
 
     def test_auto_wake_invalid_and_exception_results_fail_closed(self):
         responses = [
@@ -1443,7 +1834,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.db.commit()
         with patch.object(runtime.time, "monotonic", return_value=1000):
             relay.pass_once()
-        self.assertEqual(adapter_calls, [{"op": "ensure-active"}])
+        self.assertEqual(adapter_calls, [{"op": "ensure-active", "driver": "qq"}])
         self.assertFalse(any("/commands?" in path for _, path in http_calls))
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
         self.assertEqual(sum(path.endswith("/events") for _, path in http_calls), 1)
@@ -1466,7 +1857,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.db.commit()
         with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]):
             relay.pass_once()
-        self.assertEqual(adapter_calls, [{"op": "ensure-active"}])
+        self.assertEqual(adapter_calls, [{"op": "ensure-active", "driver": "qq"}])
         self.assertEqual(sum(path.endswith("/events") for path in http_calls), 1)
         self.assertFalse(any("/commands?" in path for path in http_calls))
         self.assertEqual(sum(path.endswith("/heartbeat") for path in http_calls), 2)
@@ -1474,11 +1865,12 @@ class DeviceRuntimeTests(unittest.TestCase):
     def test_auto_wake_recovery_forces_fresh_scan_without_clearing_cloud_backoff(self):
         scans = []
         http_calls = []
+        now = [1000.0]
         def adapter(req):
             if req["op"] == "ensure-active":
                 return self.wake_result(True)
             scans.append(req)
-            return {"ok": True, "health": "online", "cursor": None, "messages": []}
+            return {"ok": True, "sourceReadOk": True, "health": "online", "cursor": None, "messages": []}
         relay = runtime.Relay(self.auto_wake_config(), self.db, adapter,
                               lambda method, path, payload=None: http_calls.append(path) or {"ok": True})
         relay.wake_ready = False
@@ -1488,24 +1880,32 @@ class DeviceRuntimeTests(unittest.TestCase):
         relay.wake_scan_retry_at["connector-a"] = 5000
         relay.retry_at["connector-a"] = 5000
         relay.failures["connector-a"] = 4
-        with patch.object(runtime.time, "monotonic", return_value=1000):
+        with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]), patch.object(
+            runtime.time, "time", side_effect=lambda: now[0]
+        ):
             relay.pass_once()
-        self.assertEqual([request["driver"] for request in scans], ["qq", "wechat"])
+            self.assertEqual(scans, [])
+            now[0] += 60
+            relay.pass_once()
+        self.assertEqual([request["driver"] for request in scans], ["qq", "qq"])
         self.assertEqual(relay.retry_at["connector-a"], 5000)
         self.assertEqual(relay.failures["connector-a"], 4)
         self.assertTrue(all(request.get("history") is False for request in scans))
 
-    def test_auto_wake_requires_exact_qq_and_wechat_pair(self):
+    def test_auto_wake_accepts_qq_only_and_rejects_mixed_connectors(self):
         config = self.auto_wake_config()
         config["connectors"] = config["connectors"][:1]
-        with self.assertRaisesRegex(ValueError, "auto_wake_requires_qq_and_wechat"):
+        runtime.Relay(config, self.db, lambda _request: {})
+        config = self.auto_wake_config()
+        config["connectors"][1]["kind"] = "wechat"
+        with self.assertRaisesRegex(ValueError, "auto_wake_requires_qq_only"):
             runtime.Relay(config, self.db, lambda _request: {})
 
     def test_auto_wake_omitted_preserves_existing_scan_and_command_behavior(self):
         scans = []
         http_calls = []
         relay = runtime.Relay(self.config, self.db,
-                              lambda req: scans.append(req) or {"ok": True, "health": "online",
+                              lambda req: scans.append(req) or {"ok": True, "sourceReadOk": True, "health": "online",
                                   "cursor": None, "messages": []},
                               lambda method, path, payload=None: http_calls.append(path) or {"ok": True})
         with patch.object(runtime.time, "monotonic", return_value=1000):
