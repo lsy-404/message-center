@@ -8,3 +8,7 @@
 - Recovery remains opt-in with `autoWake`; no force-kill, reboot, respring, cloud changes, or send retries are part of this implementation.
 - CPU scope: public runtime now suppresses repeated scans during the 60-second activation settle window and retains exponential retry backoff; steady-state native conversation discovery frequency remains owned by the private adapter/cache work and was not changed here.
 - Local verification: 100 isolated Python tests pass with one platform-specific skip. Real-device recovery and CPU impact remain unverified and require the coordinating task's authorized live validation.
+- Follow-up review: a prior-success timestamp is not required for failure recovery; the explicit three-failure threshold and durable cooldown are sufficient on fresh installs.
+- Backpressure (`scan_profile` returns `None`) is not source health evidence. It must leave timestamps and retry state unchanged and retain forced scan intent.
+- Both scans and command polling must be gated by the persisted settle deadline after activation/readiness.
+- Private wake safety review covered only commit `7393e62`; live app recovery is not demonstrated by unit tests. Its validated schema and private dispatch use constants, but malformed non-string/unhashable recovery values can currently raise during membership tests before the helper's broad catch.

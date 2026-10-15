@@ -105,11 +105,11 @@ class DeviceRuntimeTests(unittest.TestCase):
         relay = runtime.Relay(config, self.db, adapter,
                               lambda method, path, payload=None: http_calls.append((method, path)) or
                                   {"ok": True, "commands": []})
-        with patch.object(runtime.time, "time", return_value=now[0]):
-            relay.source_read_succeeded("connector-a")
         with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]), patch.object(
             runtime.time, "time", side_effect=lambda: now[0]
         ):
+            relay.pass_once()
+            now[0] += 60
             relay.pass_once()
             now[0] += 15
             relay.pass_once()
@@ -143,7 +143,7 @@ class DeviceRuntimeTests(unittest.TestCase):
                                       lambda request: recovery_calls.append(request) or self.wake_result(False),
                                       lambda *_args: {"ok": True})
             self.assertEqual(restarted.source_failures["connector-a"], 3)
-            self.assertEqual(restarted.source_last_success["connector-a"], 1000.0)
+            self.assertEqual(restarted.source_last_success["connector-a"], 0)
             self.assertGreater(restarted.source_recovery_after["connector-a"], now[0])
             self.assertGreater(restarted.source_settle_until["connector-a"], now[0])
             with patch.object(runtime.time, "time", return_value=1200.0):
@@ -161,6 +161,50 @@ class DeviceRuntimeTests(unittest.TestCase):
         relay.source_read_failed("connector-a")
         self.assertTrue(relay.scan_profile("primary"))
         self.assertEqual(relay.source_failures["connector-a"], 0)
+
+    def test_backpressure_skip_does_not_refresh_scan_health_or_clear_forced_scan(self):
+        relay = runtime.Relay(self.auto_wake_config(), self.db,
+                              lambda _request: self.wake_result(True),
+                              lambda *_args: {"ok": True, "commands": []})
+        relay.wake_ready = True
+        relay.wake_readiness_established = True
+        relay.wake_ready_at = 1000
+        relay.last_wake_attempt = 990
+        relay.health.update({"connector-a": True, "connector-b": True})
+        relay.last_scan.update({"connector-a": 990, "connector-b": 990})
+        relay.wake_scan_pending = set(relay.connector_by_id)
+        relay.wake_scan_failures["connector-a"] = 2
+        relay.wake_scan_retry_at["connector-a"] = 5000
+        with patch.object(runtime.time, "monotonic", return_value=1000), patch.object(
+            runtime.time, "time", return_value=1000
+        ), patch.object(relay, "scan_profile", return_value=None) as scan:
+            relay.pass_once()
+        self.assertEqual(scan.call_count, 2)
+        self.assertEqual(relay.last_scan, {"connector-a": 990, "connector-b": 990})
+        self.assertEqual(relay.health, {"connector-a": True, "connector-b": True})
+        self.assertEqual(relay.wake_scan_failures["connector-a"], 2)
+        self.assertEqual(relay.wake_scan_pending, {"connector-a", "connector-b"})
+
+    def test_startup_settle_suppresses_scan_and_command_poll(self):
+        config = self.auto_wake_config()
+        http_calls = []
+        relay = runtime.Relay(config, self.db,
+                              lambda _request: self.wake_result(True),
+                              lambda method, path, payload=None: http_calls.append((method, path)) or
+                                  {"ok": True, "commands": []})
+        relay.ensure_active = lambda: True
+        relay.wake_ready = True
+        relay.wake_readiness_established = True
+        relay.wake_ready_at = 1000
+        relay.health.update({connector_id: True for connector_id in relay.connector_by_id})
+        relay.last_scan.update({connector_id: 990 for connector_id in relay.connector_by_id})
+        relay.source_settle_until.update({connector_id: 1100 for connector_id in relay.connector_by_id})
+        with patch.object(runtime.time, "monotonic", return_value=1000), patch.object(
+            runtime.time, "time", return_value=1000
+        ), patch.object(relay, "scan_profile") as scan:
+            relay.pass_once()
+        scan.assert_not_called()
+        self.assertFalse(any("/commands?" in path for _method, path in http_calls))
 
     def test_sender_avatar_sync_failure_preserves_cursor_and_outbox(self):
         result = {"ok": True, "health": "online", "cursor": {"next": "2"},
@@ -1563,6 +1607,7 @@ class DeviceRuntimeTests(unittest.TestCase):
     def test_auto_wake_recovery_forces_fresh_scan_without_clearing_cloud_backoff(self):
         scans = []
         http_calls = []
+        now = [1000.0]
         def adapter(req):
             if req["op"] == "ensure-active":
                 return self.wake_result(True)
@@ -1577,7 +1622,12 @@ class DeviceRuntimeTests(unittest.TestCase):
         relay.wake_scan_retry_at["connector-a"] = 5000
         relay.retry_at["connector-a"] = 5000
         relay.failures["connector-a"] = 4
-        with patch.object(runtime.time, "monotonic", return_value=1000):
+        with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]), patch.object(
+            runtime.time, "time", side_effect=lambda: now[0]
+        ):
+            relay.pass_once()
+            self.assertEqual(scans, [])
+            now[0] += 60
             relay.pass_once()
         self.assertEqual([request["driver"] for request in scans], ["qq", "wechat"])
         self.assertEqual(relay.retry_at["connector-a"], 5000)

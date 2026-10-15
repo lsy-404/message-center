@@ -295,6 +295,7 @@ class Relay:
                                {item.get("kind") for item in self.connectors} != {"qq", "wechat"}):
             raise ValueError("auto_wake_requires_qq_and_wechat")
         self.wake_ready = not self.auto_wake
+        self.wake_readiness_established = not self.auto_wake
         self.last_wake_attempt = float("-inf")
         self.wake_ready_at = float("-inf")
         self.last_logged_wake_state = None
@@ -311,6 +312,7 @@ class Relay:
                                       for item in self.connectors}
         self.source_settle_until = {item["id"]: recovery_rows.get(item["id"], (0, 0, 0, 0))[3]
                                     for item in self.connectors}
+        self.source_state_durable = {item["id"]: True for item in self.connectors}
         self.connector = self.connectors[0]["id"]
         self.health = {item["id"]: False for item in self.connectors}
         self.last_scan = {item["id"]: float("-inf") for item in self.connectors}
@@ -349,20 +351,29 @@ class Relay:
         self.retry_at[connector_id] = 0
 
     def persist_source_state(self, connector_id):
-        self.db.execute(
-            "INSERT INTO source_recovery(connector_id,consecutive_failures,last_success_at,retry_after,settle_until) "
-            "VALUES(?,?,?,?,?) ON CONFLICT(connector_id) DO UPDATE SET "
-            "consecutive_failures=excluded.consecutive_failures,last_success_at=excluded.last_success_at,"
-            "retry_after=excluded.retry_after,"
-            "settle_until=excluded.settle_until",
-            (connector_id, self.source_failures[connector_id], self.source_last_success[connector_id],
-             self.source_recovery_after[connector_id], self.source_settle_until[connector_id]),
-        )
-        self.db.commit()
+        try:
+            self.db.execute(
+                "INSERT INTO source_recovery(connector_id,consecutive_failures,last_success_at,retry_after,settle_until) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(connector_id) DO UPDATE SET "
+                "consecutive_failures=excluded.consecutive_failures,last_success_at=excluded.last_success_at,"
+                "retry_after=excluded.retry_after,settle_until=excluded.settle_until",
+                (connector_id, self.source_failures[connector_id], self.source_last_success[connector_id],
+                 self.source_recovery_after[connector_id], self.source_settle_until[connector_id]),
+            )
+            self.db.commit()
+        except sqlite3.Error:
+            self.source_state_durable[connector_id] = False
+            try:
+                self.db.rollback()
+            except sqlite3.Error:
+                pass
+            return False
+        self.source_state_durable[connector_id] = True
+        return True
 
     def source_read_failed(self, connector_id):
         self.source_failures[connector_id] += 1
-        self.persist_source_state(connector_id)
+        return self.persist_source_state(connector_id)
 
     def source_read_succeeded(self, connector_id):
         self.source_failures[connector_id] = 0
@@ -372,13 +383,14 @@ class Relay:
     def recover_source_after_failures(self, connector_id):
         now = time.time()
         if (not self.auto_wake
-                or self.source_last_success[connector_id] <= 0
+                or not self.source_state_durable[connector_id]
                 or self.source_failures[connector_id] < SOURCE_RECOVERY_FAILURE_THRESHOLD
                 or now < self.source_recovery_after[connector_id]
                 or now < self.source_settle_until[connector_id]):
             return False
         self.source_recovery_after[connector_id] = now + SOURCE_RECOVERY_COOLDOWN
-        self.persist_source_state(connector_id)
+        if not self.persist_source_state(connector_id):
+            return False
         self.health[connector_id] = False
         try:
             result = self.ensure_active(recovery_driver=self.connector_by_id[connector_id].get("kind"))
@@ -716,6 +728,13 @@ class Relay:
             self.wake_ready_at = time.monotonic()
             if self.wake_ready and not was_ready:
                 self.wake_scan_pending = set(self.connector_by_id)
+                if not self.wake_readiness_established:
+                    self.wake_readiness_established = True
+                    settle_until = time.time() + SOURCE_STARTUP_SETTLE
+                    for connector_id in self.connector_by_id:
+                        self.health[connector_id] = False
+                        self.source_settle_until[connector_id] = settle_until
+                        self.persist_source_state(connector_id)
             if result["attempted"]:
                 settle_until = time.time() + SOURCE_STARTUP_SETTLE
                 for connector_id in self.connector_by_id:
@@ -1024,20 +1043,26 @@ class Relay:
             if (connector_id not in pending_connectors and scan_allowed and scan_retry_allowed and
                     time.time() >= self.source_settle_until[connector_id] and
                     (force_scan or scan_due)):
+                backpressured = False
                 try:
-                    self.health[connector_id] = self.scan_profile(profile)
-                    self.last_scan[connector_id] = time.monotonic()
-                    if self.auto_wake:
-                        self.wake_scan_succeeded(connector_id)
+                    scan_health = self.scan_profile(profile)
+                    if scan_health is None:
+                        backpressured = True
                     else:
-                        self.succeeded(connector_id)
+                        self.health[connector_id] = scan_health
+                        self.last_scan[connector_id] = time.monotonic()
+                        if self.auto_wake:
+                            self.wake_scan_succeeded(connector_id)
+                        else:
+                            self.succeeded(connector_id)
                 except SourceReadError:
                     self.health[connector_id] = False
                     self.last_scan[connector_id] = time.monotonic() - self.scan_interval[connector_id]
-                    self.source_read_failed(connector_id)
+                    source_state_saved = self.source_read_failed(connector_id)
                     if self.auto_wake:
                         self.wake_scan_failed(connector_id)
-                        self.recover_source_after_failures(connector_id)
+                        if source_state_saved:
+                            self.recover_source_after_failures(connector_id)
                     else:
                         self.failed(connector_id)
                 except Exception:
@@ -1048,7 +1073,7 @@ class Relay:
                     else:
                         self.failed(connector_id)
                 finally:
-                    if force_scan:
+                    if force_scan and not backpressured:
                         self.wake_scan_pending.discard(connector_id)
                     self.cleanup_unreferenced_media()
             if time.monotonic() >= self.heartbeat_retry_at[connector_id]:
@@ -1071,6 +1096,7 @@ class Relay:
             ready = self.wake_readiness_current()
             if (not ready or connector.get("receiveOnly") is True or not self.eligible(connector_id) or
                     not self.health.get(connector_id) or
+                    time.time() < self.source_settle_until[connector_id] or
                     time.monotonic() - self.last_scan[connector_id] > self.scan_interval[connector_id] + 30):
                 continue
             path = "/api/connectors/commands?connectorId=" + urllib.parse.quote(self.connector, safe="") + "&limit=1"
