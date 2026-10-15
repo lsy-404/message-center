@@ -3,6 +3,7 @@
 
 | 编号 | 任务名称 | 任务描述 | 变更动机 | 状态 |
 | :--: | :-- | :-- | :-- | :-- |
+| 042 | [Feature] AI访问规则与消息标记 | 为消息加内部数字标记（AI/人发送、人/AI 已读、无指令权限），按会话与接入两级配置 AI 可见、推送处理、接受指令、发送人指令权限与回复 | 让 AI 代收代发的范围可控、可见，并区分人与 AI 的发送和阅读 | ✅ 本地验证通过；生产迁移与实机未验证 |
 | 041 | [Feature] 收件箱外观与AI状态 | 重做收件箱视觉层级与图标，显示未读、渠道色标、AI 代发与 AI 已读状态，渲染 QQ/微信引用与小程序等卡片，并补充语义与机器可读标记 | 本人需要快速扫读信息，AI 代收代发的结果需要一眼可见，页面同时供浏览器中的 AI 读取 | ✅ 本地验证通过；Safari/iPad 实机未验证 |
 | 038 | [BugFix] wake-pipe-reliability | Retry transient nonblocking adapter-pipe readiness races and categorize redacted wake failures | Avoid losing bounded wake attempts to EAGAIN and make adapter failures diagnosable without leaking private details | ✅ Locally verified |
 | 039 | [BugFix] source-health-recovery | Recover bounded repeated native source read failures without cursor inactivity inference or launch loops | Improve device collection stability while keeping source reads, activation retries, and send safety bounded | 🔄 In progress |

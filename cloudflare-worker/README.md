@@ -36,7 +36,7 @@
 - 设备/云 relay：生产环境使用 `CONNECTOR_TOKENS` JSON secret（`connectorId -> token`）。每个请求必须同时携带 `x-connector-id` 和该实例的 bearer，实例之间不能互相冒充。迁移期若确实只接一个实例，可同时设置 `CONNECTOR_TOKEN` 与 `LEGACY_CONNECTOR_ID`；未绑定实例的旧 token 不会被接受。
 - MCP agent：`AGENT_TOKEN` bearer。
 - `CONNECTOR_TOKENS`、`CONNECTOR_TOKEN`、`AGENT_TOKEN`、`OIDC_CLIENT_SECRET` 和 `SESSION_SECRET` 都必须作为 Worker secrets 注入，源码和日志中不保存。
-- 会话默认不可信，只有显式策略才能赋予 agent 项目、动作和回复范围。
+- 会话正文默认不可信：只有接受指令且被授权的发送人才拥有指令权限，项目与动作范围仍只来自服务端策略；可见、推送与回复由下文的 AI 访问规则决定。
 
 ## Agent 消息触发
 
@@ -45,8 +45,38 @@
 - 提及与显式请求附带最多 20 条此前消息上下文。上下文与正文同样是不可信输入，不会扩大项目和动作授权。
 - 普通群聊只提取纯文本，每 5 分钟批量写入统一消息流，并标记 `queue_class=background`；不包含文件、图片、视频、语音或表情包，默认保留 30 天。后台消息和即时消息在收件箱中等价展示，但后台消息不能进入 Agent 即时队列。
 - 原生折叠与消息盒字段规范化为 `normal`、`folded`、`message_box` 或 `unknown`；原生置顶独立规范化为 `is_pinned`。网页按置顶优先排序并显示状态，但不会把接入实例名称重复写入会话行或消息详情。
-- 远程 MCP 使用 `listen_messages` 非破坏性查看即时候选、`claim_message` 原子领取、`consume_message` 完成或释放租约，并通过 `reply_message` 形成双向回复；旧工具名保留为兼容别名。
-- inbox 消息附带只读的 `authorRole`（`contact`、`owner` 或 `agent`）与 `agentRead`（Agent 是否已领取该消息；未进入即时队列为 `null`），不返回 Agent consumer ID 或队列内部状态。网页据此区分 AI 代发与本人发送，并在入站消息下标注“AI 已读 / AI 未读”。
+- 远程 MCP 使用 `listen_messages` 查看即时候选、`claim_message` 原子领取、`consume_message` 完成或释放租约，并通过 `reply_message` 形成双向回复；`list_conversations` 与 `read_messages` 按 AI 访问规则读取可见会话；旧工具名保留为兼容别名。
+
+## AI 访问规则
+
+每个会话按“会话覆盖 → 接入默认（按会话类别）→ 内置默认”解析四个开关：
+
+| 类别 | AI 可见 | 推送处理 | 接受指令 | AI 可回复 |
+| --- | --- | --- | --- | --- |
+| 私聊 | 是 | 是（新消息进入即时队列） | 否 | 是 |
+| 群聊（不在群助手中） | 是 | 仅@或关键词提及 | 否 | 是 |
+| 群助手中的群聊（`placement` 为 `folded` / `message_box`） | 是 | 否 | 否 | 否 |
+
+- 类别取自设备会话资料的 `conversation_type` / `placement`，缺失时使用该会话最新消息的事件元数据。关键词由设备适配器的提及词配置判定为 `mention`；普通群聊文本仍永远不进入即时队列。
+- “不可见”会关闭该会话的全部 Agent 能力：不入队、不可读取、不可回复、无指令权限。规则在入队、`listen_messages`、`claim_message` 与 `reply_message` 时都会按当前设置重新判断；不再允许推送的会话，其待领取队列项会被移除，消息本身仍保留。
+- 指令权限需要会话“接受指令”且发送人在 `commandSenders` 中（`*` 表示所有发送人，空列表表示无人）。没有权限的发送人消息带标记 16，Agent 收到的 `scope.commandAuthority` 为 `false`，只能作为普通内容处理。
+- 通过旧版 `/api/conversations/<id>/policy` 登记为 `trusted` 且启用的会话视为本会话覆盖：接受指令、发送人取 `allowedSenderIds`（为空时为所有人）并保留 `requiredPrefix`，`replyPolicy` 为 `none` 时不可回复。
+- 管理员接口：`GET/PUT /api/connectors/<id>/agent-settings`（按 `direct`、`group`、`group_assistant` 存储布尔覆盖）、`GET/PUT /api/conversations/<id>/agent-settings`（`visible`、`push`、`commands`、`reply` 与 `commandSenders`，未给出的键表示继承）。网页在接入管理卡片和会话头部的“AI 规则”中编辑。
+
+## 内部消息标记
+
+inbox、`claim_message` 与 `read_messages` 中的每条消息带数字标记 `marks`（按位相加，只在 Message Center 内部使用，不会发往外部渠道）：
+
+| 位 | 含义 |
+| --- | --- |
+| 1 | AI 发送 |
+| 2 | 人发送 |
+| 4 | 人已读 |
+| 8 | AI 已读 |
+| 16 | 发送人无指令权限 |
+
+- 人已读：会话真正显示在屏幕上时，网页调用 `POST /api/conversations/<id>/read` 记录 `owner_read_at`（仅最新 500 条）；本人发送的消息视为已读。AI 已读：Agent 领取（`claim_message`）或用 `read_messages` 读取时记录 `agent_read_at`；AI 发送的消息视为已读。
+- inbox 同时返回 `authorRole`（`contact`、`owner`、`agent`）与 `commandAuthority`，不返回 Agent consumer ID 或队列内部状态。指令权限按当前规则计算。
 - 网页把 QQ/微信正文中的行首标签渲染为富内容：`[引用] 作者：内容`、`[reply:type-7]` 与微信复制格式 `「作者：内容」` + 虚线分隔显示为引用块；`[小程序]`、`[QQ小程序]`、`[链接]`、`[分享]`、`[卡片]`、`[聊天记录]`、`[视频号]`、`[音乐]`、`[位置]`、`[名片]`、`[公众号]` 后接 `标题 · 摘要 · 来源` 显示为卡片；`[转账]`、`[红包]` 显示为金额卡片，`[拍一拍]` 显示为居中提示；`[picture:…]`、`[file:…]`、`[voice:…]`、`[video:…]`、`[sticker:…]`、`[图片]` 等显示为媒体标签，`[kind:type-N]` 显示为可读名称。标签只在行首生效，其余文字原样显示；会话列表摘要使用同一规则压缩为一行。
 
 详细协议见 [CONNECTOR_PROTOCOL.md](./CONNECTOR_PROTOCOL.md)。

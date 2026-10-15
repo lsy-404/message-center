@@ -25,6 +25,7 @@ async function main() {
       lastMessageAt: new Date().toISOString(),
       connectorState: 'online',
       capabilities: ['receive_text'],
+      agentAccess: { category: 'direct', visible: true, push: true, commands: index === 0, reply: true },
     }))
     const payload = {
       ok: true,
@@ -41,9 +42,9 @@ async function main() {
         { id: 'failed-message', direction: 'outbound', senderName: 'Bob Lee', body: '失败消息', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'failed', attachments: [] },
         { id: 'uncertain-message', direction: 'outbound', senderName: 'Bob Lee', body: '待确认消息', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'uncertain', attachments: [] },
         { id: 'delivered-message', direction: 'outbound', senderName: 'Bob Lee', body: '已发送消息', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'delivered', attachments: [] },
-        { id: 'inbound-state-message', direction: 'inbound', senderName: '张三', body: '入站消息', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'queued', authorRole: 'contact', agentRead: true, attachments: [] },
-        { id: 'agent-message', direction: 'outbound', senderName: 'Agent', body: '代理回复', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'delivered', authorRole: 'agent', attachments: [] },
-        { id: 'agent-unread-message', direction: 'inbound', senderName: '张三', body: '「李四：原文」\n- - - - - - - - - - - - - - -\n回复内容\n[小程序] 腾讯文档 · 排期表 · 腾讯文档', contentType: 'text', occurredAt: new Date().toISOString(), authorRole: 'contact', agentRead: false, attachments: [] },
+        { id: 'inbound-state-message', direction: 'inbound', senderName: '张三', body: '入站消息', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'queued', authorRole: 'contact', marks: 4 | 8 | 16, commandAuthority: false, attachments: [] },
+        { id: 'agent-message', direction: 'outbound', senderName: 'Agent', body: '代理回复', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'delivered', authorRole: 'agent', marks: 1 | 8, attachments: [] },
+        { id: 'agent-unread-message', direction: 'inbound', senderName: '张三', body: '「李四：原文」\n- - - - - - - - - - - - - - -\n回复内容\n[小程序] 腾讯文档 · 排期表 · 腾讯文档', contentType: 'text', occurredAt: new Date().toISOString(), authorRole: 'contact', marks: 16, commandAuthority: false, attachments: [] },
       ],
     }
     let inboxRequestCount = 0
@@ -55,6 +56,24 @@ async function main() {
         response.messages.find((message) => message.id === 'pending-message').deliveryState = 'delivered'
       }
       return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(response) })
+    })
+    const readRequests = []
+    await page.route('**/api/conversations/*/read', (route) => {
+      readRequests.push({ url: route.request().url(), body: JSON.parse(route.request().postData() || '{}') })
+      return route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true,"marked":1}' })
+    })
+    const settingsWrites = []
+    await page.route('**/api/conversations/*/agent-settings', (route) => {
+      if (route.request().method() === 'PUT') settingsWrites.push(JSON.parse(route.request().postData()))
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+        ok: true, category: 'direct', settings: { commands: true, commandSenders: ['zhang'] },
+        inherited: { visible: true, push: true, commands: false, reply: true },
+        configured: { visible: true, push: true, commands: true, reply: true },
+        effective: { category: 'direct', visible: true, push: true, commands: true, reply: true },
+        sources: { visible: 'default', push: 'default', commands: 'conversation', reply: 'default' },
+        commandSenders: ['zhang'], commandPrefix: '',
+        senders: [{ id: 'zhang', name: '张三', lastSeenAt: new Date().toISOString(), messageCount: 3, commandAuthority: true }],
+      }) })
     })
     await page.route('**/api/files/image-loaded', (route) => route.fulfill({
       status: 200,
@@ -84,13 +103,21 @@ async function main() {
     assert.equal(await agentRow.locator('.role-chip').textContent(), '代你发送')
     assert.equal(await agentRow.locator('.message-avatar img').count(), 0, 'agent replies use the agent avatar')
     assert.equal(await page.locator('.message-row[data-message-id="pending-message"] .role-chip').count(), 0, 'owner replies are not labelled as agent replies')
-    assert.equal(await page.locator('.message-row[data-message-id="inbound-state-message"] .message-ai-read').textContent(), 'AI 已读')
+    const markLabels = (row) => row.locator('.mark-tag').allTextContents()
+    assert.deepEqual(await markLabels(page.locator('.message-row[data-message-id="inbound-state-message"]')),
+      ['人已读', 'AI 已读', '无指令权限'])
     const unreadRow = page.locator('.message-row[data-message-id="agent-unread-message"]')
-    assert.equal(await unreadRow.getAttribute('data-ai-read'), 'false')
-    assert.equal(await unreadRow.locator('.message-ai-read').textContent(), 'AI 未读')
-    assert.equal(await page.locator('.message-row[data-message-id="agent-message"] .message-ai-read').count(), 0, 'outbound messages do not show an AI read marker')
-    assert.equal(await page.locator('.message-row[data-message-id="text-message"] .message-ai-read').count(), 0, 'messages outside the agent queue show no AI read marker')
-    assert.match(await page.locator('.ai-unread-chip').textContent(), /AI 未读\s*1/)
+    assert.equal(await unreadRow.getAttribute('data-marks'), '16')
+    assert.equal(await unreadRow.getAttribute('data-command-authority'), 'false')
+    assert.deepEqual(await markLabels(unreadRow), ['人未读', 'AI 未读', '无指令权限'])
+    assert.equal(await unreadRow.locator('.mark-code').textContent(), '#16')
+    assert.match(await unreadRow.locator('.message-marks').getAttribute('title'), /发送人无指令权限\(16\)/)
+    assert.deepEqual(await markLabels(page.locator('.message-row[data-message-id="agent-message"]')), ['AI 发', '人未读'],
+      'agent replies show their sender and owner read state')
+    assert.equal(await page.locator('.message-row[data-message-id="text-message"] .message-marks').count(), 0,
+      'messages without marks show none')
+    assert.equal(readRequests.length, 0, 'the thread is not marked read while it is off screen')
+    assert.match(await page.locator('.ai-rules-button').getAttribute('aria-label'), /主动处理，可回复，接受指令/)
     assert.equal(await unreadRow.locator('.block-quote .quote-author').textContent(), '李四')
     assert.equal(await unreadRow.locator('.block-quote .quote-text').textContent(), '原文')
     assert.equal(await unreadRow.locator('.block-text').textContent(), '回复内容')
@@ -110,6 +137,21 @@ async function main() {
     await page.waitForFunction(() => document.querySelector('.message-row[data-message-id="pending-message"] .message-delivery-state')?.textContent === '已发送')
     await page.waitForFunction(() => document.querySelector('.message-row[data-message-id="image-message"] .message-avatar img')?.dataset.avatarPath === '/avatars/lin-v2.svg')
     await page.locator('.conversation-row').first().click()
+    await page.waitForFunction(() => document.querySelector('.message-row[data-message-id="agent-unread-message"] [data-mark="owner-read"]'))
+    assert.ok(readRequests.length >= 1, 'opening the thread marks it read by the owner')
+    assert.match(readRequests[0].url, /\/api\/conversations\/conv-1\/read$/)
+    assert.ok(Number.isFinite(Date.parse(readRequests[0].body.through)))
+    assert.equal(await unreadRow.getAttribute('data-marks'), '20')
+
+    await page.locator('.ai-rules-button').click()
+    const dialog = page.locator('.agent-rules-dialog')
+    await dialog.locator('.agent-rule').first().waitFor()
+    assert.equal(await dialog.locator('.agent-rule').count(), 4)
+    assert.equal(await dialog.locator('[data-rule="commands"] [aria-checked="true"]').textContent(), '开')
+    await dialog.locator('[data-rule="reply"] [role="radio"]').filter({ hasText: /^关$/ }).click()
+    await dialog.getByRole('button', { name: '保存' }).click()
+    await page.waitForFunction(() => !document.querySelector('.agent-rules-dialog[open]'))
+    assert.deepEqual(settingsWrites, [{ settings: { commands: true, reply: false, commandSenders: ['zhang'] } }])
     await page.locator('img.attachment-image').evaluateAll((images) => images.forEach((image) => { image.loading = 'eager' }))
     assert.ok(inboxRequestCount > 1, 'a refresh returned the updated sender avatar path')
     const aliceRow = page.locator('.message-row').filter({ hasText: '教程里写' })

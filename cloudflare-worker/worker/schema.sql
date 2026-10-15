@@ -11,7 +11,8 @@ CREATE TABLE IF NOT EXISTS connector_instances (
   configuration_json TEXT NOT NULL DEFAULT '{}',
   last_seen_at TEXT,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  agent_settings_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_connector_instances_kind ON connector_instances(kind);
 CREATE INDEX IF NOT EXISTS idx_connector_instances_state ON connector_instances(state);
@@ -53,6 +54,7 @@ CREATE TABLE IF NOT EXISTS conversations (
   last_message_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  agent_settings_json TEXT NOT NULL DEFAULT '{}',
   FOREIGN KEY (connector_id) REFERENCES connector_instances(id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_external ON conversations(connector_id, external_id);
@@ -74,6 +76,8 @@ CREATE TABLE IF NOT EXISTS messages (
   occurred_at TEXT NOT NULL,
   created_by TEXT,
   created_at TEXT NOT NULL,
+  owner_read_at TEXT,
+  agent_read_at TEXT,
   FOREIGN KEY (conversation_id) REFERENCES conversations(id),
   FOREIGN KEY (connector_id) REFERENCES connector_instances(id)
 );
