@@ -161,6 +161,8 @@ function normalizeCapabilities(value) {
 }
 
 function normalizeInboundEvent(item) {
+  if (item?.isSelf !== undefined && typeof item.isSelf !== "boolean") throw new Error("invalid_message_self_flag");
+  const isSelf = item?.isSelf === true;
   const conversationType = item?.conversationType === "group" ? "group" : "direct";
   const allowedTriggers = conversationType === "group"
     ? new Set(["mention", "explicit_request", "background"])
@@ -192,7 +194,8 @@ function normalizeInboundEvent(item) {
     occurredAt: new Date(item.occurredAt).toISOString(),
     observedAt: observedAtText ? new Date(observedAtText).toISOString() : null,
     context: trigger === "mention" || trigger === "explicit_request" ? context : [],
-    suppress: conversationType === "group" && trigger === "background",
+    isSelf,
+    suppress: !isSelf && conversationType === "group" && trigger === "background",
   };
 }
 
@@ -1223,8 +1226,10 @@ async function ensureImmediateMessageState(env, input) {
   // Do not expose the message to agents until every attachment has been
   // durably linked. A failed/competing cleanup can then be retried without an
   // agent observing a message whose attachment object is unavailable.
-  await env.DB.prepare("INSERT OR IGNORE INTO agent_queue (message_id, state, created_at) VALUES (?, 'pending', ?)")
-    .bind(input.messageId, input.stamp).run();
+  if (!input.isSelf) {
+    await env.DB.prepare("INSERT OR IGNORE INTO agent_queue (message_id, state, created_at) VALUES (?, 'pending', ?)")
+      .bind(input.messageId, input.stamp).run();
+  }
   await reconcileConversationUnread(env, input.conversationId);
 }
 
@@ -1331,7 +1336,7 @@ async function ingestEvents(request, env) {
     let metadata = JSON.stringify({ ...(item.metadata && typeof item.metadata === "object" ? item.metadata : {}),
       conversationType: event.conversationType, trigger: event.trigger, mentioned: event.mentioned,
       placement: event.placement, context: event.context, attachments: attachmentMetadata,
-      observedAt: event.observedAt });
+      observedAt: event.observedAt, isSelf: event.isSelf });
     const conversationExternalId = String(item.conversationExternalId).slice(0, 500);
     let conversation = await env.DB.prepare(`
       SELECT id, title, avatar_label FROM conversations WHERE connector_id = ? AND external_id = ?
@@ -1358,10 +1363,12 @@ async function ingestEvents(request, env) {
       INSERT OR IGNORE INTO messages (
         id, conversation_id, connector_id, external_id, direction, sender_id, sender_name, body,
         content_type, delivery_state, queue_class, metadata_json, occurred_at, created_by, created_at
-      ) VALUES (?, ?, ?, ?, 'inbound', ?, ?, ?, ?, 'received', 'immediate', ?, ?, NULL, ?)
-    `).bind(messageId, conversation.id, connectorId, item.externalId, item.senderId || null,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'immediate', ?, ?, NULL, ?)
+    `).bind(messageId, conversation.id, connectorId, item.externalId, event.isSelf ? "outbound" : "inbound",
+      item.senderId || null,
       String(item.senderName).slice(0, 200), String(item.body || "").slice(0, 20_000),
       String(item.contentType || (attachments.length ? "mixed" : "text")).slice(0, 50),
+      event.isSelf ? "delivered" : "received",
       metadata, event.occurredAt, stamp).run();
     const upgradedBody = String(item.body || "").slice(0, 20_000);
     let canonicalMessageId = messageId;
@@ -1372,11 +1379,15 @@ async function ingestEvents(request, env) {
     let canonicalAvatarLabel = String(item.avatarLabel || item.conversationTitle[0] || "?").slice(0, 2);
     if (!count(result.meta?.changes)) {
       const existing = await env.DB.prepare(`
-        SELECT id, conversation_id, queue_class, body, occurred_at, metadata_json
+        SELECT id, conversation_id, queue_class, direction, body, occurred_at, metadata_json
         FROM messages WHERE connector_id = ? AND external_id = ?
       `).bind(connectorId, item.externalId).first();
       if (!existing) throw new Error("message_not_found");
       if (existing.conversation_id !== conversation.id) {
+        await deleteRequestCreatedEmptyConversation(env, requestCreatedConversationId);
+        throw new Error("message_external_id_conflict");
+      }
+      if (existing.direction !== (event.isSelf ? "outbound" : "inbound")) {
         await deleteRequestCreatedEmptyConversation(env, requestCreatedConversationId);
         throw new Error("message_external_id_conflict");
       }
@@ -1456,6 +1467,7 @@ async function ingestEvents(request, env) {
       occurredAt: canonicalOccurredAt,
       attachments: canonicalAttachments,
       stamp,
+      isSelf: event.isSelf,
     });
   }
   await reconcileConnectorSummaries(env, connectorId, stamp);
@@ -2447,6 +2459,37 @@ async function renewCommandLease(request, env, commandId) {
   return json({ ok: true, leaseExpiresAt: renewed.lease_expires_at });
 }
 
+function verifiedQQExternalId(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return { present: false };
+  if (result.receipt === undefined && result.externalId === undefined) return { present: false };
+  if (typeof result.receipt !== "string" || result.receipt.length > 8192 ||
+      typeof result.externalId !== "string") return { present: true, valid: false };
+  let receipt;
+  try { receipt = JSON.parse(result.receipt); } catch { return { present: true, valid: false }; }
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) return { present: true, valid: false };
+  const sourceId = receipt.sourceId;
+  if (typeof sourceId !== "string" || !/^-?(?:0|[1-9][0-9]*)$/.test(sourceId) || sourceId === "-0") {
+    return { present: true, valid: false };
+  }
+  let numericId;
+  try { numericId = BigInt(sourceId); } catch { return { present: true, valid: false }; }
+  if (numericId < -(1n << 63n) || numericId > (1n << 63n) - 1n) return { present: true, valid: false };
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < sourceId.length; index += 1) {
+    hash ^= sourceId.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  const alias = `message-${hash.toString(16).padStart(8, "0")}`;
+  const expectedExternalId = result.externalId.match(/^([A-Za-z0-9_.-]{1,64}):(message-[a-f0-9]{8})$/);
+  return {
+    present: true,
+    valid: Boolean(expectedExternalId && expectedExternalId[2] === alias &&
+      receipt.messageAlias === alias && receipt.messageType === 1 && receipt.sendStatus === 2 &&
+      receipt.confirmation === "verified-status"),
+    externalId: expectedExternalId ? result.externalId : null,
+  };
+}
+
 async function completeCommand(request, env, commandId) {
   const authenticatedConnectorId = request.headers.get("x-connector-id") || "";
   if (!await hasConnectorRole(request, env, authenticatedConnectorId)) return fail("unauthorized", 401);
@@ -2457,12 +2500,50 @@ async function completeCommand(request, env, commandId) {
   if (!validId(connectorId) || !validId(commandId) || !validId(leaseToken)) throw new Error("invalid_command_completion");
   const stamp = now();
   const command = await env.DB.prepare(`
-    SELECT message_id FROM commands
-    WHERE id = ? AND connector_id = ? AND state = 'leased' AND lease_token = ?
+    SELECT c.message_id, c.conversation_id, c.kind, c.payload_json,
+      m.direction, m.external_id, m.body, m.content_type, m.created_by, m.sender_name
+    FROM commands c JOIN messages m ON m.id = c.message_id
+    WHERE c.id = ? AND c.connector_id = ? AND c.state = 'leased' AND c.lease_token = ?
       AND lease_expires_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
   `).bind(commandId, connectorId, leaseToken).first();
   if (!command) throw new Error("invalid_command_lease");
-  const state = body.retry === true ? "pending" : body.uncertain === true ? "manual_review" : body.ok === true ? "completed" : "failed";
+  const resultValue = body.result && typeof body.result === "object" ? body.result : {};
+  const qqIdentity = body.ok === true ? verifiedQQExternalId(resultValue) : { present: false };
+  let state = body.retry === true ? "pending" : body.uncertain === true ? "manual_review" : body.ok === true ? "completed" : "failed";
+  let completionMessageId = command.message_id;
+  let mergeFromMessageId = null;
+  if (state === "completed" && qqIdentity.present) {
+    if (!qqIdentity.valid || command.kind !== "send_text" || command.direction !== "outbound" ||
+        command.external_id !== null || command.content_type !== "text" ||
+        String(command.body || "") !== String(safeJson(command.payload_json, {}).body || "")) {
+      state = "manual_review";
+    } else {
+      const existing = await env.DB.prepare(`
+        SELECT id, conversation_id, direction, body, content_type, metadata_json, created_by, sender_name,
+          (SELECT COUNT(*) FROM attachments WHERE message_id = messages.id) AS attachment_count,
+          (SELECT COUNT(*) FROM agent_queue WHERE message_id = messages.id) AS agent_queue_count
+        FROM messages WHERE connector_id = ? AND external_id = ?
+      `).bind(connectorId, qqIdentity.externalId).first();
+      if (existing && existing.id !== command.message_id) {
+        const originalChildren = await env.DB.prepare(`
+          SELECT (SELECT COUNT(*) FROM attachments WHERE message_id = ?) AS attachment_count,
+            (SELECT COUNT(*) FROM agent_queue WHERE message_id = ?) AS agent_queue_count,
+            (SELECT COUNT(*) FROM commands WHERE message_id = ? AND id <> ?) AS other_command_count
+        `).bind(command.message_id, command.message_id, command.message_id, commandId).first();
+        if (existing.conversation_id !== command.conversation_id || existing.direction !== "outbound" ||
+            existing.body !== command.body || existing.content_type !== "text" ||
+            existing.attachment_count !== 0 || existing.agent_queue_count !== 0 ||
+            safeJson(existing.metadata_json, {}).isSelf !== true ||
+            originalChildren.attachment_count !== 0 || originalChildren.agent_queue_count !== 0 ||
+            originalChildren.other_command_count !== 0) {
+          state = "manual_review";
+        } else {
+          completionMessageId = existing.id;
+          mergeFromMessageId = command.message_id;
+        }
+      }
+    }
+  }
   const deliveryState = state === "completed" ? "delivered" : state === "pending" ? "queued" :
     state === "manual_review" ? "uncertain" : "failed";
   // Fence the lease exactly once. D1 batch statements are sequential, so checking the
@@ -2474,23 +2555,58 @@ async function completeCommand(request, env, commandId) {
     SELECT 1 FROM commands c WHERE c.id = ? AND c.connector_id = ?
       AND c.state = ? AND c.lease_token = ?
   )`;
+  const reconciliationGuard = mergeFromMessageId ? `AND EXISTS (
+      SELECT 1 FROM messages target WHERE target.id = ? AND target.connector_id = ?
+        AND target.conversation_id = ? AND target.external_id = ? AND target.direction = 'outbound'
+        AND target.content_type = 'text' AND target.body = ?
+        AND json_extract(target.metadata_json, '$.isSelf') = 1
+    ) AND EXISTS (
+      SELECT 1 FROM messages source WHERE source.id = ? AND source.connector_id = ?
+        AND source.conversation_id = ? AND source.direction = 'outbound'
+        AND source.external_id IS NULL AND source.content_type = 'text' AND source.body = ?
+    ) AND NOT EXISTS (SELECT 1 FROM attachments WHERE message_id = ?)
+      AND NOT EXISTS (SELECT 1 FROM agent_queue WHERE message_id = ?)
+      AND NOT EXISTS (SELECT 1 FROM commands WHERE message_id = ? AND id <> ?)` : "";
+  const reconciliationGuardArgs = mergeFromMessageId
+    ? [completionMessageId, connectorId, command.conversation_id, qqIdentity.externalId, command.body,
+      mergeFromMessageId, connectorId, command.conversation_id, command.body,
+      mergeFromMessageId, mergeFromMessageId, mergeFromMessageId, commandId]
+    : [];
   const results = await env.DB.batch([
     env.DB.prepare(`
-      UPDATE commands SET state = ?, result_json = ?, completed_at = ?
+      UPDATE commands SET state = ?, result_json = ?, completed_at = ?, message_id = ?
       WHERE id = ? AND connector_id = ? AND state = 'leased' AND lease_token = ?
         AND lease_expires_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        ${reconciliationGuard}
     `).bind(state, JSON.stringify(body.result || { error: body.error || null }), state === "pending" ? null : stamp,
-      commandId, connectorId, leaseToken),
-    env.DB.prepare(`UPDATE messages SET delivery_state = ? WHERE id = ? AND ${completionPredicate}`)
-      .bind(deliveryState, command.message_id, commandId, connectorId, state, leaseToken),
+      completionMessageId, commandId, connectorId, leaseToken, ...reconciliationGuardArgs),
+    mergeFromMessageId
+      ? env.DB.prepare(`
+          UPDATE messages SET created_by = ?, sender_name = ?, delivery_state = 'delivered'
+          WHERE id = ? AND direction = 'outbound' AND external_id = ? AND ${completionPredicate}
+        `).bind(command.created_by, command.sender_name, completionMessageId, qqIdentity.externalId,
+          commandId, connectorId, state, leaseToken)
+      : qqIdentity.present && state === "completed"
+        ? env.DB.prepare(`UPDATE messages SET external_id = ?, delivery_state = ? WHERE id = ? AND ${completionPredicate}`)
+          .bind(qqIdentity.externalId, deliveryState, command.message_id, commandId, connectorId, state, leaseToken)
+        : env.DB.prepare(`UPDATE messages SET delivery_state = ? WHERE id = ? AND ${completionPredicate}`)
+          .bind(deliveryState, command.message_id, commandId, connectorId, state, leaseToken),
     env.DB.prepare(`UPDATE attachments SET state = ? WHERE message_id = ? AND ${completionPredicate}`)
       .bind(deliveryState, command.message_id, commandId, connectorId, state, leaseToken),
+    ...(mergeFromMessageId ? [env.DB.prepare(`
+      DELETE FROM messages WHERE id = ? AND external_id IS NULL AND direction = 'outbound'
+        AND NOT EXISTS (SELECT 1 FROM attachments WHERE message_id = messages.id)
+        AND NOT EXISTS (SELECT 1 FROM agent_queue WHERE message_id = messages.id)
+        AND NOT EXISTS (SELECT 1 FROM commands WHERE message_id = messages.id)
+        AND ${completionPredicate}
+    `).bind(mergeFromMessageId, commandId, connectorId, state, leaseToken)] : []),
     env.DB.prepare(`
       UPDATE commands SET lease_token = NULL, lease_expires_at = NULL
       WHERE id = ? AND connector_id = ? AND state = ? AND lease_token = ?
     `).bind(commandId, connectorId, state, leaseToken),
   ]);
-  if (!count(results[0]?.meta?.changes) || !count(results.at(-1)?.meta?.changes)) {
+  if (!count(results[0]?.meta?.changes) || !count(results.at(-1)?.meta?.changes) ||
+      (mergeFromMessageId && !count(results[3]?.meta?.changes))) {
     throw new Error("invalid_command_lease");
   }
   await audit(env, `connector:${connectorId}`, "command_completed", commandId, { state });

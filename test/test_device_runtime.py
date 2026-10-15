@@ -21,6 +21,14 @@ runtime = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(runtime)
 
 
+def qq_receipt_result():
+    receipt = {"sourceId": "9007199254740993", "messageAlias": "message-aeb18cd1",
+               "messageType": 1, "sendStatus": 2, "confirmation": "verified-status"}
+    return {"ok": True, "dispatched": True,
+            "receipt": json.dumps(receipt, separators=(",", ":")),
+            "externalId": "primary:message-aeb18cd1"}
+
+
 class DeviceRuntimeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -50,6 +58,23 @@ class DeviceRuntimeTests(unittest.TestCase):
         return {"ok": True, "received": received,
                 "inserted": received if inserted is None else inserted,
                 "upgraded": upgraded, "promoted": promoted, "suppressed": suppressed}
+
+    def test_qq_receipt_identity_requires_exact_source_alias_and_profile(self):
+        valid = qq_receipt_result()
+        self.assertTrue(runtime.verified_qq_external_id(
+            "primary", valid["externalId"], valid["receipt"]))
+        self.assertFalse(runtime.verified_qq_external_id(
+            "other-profile", valid["externalId"], valid["receipt"]))
+        self.assertFalse(runtime.verified_qq_external_id(
+            "primary", "primary:message-00000000", valid["receipt"]))
+        bad_receipt = json.loads(valid["receipt"])
+        bad_receipt["sourceId"] = "9007199254740992"
+        self.assertFalse(runtime.verified_qq_external_id(
+            "primary", valid["externalId"], json.dumps(bad_receipt)))
+        bad_receipt = json.loads(valid["receipt"])
+        bad_receipt["sendStatus"] = 3
+        self.assertFalse(runtime.verified_qq_external_id(
+            "primary", valid["externalId"], json.dumps(bad_receipt)))
 
     def backup_ack(self, received, inserted=None, normalized_inserted=None):
         return {"ok": True, "received": received,
@@ -1201,7 +1226,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         completion_calls = []
         def adapter(request):
             adapter_calls.append(request)
-            return {"ok": True, "receipt": "receipt-2"}
+            return qq_receipt_result()
         def http(method, path, payload=None):
             if path.endswith("/complete"):
                 completion_calls.append(payload)
@@ -1248,7 +1273,7 @@ class DeviceRuntimeTests(unittest.TestCase):
             ).fetchone()
             self.assertEqual(ledger[0], "started")
             adapter_calls.append(request)
-            return {"ok": True, "dispatched": True, "receipt": "verified-receipt"}
+            return qq_receipt_result()
 
         def http(method, path, payload=None):
             http_calls.append((method, path, payload))
@@ -1272,6 +1297,35 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(len(http_calls), 2)
         self.assertEqual(timeline, ["lease", "adapter"])
 
+    def test_qq_receipt_external_id_is_forwarded_to_completion(self):
+        command = {"id": "command-receipt-id", "leaseToken": "lease-receipt-id",
+                   "idempotencyKey": "key-receipt-id",
+                   "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "body"}}
+        completions = []
+        relay = runtime.Relay(self.config, self.db, lambda _: qq_receipt_result(),
+                              lambda method, path, payload=None: completions.append(payload) or {"ok": True})
+        relay.process_command(command, "primary")
+        completion = next(payload for payload in completions if payload and "result" in payload)
+        self.assertEqual(completion["result"]["externalId"], "primary:message-aeb18cd1")
+        self.assertEqual(json.loads(completion["result"]["receipt"])["sourceId"], "9007199254740993")
+
+    def test_qq_receipt_mismatch_is_terminal_uncertain(self):
+        command = {"id": "command-bad-receipt", "leaseToken": "lease-bad-receipt",
+                   "idempotencyKey": "key-bad-receipt",
+                   "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "body"}}
+        adapter_calls = []
+        completions = []
+        result = qq_receipt_result()
+        result["externalId"] = "primary:message-00000000"
+        relay = runtime.Relay(self.config, self.db,
+                              lambda request: adapter_calls.append(request) or result,
+                              lambda method, path, payload=None: completions.append(payload) or {"ok": True})
+        relay.process_command(command, "primary")
+        relay.process_command(command, "primary")
+        self.assertEqual(len(adapter_calls), 1)
+        self.assertTrue(completions[-1]["uncertain"])
+        self.assertEqual(completions[-1]["error"], "qq_receipt_identity_unverified")
+
     def test_retryable_unknown_dispatch_is_uncertain_and_never_retried(self):
         command = {"id": "command-4", "leaseToken": "lease-4", "idempotencyKey": "key-4",
                    "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "hello"}}
@@ -1293,7 +1347,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         adapter_calls = []
         completions = []
         relay = runtime.Relay(self.config, self.db,
-                              lambda request: adapter_calls.append(request) or {"ok": True, "receipt": "ok"},
+                              lambda request: adapter_calls.append(request) or qq_receipt_result(),
                               lambda method, path, payload=None: completions.append(payload) or {"ok": True})
         relay.process_command(command, "primary")
         changed = dict(command, id="command-6", leaseToken="lease-6",

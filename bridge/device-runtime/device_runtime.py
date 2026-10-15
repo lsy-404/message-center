@@ -152,6 +152,37 @@ def compact(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
 
+def verified_qq_external_id(profile, external_id, receipt_text):
+    if not isinstance(profile, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", profile):
+        return False
+    if not isinstance(receipt_text, str) or len(receipt_text) > 8192:
+        return False
+    try:
+        receipt = json.loads(receipt_text)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(receipt, dict):
+        return False
+    source_id = receipt.get("sourceId")
+    if not isinstance(source_id, str) or not re.fullmatch(r"-?(?:0|[1-9][0-9]*)", source_id):
+        return False
+    try:
+        numeric_id = int(source_id)
+    except ValueError:
+        return False
+    if not -(1 << 63) <= numeric_id < (1 << 63) or source_id == "-0":
+        return False
+    value = 0x811C9DC5
+    for byte in source_id.encode("ascii"):
+        value = ((value ^ byte) * 0x01000193) & 0xFFFFFFFF
+    alias = f"message-{value:08x}"
+    return (receipt.get("messageAlias") == alias
+            and type(receipt.get("messageType")) is int and receipt["messageType"] == 1
+            and type(receipt.get("sendStatus")) is int and receipt["sendStatus"] == 2
+            and receipt.get("confirmation") == "verified-status"
+            and external_id == f"{profile}:{alias}")
+
+
 def resolve_local_paths(config, config_path):
     base = os.path.dirname(os.path.abspath(config_path))
     config.setdefault("mediaDirectory", config["database"] + ".media")
@@ -1033,7 +1064,15 @@ class Relay:
                                         "confirmed": True, "targetConfirmed": True,
                                         "attachments": payload.get("attachments", [])})
             if result.get("ok") is True and isinstance(result.get("receipt"), str) and result.get("receipt"):
-                outcome = {"ok": True, "result": {"receipt": result["receipt"]}}
+                if driver == "qq":
+                    external_id = result.get("externalId")
+                    if verified_qq_external_id(profile, external_id, result["receipt"]):
+                        outcome = {"ok": True, "result": {
+                            "receipt": result["receipt"], "externalId": external_id}}
+                    else:
+                        outcome = {"uncertain": True, "error": "qq_receipt_identity_unverified"}
+                else:
+                    outcome = {"ok": True, "result": {"receipt": result["receipt"]}}
                 retryable = 0
             elif result.get("retryable") is True:
                 if result.get("dispatched") is not False:
