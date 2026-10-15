@@ -6,3 +6,7 @@
 
 - Initial module-style unittest invocation failed because `test` is not a Python package; rerunning the test file directly succeeded.
 - The deterministic race test uses fake process pipes and selector readiness so it runs on Windows as well as the device POSIX runtime; existing real-process deadline tests remain platform-gated.
+
+- Source audit found the runtime plist template explicitly enables `LowPriorityIO` alongside `Nice=10`; the launcher still independently sets and verifies its 64 MiB active/inactive fatal memory limit.
+- Apple primary source: [launchd.plist manual](https://github.com/apple-oss-distributions/launchd/blob/main/man/launchd.plist.5) says `LowPriorityIO` asks the kernel to treat daemon filesystem I/O as low priority. It also says `Standard` is equivalent to an unspecified `ProcessType`, so adding that value is not a meaningful correction.
+- New live evidence reports receiver startup exceeding three minutes while a normal SSH Python probe completed in 1–3 seconds. This motivates removing only `LowPriorityIO` in the template as a controlled trial; it does not prove that I/O priority caused the delay.

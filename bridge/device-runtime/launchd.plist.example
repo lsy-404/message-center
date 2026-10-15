@@ -21,8 +21,6 @@
   <integer>30</integer>
   <key>Nice</key>
   <integer>10</integer>
-  <key>LowPriorityIO</key>
-  <true/>
   <key>StandardOutPath</key>
   <string>/var/mobile/Library/MessageCenter/runtime.log</string>
   <key>StandardErrorPath</key>
