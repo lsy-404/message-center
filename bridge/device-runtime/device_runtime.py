@@ -562,10 +562,17 @@ class Relay:
             raise SourceReadError("source_read_failed") from error
         if not isinstance(result, dict):
             raise RuntimeError("invalid_scan_result")
-        if result.get("health") != "online":
+        source_read_ok = result.get("sourceReadOk")
+        if type(source_read_ok) is not bool:
+            raise RuntimeError("invalid_scan_result")
+        if source_read_ok is False:
             raise SourceReadError("source_read_failed")
-        if result.get("ok") is not True or "cursor" not in result or not isinstance(result.get("messages"), list):
-            raise SourceReadError("scan_failed")
+        if (result.get("ok") is not True or "cursor" not in result or
+                not isinstance(result.get("messages"), list)):
+            raise RuntimeError("invalid_scan_result")
+        health = result.get("health")
+        if not isinstance(health, str) or health not in {"online", "degraded"}:
+            raise RuntimeError("invalid_scan_health")
         if len(compact(result).encode("utf-8")) > MAX_SCAN_RESPONSE:
             raise RuntimeError("scan_response_too_large")
         messages = result["messages"]
