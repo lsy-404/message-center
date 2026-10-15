@@ -32,6 +32,12 @@ assert.deepEqual(freshMigrationDatabase.prepare('PRAGMA table_info(conversation_
   .map((row) => row.name).filter((name) => name === 'native_unread_observed_at'), ['native_unread_observed_at']);
 assert.deepEqual(freshMigrationDatabase.prepare('PRAGMA table_info(attachments)').all()
   .map((row) => row.name).filter((name) => name === 'inbound_cleanup_marked_at'), ['inbound_cleanup_marked_at']);
+for (const table of ['connector_instances', 'conversations']) {
+  assert.deepEqual(freshMigrationDatabase.prepare(`PRAGMA table_info(${table})`).all()
+    .map((row) => row.name).filter((name) => name === 'agent_settings_json'), ['agent_settings_json']);
+}
+assert.deepEqual(freshMigrationDatabase.prepare('PRAGMA table_info(messages)').all()
+  .map((row) => row.name).filter((name) => name.endsWith('_read_at')), ['owner_read_at', 'agent_read_at']);
 freshMigrationDatabase.close();
 
 const migrationDatabase = new DatabaseSync(':memory:');

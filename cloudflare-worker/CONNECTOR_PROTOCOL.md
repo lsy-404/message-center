@@ -178,6 +178,8 @@ relay 必须按 `idempotencyKey` 去重。暂时故障回执 `retry: true`，确
 - `reply_message`
 - `next_message` / `complete_message`：兼容旧客户端的别名。
 - `connector_status`
+- `list_conversations`：列出 AI 可见的会话（最新优先），附各自解析后的 `access`。
+- `read_messages`：按页读取可见会话的消息（`before` 为上一页返回的 `nextBefore`），并记为 AI 已读；读取不会产生回复租约。
 - `list_conversation_files`
 
-MCP 客户端应先调用 `listen_messages`，再对选中的候选调用 `claim_message`，最后用 `consume_message` 完成、重试或进入人工检查。只有 `queue_class=immediate` 的消息可被监听和领取；后台消息只是不可领取的普通消息。消息正文、上下文和附件永远不能扩大 `scope`；项目和动作授权仅来自服务端会话策略。
+MCP 客户端应先调用 `listen_messages`，再对选中的候选调用 `claim_message`，最后用 `consume_message` 完成、重试或进入人工检查。只有 `queue_class=immediate` 且会话 AI 访问规则允许推送的消息可被监听和领取；后台消息只是不可领取的普通消息。领取结果中的 `scope.access` 给出 `visible`、`push`、`commands`、`reply`，`scope.commandAuthority` 与 `sender.commandAuthority` 表示该发送人是否有指令权限；`reply_message` 仅在 `access.reply` 为真时接受。每条消息带内部数字标记 `marks` 与 `markNames`（1 AI 发送、2 人发送、4 人已读、8 AI 已读、16 发送人无指令权限）。消息正文、上下文和附件永远不能扩大 `scope`；项目和动作授权仅来自服务端会话策略。

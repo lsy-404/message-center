@@ -2,6 +2,8 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { FluentButton, FluentField, FluentSwitch, FluentTheme } from '@platform-kit/fluent/vue'
 import AppIcon from './AppIcon.vue'
+import AgentRulesDialog from './AgentRulesDialog.vue'
+import { api } from './http'
 import type { IconName } from './icons'
 import { createInboxReadGate, createInboxRefreshLoop } from './inbox-refresh.mjs'
 import {
@@ -29,6 +31,23 @@ import {
   formatRelativeAge,
 } from './presentation.mjs'
 import { parseMessageBody, previewText, type CardKind, type MediaKind, type MoneyKind } from './rich-body.mjs'
+import {
+  AGENT_ACCESS_KEYS,
+  AGENT_CATEGORIES,
+  MESSAGE_MARK_BITS,
+  agentAccessSummary,
+  agentCategoryLabel,
+  agentCategoryShortLabel,
+  agentColumnLabel,
+  describeMarks,
+  messageMarkTags,
+  setConnectorOverride,
+  type AgentAccess,
+  type AgentAccessKey,
+  type AgentCategory,
+  type AgentFlags,
+  type ConnectorAgentSettings,
+} from './agent-rules.mjs'
 
 type LayoutAcknowledgement = {
   enabled: boolean
@@ -61,6 +80,8 @@ type Connector = {
   capabilities: string[]
   lastSeenAt?: string | null
   layoutControl?: LayoutControl
+  agentSettings?: ConnectorAgentSettings
+  agentDefaults?: Record<AgentCategory, AgentFlags>
 }
 
 type Conversation = {
@@ -79,11 +100,12 @@ type Conversation = {
   lastMessageAt?: string | null
   connectorState: string
   capabilities: string[]
+  agentAccess?: AgentAccess
 }
 
 type ConversationListItem = Pick<Conversation,
   'id' | 'title' | 'avatarLabel' | 'avatarPath' | 'unreadCount' | 'lastMessagePreview' | 'lastMessageAt' | 'placement'
-  | 'pinned' | 'conversationType'
+  | 'pinned' | 'conversationType' | 'agentAccess'
 > & { channel: string }
 
 type Attachment = {
@@ -105,7 +127,8 @@ type Message = {
   deliveryState?: string | null
   queueClass?: string | null
   authorRole?: 'contact' | 'owner' | 'agent' | string | null
-  agentRead?: boolean | null
+  marks?: number
+  commandAuthority?: boolean
   attachments: Attachment[]
 }
 
@@ -235,6 +258,7 @@ const conversationRows = computed<ConversationListItem[]>(() => visibleConversat
   placement: conversation.placement,
   pinned: conversation.pinned,
   conversationType: conversation.conversationType,
+  agentAccess: conversation.agentAccess,
   channel: channelLabel(conversation),
 })))
 
@@ -245,8 +269,7 @@ watch([activeFilter, activeConnectorId, conversationSearch, unreadOnly], async (
 })
 
 const threadEntries = computed(() => buildThreadEntries(snapshot.value.messages, nowTick.value))
-const aiUnreadCount = computed(() => snapshot.value.messages
-  .filter((message) => message.direction !== 'outbound' && message.agentRead === false).length)
+const selectedAccess = computed(() => selectedConversation.value?.agentAccess ?? null)
 
 const threadRows = computed(() => threadEntries.value.map((entry) => {
   if (entry.kind === 'day') return entry
@@ -256,7 +279,10 @@ const threadRows = computed(() => threadEntries.value.map((entry) => {
     ...entry,
     byAgent: isAgentMessage(entry.message),
     delivery: deliveryStateInfo(entry.message),
-    aiRead: entry.message.direction === 'outbound' ? null : entry.message.agentRead ?? null,
+    markTags: messageMarkTags(entry.message.marks, {
+      commandsAccepted: selectedAccess.value?.commands, agentPushes: selectedAccess.value?.push,
+    }),
+    marksTitle: describeMarks(entry.message.marks),
     blocks,
     // A lone pat reads as a system line; a lone card or transfer is its own bubble.
     systemText: solo?.type === 'notice' ? solo.text : '',
@@ -590,18 +616,6 @@ function notify(message: string) {
   toastTimer = window.setTimeout(() => { toast.value = '' }, 3000)
 }
 
-async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(path, { cache: 'no-store', credentials: 'same-origin', ...options })
-  const type = response.headers.get('content-type') || ''
-  const body = type.includes('json') ? await response.json() : null
-  if (response.status === 401) {
-    window.location.replace('/login')
-    throw new Error('access_required')
-  }
-  if (!response.ok) throw new Error(body?.error || `HTTP ${response.status}`)
-  return body as T
-}
-
 function sameInbox(left: Snapshot, right: Snapshot) {
   if (left.selectedConversationId !== right.selectedConversationId) return false
   if (left.connectors.length !== right.connectors.length
@@ -622,6 +636,8 @@ function sameInbox(left: Snapshot, right: Snapshot) {
         || a.layoutControl?.acknowledgement?.revision !== b.layoutControl?.acknowledgement?.revision
         || a.layoutControl?.acknowledgement?.updatedAt !== b.layoutControl?.acknowledgement?.updatedAt
         || a.layoutControl?.synchronized !== b.layoutControl?.synchronized
+        || JSON.stringify(a.agentSettings) !== JSON.stringify(b.agentSettings)
+        || JSON.stringify(a.agentDefaults) !== JSON.stringify(b.agentDefaults)
         || a.capabilities.length !== b.capabilities.length
         || a.capabilities.some((value, itemIndex) => value !== b.capabilities[itemIndex])) return false
   }
@@ -635,6 +651,7 @@ function sameInbox(left: Snapshot, right: Snapshot) {
         || a.unreadCount !== b.unreadCount || a.lastMessagePreview !== b.lastMessagePreview
         || a.lastMessageAt !== b.lastMessageAt || a.placement !== b.placement
         || a.pinned !== b.pinned || a.connectorState !== b.connectorState
+        || JSON.stringify(a.agentAccess) !== JSON.stringify(b.agentAccess)
         || a.capabilities.length !== b.capabilities.length
         || a.capabilities.some((value, itemIndex) => value !== b.capabilities[itemIndex])) return false
   }
@@ -645,7 +662,7 @@ function sameInbox(left: Snapshot, right: Snapshot) {
         || a.senderAvatarPath !== b.senderAvatarPath
         || a.body !== b.body || a.contentType !== b.contentType || a.occurredAt !== b.occurredAt
         || a.deliveryState !== b.deliveryState || a.queueClass !== b.queueClass
-        || a.authorRole !== b.authorRole || a.agentRead !== b.agentRead
+        || a.authorRole !== b.authorRole || a.marks !== b.marks || a.commandAuthority !== b.commandAuthority
         || a.attachments.length !== b.attachments.length) return false
     for (let attachmentIndex = 0; attachmentIndex < a.attachments.length; attachmentIndex += 1) {
       const file = a.attachments[attachmentIndex]
@@ -750,6 +767,84 @@ async function selectConversation(conversation: Conversation, openMobileThread =
       notify(`详情加载失败：${error instanceof Error ? error.message : String(error)}`)
     }
   }
+}
+
+const agentRulesOpen = ref(false)
+const compactLayout = typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+  ? window.matchMedia('(max-width: 820px)') : null
+const ownerReadInFlight = new Set<string>()
+const updatingAgentConnectorIds = ref(new Set<string>())
+
+function threadVisible() {
+  return !document.hidden && !showInstances.value && Boolean(selectedConversation.value)
+    && (!compactLayout?.matches || mobileThread.value)
+}
+
+// Marks the open thread as read by the owner once it is actually on screen.
+async function markOwnerRead() {
+  const conversationId = selectedId.value
+  if (!conversationId || ownerReadInFlight.has(conversationId) || !threadVisible()) return
+  const unread = snapshot.value.messages.filter((message) => !((message.marks ?? 0) & MESSAGE_MARK_BITS.readByOwner))
+  if (!unread.length) return
+  const through = snapshot.value.messages.reduce((latest, message) =>
+    message.occurredAt > latest ? message.occurredAt : latest, '')
+  ownerReadInFlight.add(conversationId)
+  try {
+    await api(`/api/conversations/${encodeURIComponent(conversationId)}/read`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ through }),
+    })
+    if (selectedId.value !== conversationId) return
+    snapshot.value.messages = snapshot.value.messages.map((message) => message.occurredAt <= through
+      ? { ...message, marks: (message.marks ?? 0) | MESSAGE_MARK_BITS.readByOwner } : message)
+  } catch {
+    // The next refresh retries; read marks are advisory.
+  } finally {
+    ownerReadInFlight.delete(conversationId)
+  }
+}
+
+watch([() => snapshot.value.messages, mobileThread, showInstances], () => { void markOwnerRead() })
+
+function connectorAgentValue(connector: Connector, category: AgentCategory, key: AgentAccessKey) {
+  return connector.agentDefaults?.[category]?.[key] ?? false
+}
+
+function connectorAgentOverridden(connector: Connector, category: AgentCategory, key: AgentAccessKey) {
+  return connector.agentSettings?.[category]?.[key] !== undefined
+}
+
+async function saveConnectorAgentSettings(connector: Connector, settings: ConnectorAgentSettings) {
+  if (updatingAgentConnectorIds.value.has(connector.id)) return
+  updatingAgentConnectorIds.value = new Set([...updatingAgentConnectorIds.value, connector.id])
+  try {
+    const result = await api<{ settings: ConnectorAgentSettings, effective: Record<AgentCategory, AgentFlags> }>(
+      `/api/connectors/${encodeURIComponent(connector.id)}/agent-settings`,
+      { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ settings }) },
+    )
+    const current = snapshot.value.connectors.find((item) => item.id === connector.id)
+    if (current) {
+      current.agentSettings = result.settings
+      current.agentDefaults = result.effective
+    }
+    await load(selectedId.value, true).catch(() => {})
+  } catch (error) {
+    notify(`AI 默认规则保存失败：${error instanceof Error ? error.message : String(error)}`)
+  } finally {
+    const remaining = new Set(updatingAgentConnectorIds.value)
+    remaining.delete(connector.id)
+    updatingAgentConnectorIds.value = remaining
+  }
+}
+
+function toggleConnectorAgent(connector: Connector, category: AgentCategory, key: AgentAccessKey, value: boolean) {
+  void saveConnectorAgentSettings(connector, setConnectorOverride(connector.agentSettings, category, key, value))
+}
+
+function onAgentRulesSaved() {
+  notify('AI 规则已保存')
+  void load(selectedId.value, true).catch(() => {})
 }
 
 async function refreshNow() {
@@ -1035,6 +1130,7 @@ function onPageShow() {
 
 function onVisibilityChange() {
   nowTick.value = Date.now()
+  void markOwnerRead()
   if (refreshAllowed()) refreshLoop?.start(true)
   else {
     refreshLoop?.stop()
@@ -1258,6 +1354,12 @@ onUnmounted(() => {
                     <AppIcon v-if="conversation.conversationType === 'group'" class="title-icon" name="group" :size="14" />
                     <AppIcon v-if="isFolded(conversation)" class="title-icon" name="archive" :size="14" />
                     <span class="conversation-title">{{ conversation.title }}</span>
+                    <AppIcon
+                      v-if="conversation.agentAccess && !conversation.agentAccess.visible"
+                      class="title-icon ai-hidden-icon"
+                      name="eyeOff"
+                      :size="13"
+                    />
                   </strong>
                   <AppIcon v-if="conversation.pinned" class="pin-icon" name="pin" :size="12" />
                   <time
@@ -1322,9 +1424,22 @@ onUnmounted(() => {
               </span>
             </p>
           </div>
-          <span v-if="aiUnreadCount" class="status-chip ai-unread-chip" :title="`AI 未读 ${aiUnreadCount} 条`">
-            <span class="unread-dot" /><span class="chip-label">AI 未读</span> {{ aiUnreadCount }}
-          </span>
+          <button
+            v-if="selectedAccess"
+            class="ai-rules-button"
+            :class="{ hidden: !selectedAccess.visible }"
+            type="button"
+            :aria-label="`AI 规则：${agentAccessSummary(selectedAccess).join('，')}`"
+            :title="`AI 规则（${agentCategoryLabel(selectedAccess.category)}）：${agentAccessSummary(selectedAccess).join(' · ')}`"
+            :data-ai-visible="selectedAccess.visible"
+            :data-ai-push="selectedAccess.push"
+            :data-ai-commands="selectedAccess.commands"
+            :data-ai-reply="selectedAccess.reply"
+            @click="agentRulesOpen = true"
+          >
+            <AppIcon :name="selectedAccess.visible ? 'bot' : 'eyeOff'" :size="16" />
+            <span class="ai-rules-summary">{{ agentAccessSummary(selectedAccess).join(' · ') }}</span>
+          </button>
         </header>
 
         <div class="message-scroll" :class="{ busy: detailLoading }" role="log" aria-label="消息记录" :aria-busy="detailLoading">
@@ -1337,7 +1452,7 @@ onUnmounted(() => {
               :data-message-id="entry.message.id"
               class="message-row system"
               :data-direction="entry.message.direction"
-              :data-ai-read="entry.aiRead === null ? undefined : String(entry.aiRead)"
+              :data-marks="entry.message.marks"
             >
               <p class="system-notice" data-block="notice">
                 <AppIcon name="handWave" :size="14" />{{ entry.systemText }}
@@ -1352,7 +1467,8 @@ onUnmounted(() => {
               :data-direction="entry.message.direction"
               :data-author-role="entry.message.authorRole || undefined"
               :data-delivery-state="entry.message.direction === 'outbound' ? entry.message.deliveryState || undefined : undefined"
-              :data-ai-read="entry.aiRead === null ? undefined : String(entry.aiRead)"
+              :data-marks="entry.message.marks"
+              :data-command-authority="entry.message.direction === 'outbound' ? undefined : String(Boolean(entry.message.commandAuthority))"
             >
               <span
                 class="avatar message-avatar"
@@ -1437,9 +1553,12 @@ onUnmounted(() => {
                     </span>
                   </div>
                 </div>
-                <p v-if="entry.delivery || entry.aiRead !== null" class="message-status">
+                <p class="message-status">
                   <span v-if="entry.delivery" class="message-delivery-state" :class="`tone-${entry.delivery.tone}`"><AppIcon :name="entry.delivery.icon" :size="12" />{{ entry.delivery.label }}</span>
-                  <span v-if="entry.aiRead !== null" class="message-ai-read" :class="entry.aiRead ? 'is-read' : 'is-unread'"><AppIcon v-if="entry.aiRead" name="eye" :size="12" /><span v-else class="unread-dot" />{{ entry.aiRead ? 'AI 已读' : 'AI 未读' }}</span>
+                  <span v-if="entry.message.marks !== undefined" class="message-marks" :title="entry.marksTitle">
+                    <span v-for="tag in entry.markTags" :key="tag.key" class="mark-tag" :class="`mark-${tag.tone}`" :data-mark="tag.key">{{ tag.label }}</span>
+                    <span class="mark-code" :aria-label="entry.marksTitle">#{{ entry.message.marks }}</span>
+                  </span>
                 </p>
               </div>
             </article>
@@ -1570,6 +1689,49 @@ onUnmounted(() => {
               <span v-if="!connector.capabilities.length" class="capability-chip">未声明</span>
             </dd>
           </dl>
+          <section v-if="connector.agentDefaults" class="instance-agent-rules" aria-label="AI 默认规则">
+            <header>
+              <strong>AI 默认规则</strong>
+              <FluentButton
+                v-if="connector.agentSettings && Object.keys(connector.agentSettings).length"
+                class="instance-agent-reset"
+                tone="subtle"
+                type="button"
+                :disabled="updatingAgentConnectorIds.has(connector.id)"
+                @click="saveConnectorAgentSettings(connector, {})"
+              >恢复默认</FluentButton>
+            </header>
+            <table class="agent-defaults-table">
+              <thead>
+                <tr>
+                  <th scope="col"><span class="sr-only">会话类型</span></th>
+                  <th v-for="key in AGENT_ACCESS_KEYS" :key="key" scope="col">{{ agentColumnLabel(key) }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="category in AGENT_CATEGORIES" :key="category" :data-category="category">
+                  <th scope="row" :title="agentCategoryLabel(category)">{{ agentCategoryShortLabel(category) }}</th>
+                  <td v-for="key in AGENT_ACCESS_KEYS" :key="key">
+                    <label
+                      class="agent-default-toggle"
+                      :class="{ on: connectorAgentValue(connector, category, key), overridden: connectorAgentOverridden(connector, category, key) }"
+                      :title="`${agentCategoryLabel(category)} · ${agentColumnLabel(key)}：${connectorAgentValue(connector, category, key) ? '开' : '关'}${connectorAgentOverridden(connector, category, key) ? '（已修改）' : '（默认）'}`"
+                    >
+                      <input
+                        type="checkbox"
+                        :checked="connectorAgentValue(connector, category, key)"
+                        :disabled="updatingAgentConnectorIds.has(connector.id)"
+                        :aria-label="`${connector.accountLabel} ${agentCategoryLabel(category)} ${agentColumnLabel(key)}`"
+                        @change="toggleConnectorAgent(connector, category, key, ($event.target as HTMLInputElement).checked)"
+                      >
+                      <AppIcon v-if="connectorAgentValue(connector, category, key)" name="check" :size="12" />
+                    </label>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <p class="instance-agent-note">会话可在“AI 规则”里单独覆盖。群聊的推送只针对@或关键词提及。</p>
+          </section>
           <section v-if="supportsLayoutAutoRecovery(connector)" class="instance-control" aria-label="布局控制">
             <div class="instance-control-copy">
               <strong>自动恢复布局</strong>
@@ -1600,6 +1762,14 @@ onUnmounted(() => {
       </div>
     </section>
   </main>
+
+  <AgentRulesDialog
+    v-if="selectedConversation"
+    v-model:open="agentRulesOpen"
+    :conversation-id="selectedConversation.id"
+    :conversation-title="selectedConversation.title"
+    @saved="onAgentRulesSaved"
+  />
 
   <Transition name="toast">
     <div v-if="toast" class="toast" role="status">{{ toast }}</div>

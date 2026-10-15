@@ -265,6 +265,8 @@ assert.deepEqual(listener.inputSchema.properties.triggers.items.enum, ['direct',
 assert.ok(toolsBody.result.tools.some((tool) => tool.name === 'next_message'));
 assert.ok(toolsBody.result.tools.some((tool) => tool.name === 'claim_message'));
 assert.ok(toolsBody.result.tools.some((tool) => tool.name === 'consume_message'));
+assert.ok(toolsBody.result.tools.some((tool) => tool.name === 'list_conversations'));
+assert.ok(toolsBody.result.tools.some((tool) => tool.name === 'read_messages'));
 
 for (const origin of [undefined, 'null', 'https://attacker.example']) {
   const rejectedLogout = await worker.fetch(new Request('https://message.example.com/api/auth/logout', {
