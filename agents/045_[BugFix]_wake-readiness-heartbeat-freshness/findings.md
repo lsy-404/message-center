@@ -6,4 +6,4 @@
 - 修复保持上传/ACK与 outbox 删除顺序、游标提交、失败退避及 `process_command` 幂等账本语义不变。所有新测试使用假时钟和本地 HTTP/adapter替身。
 - Python根测试全部通过；Node测试集合在此新worktree因未安装 `openid-client` 有12个测试启动失败，31个其他用例通过。相关改动仅涉及 Python runtime 与其测试。
 - 本任务只改公开 runtime，不访问设备、云端或部署。
-- 被动实机窗口（约4分43秒）显示7/7个settle后有效云样本在Worker 90秒TTL内为online，最大heartbeat age 39秒；它不是长期认证。15个设备样本的outbox末次值19不证明队列已清空，CPU样本也不足以证明显著改善。
+- 被动实机窗口（约4分43秒）显示7/7个settle后有效云样本在Worker 90秒TTL内为online，最大heartbeat age 39秒；它不是长期认证。15个设备样本的outboxCount序列为 `[0,0,0,0,2,2,1,1,0,2,19,0,19,0,19]`，显示观察期间多次自然清空，末次19为新一批待传；CPU样本不足以证明显著改善。

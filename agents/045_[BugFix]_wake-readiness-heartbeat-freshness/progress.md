@@ -18,6 +18,8 @@
 ## 被动实机验证
 
 - 已安装版本：profile 模块 SHA-256 `6c7846fd1c636576311418320c70f8bf4fc8e9435fdb593d290dd93e8823dced`；runtime SHA-256 `04a01771dee3641b0ae21a5481ea54685d7c8e70fdad84f3e6ae31272cd1b390`。对应 follow-up commit `1931293`。
-- 2026-10-16 01:22:03.876–01:26:46.621 UTC 连续15个被动设备样本：QQ PID 40681 稳定，source failure 最大值0；cursor有8种快照；cache 15/15保留且跨读取复用3次；cache 10,235 B、cursor 53,450 B；outbox最大值与末次值均为19。末次值不证明队列已清空。CPU单核采样16.1–44.3%，均值28.4%；ledger未变化。
+- 2026-10-16 01:22:03.876–01:26:46.621 UTC 连续15个被动设备样本：QQ PID 40681 稳定，source failure 最大值0；cursor有8种快照；cache 15/15保留且跨读取复用3次；cache 10,235 B、cursor 53,450 B；outboxCount原始序列为 `[0,0,0,0,2,2,1,1,0,2,19,0,19,0,19]`，source `lastSuccessAt` 共8种取值。窗口内多次自然清空，末次19表示新一批待传。CPU单核采样16.1–44.3%，均值28.4%；ledger未变化。
 - 同期10个云端样本间隔30秒。重启settle阶段最初3个为offline；经过至少90秒后，有效样本7/7均为online，最大heartbeat age 39秒，并观察到5个不同心跳。此结论按Worker 90秒 TTL计算，不把stored state直接视为fresh online；浏览器也显示QQ online。
 - 观察期间无 probe、UI操作或安装；原生UI操作在观察开始前完成。该窗口约4分43秒，只支持短时被动运行证据，不是长期认证，也不能据此宣称CPU有显著改善。此前出现 `FileExistsError` 的主机harness轮次不包含设备证据，已用唯一报告文件路径纠正。
+
+- 独立只读快照（01:27:21 UTC）不属于上述15个连续样本：outboxCount为2、source failure为0、lastSuccessAt为01:27:10.891 UTC；QQ PID 40681、runtime PID 41937，ledger状态为done 13。未将该快照计入窗口样本数。
