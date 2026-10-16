@@ -94,21 +94,16 @@ function inboundObjectMatches(object, sizeBytes, sha256) {
   return object && Number(object.size) === sizeBytes && r2ChecksumHex(object.checksums?.sha256) === sha256;
 }
 
-function boundedInboundFileBody(body, expectedBytes) {
-  let receivedBytes = 0;
-  return body.pipeThrough(new TransformStream({
-    transform(chunk, controller) {
-      receivedBytes += chunk.byteLength;
-      if (receivedBytes > expectedBytes || receivedBytes > MAX_INBOUND_ATTACHMENT_BYTES) {
-        controller.error(new Error("uploaded_file_integrity_mismatch"));
-        return;
-      }
-      controller.enqueue(chunk);
-    },
-    flush(controller) {
-      if (receivedBytes !== expectedBytes) controller.error(new Error("uploaded_file_integrity_mismatch"));
-    },
-  }));
+async function putFixedLengthInboundObject(bucket, key, body, expectedBytes, options) {
+  const fixedLength = new FixedLengthStream(expectedBytes);
+  const sourceComplete = body.pipeTo(fixedLength.writable).catch(() => {
+    throw new Error("uploaded_file_integrity_mismatch");
+  });
+  const [object] = await Promise.all([
+    bucket.put(key, fixedLength.readable, options),
+    sourceComplete,
+  ]);
+  return object;
 }
 
 function imageMime(bytes) {
@@ -686,7 +681,7 @@ async function uploadConnectorFile(request, env, fileId) {
     let object = await env.FILES.head(previous.object_key);
     if (!inboundObjectMatches(object, sizeBytes, sha256)) {
       try {
-        object = await env.FILES.put(previous.object_key, boundedInboundFileBody(request.body, sizeBytes), putOptions);
+        object = await putFixedLengthInboundObject(env.FILES, previous.object_key, request.body, sizeBytes, putOptions);
         if (!inboundObjectMatches(object, sizeBytes, sha256)) {
           object = await env.FILES.head(previous.object_key);
           if (!inboundObjectMatches(object, sizeBytes, sha256)) throw new Error("inbound_object_repair_failed");
@@ -709,7 +704,7 @@ async function uploadConnectorFile(request, env, fileId) {
   const objectKey = `inbound/${connectorId}/${crypto.randomUUID()}`;
   let putCompleted = false;
   try {
-    const uploaded = await env.FILES.put(objectKey, boundedInboundFileBody(request.body, sizeBytes), putOptions);
+    const uploaded = await putFixedLengthInboundObject(env.FILES, objectKey, request.body, sizeBytes, putOptions);
     if (!inboundObjectMatches(uploaded, sizeBytes, sha256)) {
       await env.FILES.delete(objectKey).catch(() => {});
       throw new Error("uploaded_file_integrity_mismatch");
@@ -755,9 +750,12 @@ async function uploadConnectorFile(request, env, fileId) {
       let canonicalObject = await env.FILES.head(stored.object_key);
       if (!inboundObjectMatches(canonicalObject, sizeBytes, sha256)) {
         const uploaded = await env.FILES.get(objectKey);
-        if (!uploaded?.body) throw new Error("inbound_object_repair_failed");
+        if (!uploaded?.body || !inboundObjectMatches(uploaded, sizeBytes, sha256)) {
+          throw new Error("inbound_object_repair_failed");
+        }
         try {
-          const repaired = await env.FILES.put(stored.object_key, uploaded.body, putOptions);
+          const repaired = await putFixedLengthInboundObject(env.FILES, stored.object_key,
+            uploaded.body, sizeBytes, putOptions);
           if (inboundObjectMatches(repaired, sizeBytes, sha256)) {
             canonicalObject = repaired;
           } else {

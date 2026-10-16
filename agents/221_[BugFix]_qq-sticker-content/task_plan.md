@@ -25,3 +25,4 @@ Public Vue UI, Worker attachment metadata/byte handling only where needed, and r
 - [x] Reconcile ambiguous canonical puts using exact HEAD size and SHA-256, without deleting the canonical key.
 - [x] Add root `/test` fault coverage and run the Worker schema suite.
 - [x] Require JSON numeric attachment byte lengths and reject boolean/string coercions.
+- [x] Use a runtime-recognized fixed-length stream for bounded inbound R2 writes and verify overflow/underflow in the strict test fixture.
