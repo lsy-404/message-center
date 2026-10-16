@@ -19,6 +19,7 @@ import {
   pageConversations,
   previousConversationPage,
   resolveConversationSelection,
+  resolveQQGroupAssistantInboxSelection,
 } from './conversation-list.mjs'
 import {
   avatarTone,
@@ -267,6 +268,9 @@ watch([activeFilter, activeConnectorId, conversationSearch, unreadOnly, showQQGr
   conversationPage.value = 0
   await nextTick()
   conversationListElement.value?.scrollTo(0, 0)
+  if (showQQGroupAssistant.value) {
+    applyConversationSelection(filteredQQGroupAssistantConversations.value)
+  }
 })
 
 const threadEntries = computed(() => buildThreadEntries(snapshot.value.messages, nowTick.value))
@@ -708,6 +712,19 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
   try {
     const body = await api<Snapshot & { ok: boolean }>(`/api/inbox?${query}`, { signal: request.controller.signal })
     if (!inboxReads.isCurrent(request, selectedId.value)) return
+    let reloadConversationId = ''
+    if (showQQGroupAssistant.value) {
+      const selection = resolveQQGroupAssistantInboxSelection(
+        body.conversations,
+        selectedId.value,
+        request.conversationId,
+        conversationSearch.value,
+        unreadOnly.value,
+      )
+      body.selectedConversationId = selection.selectedConversationId
+      reloadConversationId = selection.reloadConversationId
+      if (reloadConversationId || !selection.selectedConversationId) body.messages = []
+    }
     const priorThread = document.querySelector<HTMLElement>('.message-scroll')
     const priorSelectedId = selectedId.value
     const scrollState = priorThread ? captureMessageScroll(priorThread) : null
@@ -726,10 +743,17 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
     }
     advanceAvatarRetries(body.conversations, body.messages)
     body.connectors = mergeConnectorLayoutControls(body.connectors)
-    if (sameInbox(snapshot.value, body)) return
+    if (sameInbox(snapshot.value, body)) {
+      if (reloadConversationId) void load(reloadConversationId, true)
+      return
+    }
     snapshot.value = body
     await nextTick()
     if (!inboxReads.isActive(request)) return
+    if (reloadConversationId) {
+      void load(reloadConversationId, true)
+      return
+    }
     const thread = document.querySelector<HTMLElement>('.message-scroll')
     const shouldForceScroll = forceScrollToBottom || pendingScrollToBottomId === nextSelectedId
     if (thread) {

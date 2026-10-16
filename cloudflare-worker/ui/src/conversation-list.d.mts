@@ -14,6 +14,9 @@ export function filterQQGroupAssistantConversations<T extends Record<string, any
 export function resolveConversationSelection<T extends { id: string }>(
   conversations: T[], selectedId: string,
 ): { action: 'keep' | 'select' | 'clear', conversation: T | null }
+export function resolveQQGroupAssistantInboxSelection<T extends Record<string, any>>(
+  conversations: T[], selectedId: string, requestedId: string, query?: string, unreadOnly?: boolean,
+): { selectedConversationId: string, reloadConversationId: string }
 export function filterConversations<T extends Record<string, any>>(
   conversations: T[], options?: ConversationListFilter,
 ): T[]

@@ -4,6 +4,7 @@ import {
   filterConversations,
   filterQQGroupAssistantConversations,
   resolveConversationSelection,
+  resolveQQGroupAssistantInboxSelection,
 } from '../cloudflare-worker/ui/src/conversation-list.mjs'
 
 const conversations = [
@@ -49,4 +50,21 @@ test('view changes keep an in-scope selection, select the first match, or clear 
   assert.deepEqual(resolveConversationSelection([], 'wechat-selection'), {
     action: 'clear', conversation: null,
   })
+})
+
+test('refresh after an empty assistant result stays empty, then reloads an arriving scoped group', () => {
+  const empty = conversations.filter(({ id }) => id === 'normal-group' || id === 'direct')
+  const cleared = resolveQQGroupAssistantInboxSelection(empty, 'direct', '', '', false)
+  assert.deepEqual(cleared, { selectedConversationId: '', reloadConversationId: '' })
+
+  const stillEmpty = resolveQQGroupAssistantInboxSelection(empty, '', '', '', false)
+  assert.deepEqual(stillEmpty, { selectedConversationId: '', reloadConversationId: '' })
+
+  const arrived = resolveQQGroupAssistantInboxSelection([...empty, conversations[0]], '', '', '', false)
+  assert.deepEqual(arrived, { selectedConversationId: 'folded', reloadConversationId: 'folded' })
+
+  const targetedRefresh = resolveQQGroupAssistantInboxSelection(
+    [...empty, conversations[0]], 'folded', 'folded', '', false,
+  )
+  assert.deepEqual(targetedRefresh, { selectedConversationId: 'folded', reloadConversationId: '' })
 })

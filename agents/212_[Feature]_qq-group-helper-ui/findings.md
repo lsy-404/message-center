@@ -7,3 +7,5 @@
 - 首轮检查发现新 `connectorKind` 条件少了局部取值声明，Node 测试直接报 `ReferenceError`；补齐后相关测试全通过。
 - 首轮安装前 UI check/build 因 worktree 无 `node_modules` 失败；依据已锁定依赖文件离线安装后 check/build 通过。Worker 集成测试也因缺 `openid-client` 失败；在 `cloudflare-worker` 按 lockfile 离线安装后测试通过。
 - 视图切换需复用筛选无结果时的选择状态转移：保留范围内选择、否则选择首个匹配项、候选为空则清空会话与composer/read状态。`resolveConversationSelection()` 将该分支抽为纯函数供实际UI入口和测试共用。
+- inbox refresh 在未传 conversationId 时可能返回全局首会话；助手视图必须按当前助手筛选再次解析响应，空范围强制保留空选择，发现新匹配群后以该群 ID 发起精确详情读取。
+- 搜索/未读改变助手范围时也需立刻应用相同选择迁移；否则列表空了仍可能保留范围外编辑器。

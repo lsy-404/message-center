@@ -7,3 +7,5 @@
 - `pnpm check` 与 `pnpm build` 在 `cloudflare-worker/ui` 通过；`node --test test/qq-group-helper.test.mjs test/channel-labels.test.mjs test/inbox-conversation-capacity.test.mjs` 9 项通过。
 - `git diff --check` 通过；尚未提交。
 - 增量修复助手进入时的空结果状态清理并同步底层筛选为 `protocol:qq`；将 QQ 导航项放在全部之后、其他动态渠道之前，维持 QQ 在微信前的原有位置。新增选择状态迁移测试。
+- 防止空助手视图的刷新响应覆盖选择：对 inbox conversations 按当前 search/unread 和助手类型重新解析，清掉越界 messages；匹配群新出现时精确重读该群。新增 refresh-after-empty 行为测试。
+- 搜索/未读范围变化时也应用同一选择迁移；异步 inbox 响应按当前助手范围归一化，若出现新群则在列表刷新后重读精确群详情。

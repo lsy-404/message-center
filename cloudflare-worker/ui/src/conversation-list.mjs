@@ -28,6 +28,21 @@ export function resolveConversationSelection(conversations, selectedId) {
     : { action: 'clear', conversation: null }
 }
 
+export function resolveQQGroupAssistantInboxSelection(
+  conversations, selectedId, requestedId, query = '', unreadOnly = false,
+) {
+  const candidates = filterQQGroupAssistantConversations(filterConversations(conversations, { query, unreadOnly }))
+  const selection = resolveConversationSelection(candidates, selectedId)
+  const selectedConversationId = selection.action === 'keep'
+    ? selectedId
+    : selection.action === 'select' ? selection.conversation.id : ''
+  return {
+    selectedConversationId,
+    reloadConversationId: selectedConversationId && selectedConversationId !== requestedId
+      ? selectedConversationId : '',
+  }
+}
+
 export function filterConversations(conversations, options = {}) {
   const connectorKind = String(options.connectorKind || '')
   const connectorId = String(options.connectorId || '')
