@@ -89,7 +89,7 @@ def _load_saved_state(path: str) -> tuple[Optional[bool], Optional[bool]]:
             return None, True
         raw = json.loads(encoded.decode("utf-8"))
     except FileNotFoundError:
-        return None, None
+        return None, True
     except Exception:
         return None, True
     if not isinstance(raw, dict) or set(raw) != STATE_FIELDS:
