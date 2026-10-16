@@ -41,6 +41,15 @@ class ManualMonitor:
     def stop(self):
         return None
 
+    def request_fields(self):
+        return {
+            "activityStatePath": "/tmp/manual.activity.json",
+            "activityMonitorId": "a" * 32,
+            "activityRuntimePid": 123,
+            "activityResumeToken": "a" * 32 + ":123:{}:{}".format(
+                self.home_sequence, 0),
+        }
+
 
 class DeviceActivityPolicyTests(unittest.TestCase):
     def setUp(self):
@@ -70,6 +79,19 @@ class DeviceActivityPolicyTests(unittest.TestCase):
         self.assertFalse(saved["armed"])
         self.assertEqual(saved["generation"], 3)
         self.assertIsInstance(saved["publishedAt"], (int, float))
+
+    def test_native_monitor_exposes_durable_state_lease_and_resume_token(self):
+        monitor = device_activity.NativeActivityMonitor(self.state_path,
+                                                         idle_seconds=3,
+                                                         clock=self.clock)
+        fields = monitor.request_fields()
+        self.assertEqual(set(fields), {"activityStatePath", "activityMonitorId",
+                                       "activityRuntimePid", "activityResumeToken"})
+        self.assertEqual(fields["activityStatePath"], self.state_path)
+        self.assertEqual(fields["activityMonitorId"], monitor.policy.monitor_id)
+        self.assertEqual(fields["activityRuntimePid"], os.getpid())
+        self.assertEqual(fields["activityResumeToken"],
+                         f"{monitor.policy.monitor_id}:{os.getpid()}:0:0")
 
     def test_home_and_digitizer_activity_renew_the_grace(self):
         self.clock.value += 150
@@ -260,6 +282,7 @@ class DeviceActivityRuntimeTests(unittest.TestCase):
             "activityStatePath": self.db_path + ".activity.json",
             "activityMonitorId": "a" * 32,
             "activityRuntimePid": 123,
+            "activityResumeToken": "a" * 32 + ":123:0:0",
         }
         calls = []
         relay = self.make_relay(monitor, lambda request: calls.append(request) or {})
@@ -267,7 +290,8 @@ class DeviceActivityRuntimeTests(unittest.TestCase):
         self.assertEqual(calls, [{"op": "scan", "driver": "qq",
                                   "activityStatePath": self.db_path + ".activity.json",
                                   "activityMonitorId": "a" * 32,
-                                  "activityRuntimePid": 123}])
+                                  "activityRuntimePid": 123,
+                                  "activityResumeToken": "a" * 32 + ":123:0:0"}])
         relay.close()
 
     def test_resume_cleanup_signal_is_sent_once_after_activity_ends(self):
@@ -276,16 +300,32 @@ class DeviceActivityRuntimeTests(unittest.TestCase):
             "activityStatePath": self.db_path + ".activity.json",
             "activityMonitorId": "a" * 32,
             "activityRuntimePid": 123,
+            "activityResumeToken": "a" * 32 + ":123:0:0",
         }
         calls = []
-        relay = self.make_relay(monitor, lambda request: calls.append(request) or {})
+        replies = [RuntimeError("adapter unavailable"),
+                   {"activityResumeCleanupComplete": True,
+                    "activityResumeCleanupToken": "a" * 32 + ":123:0:0"}, {}]
+
+        def adapter(request):
+            calls.append(request)
+            reply = replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        relay = self.make_relay(monitor, adapter)
         self.assertTrue(relay.activity_state()["shouldPause"])
         monitor.armed = False
         self.assertFalse(relay.activity_state()["shouldPause"])
+        with self.assertRaisesRegex(RuntimeError, "adapter unavailable"):
+            relay.call_adapter({"op": "ensure-active", "driver": "qq"})
         relay.call_adapter({"op": "ensure-active", "driver": "qq"})
         relay.call_adapter({"op": "ensure-active", "driver": "qq"})
         self.assertTrue(calls[0]["activityResumeCleanup"])
-        self.assertNotIn("activityResumeCleanup", calls[1])
+        self.assertEqual(calls[0]["activityResumeToken"], "a" * 32 + ":123:0:0")
+        self.assertTrue(calls[1]["activityResumeCleanup"])
+        self.assertNotIn("activityResumeCleanup", calls[2])
         relay.close()
 
     def event(self, ident):

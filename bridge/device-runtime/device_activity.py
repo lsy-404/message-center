@@ -274,14 +274,6 @@ class ActivityPolicy:
             "runtimePid": os.getpid(),
         }
 
-    def request_fields(self) -> dict[str, Any]:
-        return {
-            "activityStatePath": self.policy.state_path,
-            "activityMonitorId": self.policy.monitor_id,
-            "activityRuntimePid": os.getpid(),
-        }
-
-
 class InactiveHostMonitor:
     def start(self) -> None:
         return None
@@ -320,6 +312,17 @@ class NativeActivityMonitor:
 
     def snapshot(self) -> dict[str, Any]:
         return self.policy.snapshot()
+
+    def request_fields(self) -> dict[str, Any]:
+        state = self.policy.snapshot()
+        return {
+            "activityStatePath": self.policy.state_path,
+            "activityMonitorId": self.policy.monitor_id,
+            "activityRuntimePid": os.getpid(),
+            "activityResumeToken": "{}:{}:{}:{}".format(
+                self.policy.monitor_id, os.getpid(), state["homeSequence"],
+                state["digitizerSequence"]),
+        }
 
     def stop(self, timeout: float = 3.0) -> None:
         self._stop_event.set()

@@ -537,6 +537,7 @@ class Relay:
         self.activity_pause_active = False
         self.activity_fresh_required = set()
         self.activity_resume_pending = False
+        self.activity_resume_token = None
 
     def activity_state(self):
         try:
@@ -551,13 +552,24 @@ class Relay:
         paused = state["shouldPause"] or state["armed"] or not state["healthy"]
         was_paused = self.activity_pause_active
         if paused and not was_paused:
+            self.activity_resume_pending = False
+            self.activity_resume_token = None
             self.activity_fresh_required.update(self.connector_by_id)
             for connector_id in self.connector_by_id:
                 self.health[connector_id] = False
                 self.last_scan[connector_id] = float("-inf")
             self.wake_ready = False
         elif was_paused and not paused:
-            self.activity_resume_pending = True
+            request_fields = getattr(self.activity_monitor, "request_fields", None)
+            fields = request_fields() if callable(request_fields) else None
+            token = fields.get("activityResumeToken") if isinstance(fields, dict) else None
+            if type(token) is str and token:
+                self.activity_resume_pending = True
+                self.activity_resume_token = token
+            else:
+                paused = True
+                state = state | {"healthy": False, "armed": True,
+                                 "reason": "activity_resume_token_unknown"}
         self.activity_pause_active = paused
         return state | {"shouldPause": paused}
 
@@ -576,14 +588,22 @@ class Relay:
             guarded_request = dict(request)
             fields = request_fields()
             if (not isinstance(fields, dict) or set(fields) != {
-                    "activityStatePath", "activityMonitorId", "activityRuntimePid"}):
+                    "activityStatePath", "activityMonitorId", "activityRuntimePid",
+                    "activityResumeToken"}):
                 raise RuntimeError("activity_request_state_invalid")
             guarded_request.update(fields)
             if request.get("op") == "ensure-active" and self.activity_resume_pending:
                 guarded_request["activityResumeCleanup"] = True
-                self.activity_resume_pending = False
+                guarded_request["activityResumeToken"] = self.activity_resume_token
             request = guarded_request
-        return self.adapter_call(request)
+        response = self.adapter_call(request)
+        if (request.get("activityResumeCleanup") is True and
+                isinstance(response, dict) and
+                response.get("activityResumeCleanupComplete") is True and
+                response.get("activityResumeCleanupToken") == self.activity_resume_token):
+            self.activity_resume_pending = False
+            self.activity_resume_token = None
+        return response
 
     def media_directory_for(self, connector_id):
         if not any(item["id"] == connector_id for item in self.connectors):

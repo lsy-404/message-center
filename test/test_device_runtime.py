@@ -46,8 +46,21 @@ class DeviceRuntimeTests(unittest.TestCase):
             "pageLimit": 20,
         }
         self.db = runtime.open_database(self.db_path)
+        self.inactive_monitors = []
+
+        def inactive_monitor(_path):
+            monitor = runtime.device_activity.InactiveHostMonitor()
+            self.inactive_monitors.append(monitor)
+            return monitor
+
+        self.activity_factory_patch = patch.object(
+            runtime.device_activity, "create_monitor", side_effect=inactive_monitor)
+        self.activity_factory_patch.start()
 
     def tearDown(self):
+        self.activity_factory_patch.stop()
+        for monitor in self.inactive_monitors:
+            monitor.stop()
         self.db.close()
         self.temp.cleanup()
 
