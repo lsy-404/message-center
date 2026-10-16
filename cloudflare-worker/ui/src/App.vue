@@ -103,6 +103,7 @@ type Message = {
   senderName: string
   senderAvatarPath?: string | null
   body: string
+  presentation?: 'system'
   contentType: string
   occurredAt: string
   deliveryState?: string | null
@@ -281,6 +282,9 @@ const threadRows = computed(() => threadEntries.value.map((entry) => {
   if (entry.kind === 'day') return entry
   const blocks = parseMessageBody(messageBody(entry.message))
   const solo = blocks.length === 1 && !entry.message.attachments.length ? blocks[0] : null
+  const explicitSystemText = entry.message.presentation === 'system' && entry.message.direction === 'inbound'
+      && entry.message.attachments.length === 0 && entry.message.body.trim()
+    ? entry.message.body : ''
   return {
     ...entry,
     byAgent: isAgentMessage(entry.message),
@@ -288,7 +292,8 @@ const threadRows = computed(() => threadEntries.value.map((entry) => {
     aiRead: entry.message.direction === 'outbound' ? null : entry.message.agentRead ?? null,
     blocks,
     // A lone pat reads as a system line; a lone card or transfer is its own bubble.
-    systemText: solo?.type === 'notice' ? solo.text : '',
+    systemText: explicitSystemText || (solo?.type === 'notice' ? solo.text : ''),
+    systemPresentation: explicitSystemText ? 'system' : solo?.type === 'notice' ? 'notice' : '',
     bare: solo?.type === 'card' || solo?.type === 'money',
   }
 }))
@@ -1422,12 +1427,13 @@ onUnmounted(() => {
             <article
               v-else-if="entry.systemText"
               :data-message-id="entry.message.id"
+              :data-presentation="entry.systemPresentation || undefined"
               class="message-row system"
               :data-direction="entry.message.direction"
               :data-ai-read="entry.aiRead === null ? undefined : String(entry.aiRead)"
             >
-              <p class="system-notice" data-block="notice">
-                <AppIcon name="handWave" :size="14" />{{ entry.systemText }}
+              <p class="system-notice" :data-block="entry.systemPresentation === 'system' ? 'system' : 'notice'">
+                <AppIcon v-if="entry.systemPresentation !== 'system'" name="handWave" :size="14" />{{ entry.systemText }}
                 <time class="sr-only" :datetime="isoTime(entry.message.occurredAt)">{{ formatFullStamp(entry.message.occurredAt) }}</time>
               </p>
             </article>

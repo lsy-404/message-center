@@ -35,6 +35,7 @@ export interface IncomingBridgeMessage {
   /** Device-side observation time; separates messages seen before/after a native unread snapshot. */
   observedAt?: string;
   text: string;
+  presentation?: "system";
   attachments: IncomingAttachment[];
   conversationType?: ConversationType;
   trigger?: MessageTrigger;

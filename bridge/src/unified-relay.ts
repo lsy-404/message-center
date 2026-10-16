@@ -465,6 +465,7 @@ async function main(): Promise<void> {
           senderId: value.message.sender.id,
           senderName: value.message.sender.displayName,
           body: value.message.text,
+          ...(value.message.presentation ? { presentation: value.message.presentation } : {}),
           contentType: attachments.length ? 'mixed' : 'text',
           occurredAt: value.message.receivedAt,
           ...(value.message.observedAt ? { observedAt: value.message.observedAt } : {}),

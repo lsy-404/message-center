@@ -1288,11 +1288,15 @@ class DeviceRuntimeTests(unittest.TestCase):
         direct = self.event("direct-event")
         self_group = dict(self.event("self-group-background"), conversationType="group",
                           trigger="background", isSelf=True)
+        system = dict(self.event("group-system-background"), conversationType="group",
+                      trigger="background", isSelf=False, contentType="text", presentation="system")
         for message in (group, direct):
             self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,1)",
                             ("connector-a", "primary", message["externalId"], runtime.compact(message)))
         self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,1)",
                         ("connector-a", "primary", self_group["externalId"], runtime.compact(self_group)))
+        self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,1)",
+                        ("connector-a", "primary", system["externalId"], runtime.compact(system)))
         self.db.commit()
         calls = []
         uploaded = []
@@ -1307,9 +1311,46 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual([path for path, _ in calls], [
             "/api/connectors/group-text-backups", "/api/connectors/events"])
         self.assertEqual([message["externalId"] for message in calls[1][1]["messages"]],
-                         ["direct-event", "self-group-background"])
+                         ["direct-event", "self-group-background", "group-system-background"])
+        self.assertEqual(calls[1][1]["messages"][-1]["presentation"], "system")
         self.assertEqual(uploaded, [])
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+
+    def test_system_presentation_is_validated_before_normal_event_routing(self):
+        base = dict(self.event("system-message"), conversationType="group", trigger="background",
+                    isSelf=False, contentType="text", presentation="system")
+        cases = [
+            ("non-qq", {"connectorKind": "wechat"}),
+            ("self", {"isSelf": True}),
+            ("missing-direction", {"isSelf": None}),
+            ("mixed-content", {"contentType": "mixed"}),
+            ("blank-text", {"body": "  "}),
+            ("bad-marker", {"presentation": "notice"}),
+            ("null-marker", {"presentation": None}),
+        ]
+        for label, updates in cases:
+            with self.subTest(label=label):
+                connector = dict(self.config["connectors"][0])
+                connector["kind"] = updates.get("connectorKind", "qq")
+                self.config["connectors"] = [connector]
+                message = {**base, **{key: value for key, value in updates.items() if key != "connectorKind"}}
+                if message.get("isSelf") is None:
+                    message.pop("isSelf")
+                relay = runtime.Relay(self.config, self.db, lambda request: {
+                    "ok": True, "sourceReadOk": True, "health": "online", "cursor": {}, "messages": [message],
+                }, lambda *args: {"ok": True})
+                with self.assertRaisesRegex(RuntimeError, "invalid_event_presentation"):
+                    relay.scan_profile("primary")
+        self.config["connectors"][0]["kind"] = "qq"
+        message = {**base, "attachments": [{
+            "externalId": "system-file", "stagingKey": "bad.png", "fileName": "bad.png",
+            "mimeType": "image/png", "sizeBytes": 1, "sha256": "0" * 64,
+        }]}
+        relay = runtime.Relay(self.config, self.db, lambda request: {
+            "ok": True, "sourceReadOk": True, "health": "online", "cursor": {}, "messages": [message],
+        }, lambda *args: {"ok": True})
+        with self.assertRaisesRegex(RuntimeError, "invalid_event_presentation"):
+            relay.scan_profile("primary")
 
     def test_self_group_with_attachment_uses_normal_event_route_and_skips_backup_text_guard(self):
         media_root = os.path.join(self.temp.name, "media")

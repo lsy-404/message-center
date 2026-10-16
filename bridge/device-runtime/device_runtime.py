@@ -93,6 +93,8 @@ def explicit_native_create_script_timeout(value):
 
 
 def _event_route(message):
+    if message.get("presentation") == "system":
+        return "/api/connectors/events"
     default_trigger = "background" if message.get("conversationType") == "group" else "direct"
     background_group = (message.get("conversationType") == "group" and
                         message.get("trigger", default_trigger) == "background" and
@@ -893,11 +895,24 @@ class Relay:
                 raise RuntimeError("invalid_event")
             if "isSelf" in message and type(message["isSelf"]) is not bool:
                 raise RuntimeError("invalid_event")
+            presentation = message.get("presentation")
+            if "presentation" in message and presentation != "system":
+                raise RuntimeError("invalid_event_presentation")
             attachments = message.get("attachments", [])
             if attachments is None:
                 attachments = []
             if not isinstance(attachments, list) or len(attachments) > 20:
                 raise RuntimeError("invalid_attachments")
+            if presentation == "system":
+                body = message.get("body", "")
+                content_type = message.get("contentType", "text")
+                try:
+                    body_length = len(body.encode("utf-16-le")) // 2
+                except UnicodeEncodeError:
+                    raise RuntimeError("invalid_event_presentation")
+                if (driver != "qq" or message.get("isSelf") is not False or attachments or
+                        content_type not in (None, "", "text") or not body.strip() or body_length > 20000):
+                    raise RuntimeError("invalid_event_presentation")
             normalized_attachments = []
             for attachment in attachments:
                 normalized_attachments.append(self.validate_staged_attachment(attachment))

@@ -44,6 +44,9 @@ async function main() {
         { id: 'inbound-state-message', direction: 'inbound', senderName: '张三', body: '入站消息', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'queued', authorRole: 'contact', agentRead: true, attachments: [] },
         { id: 'agent-message', direction: 'outbound', senderName: 'Agent', body: '代理回复', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'delivered', authorRole: 'agent', attachments: [] },
         { id: 'agent-unread-message', direction: 'inbound', senderName: '张三', body: '「李四：原文」\n- - - - - - - - - - - - - - -\n回复内容\n[小程序] 腾讯文档 · 排期表 · 腾讯文档', contentType: 'text', occurredAt: new Date().toISOString(), authorRole: 'contact', agentRead: false, attachments: [] },
+        { id: 'qq-system-message', direction: 'inbound', senderName: 'hidden member alias', senderAvatarPath: '/avatars/hidden.svg', body: '一位新成员加入了群聊', presentation: 'system', contentType: 'text', occurredAt: new Date().toISOString(), attachments: [] },
+        { id: 'unmarked-system-looking-message', direction: 'inbound', senderName: '普通成员', body: '这是一条普通消息', contentType: 'text', occurredAt: new Date().toISOString(), attachments: [] },
+        { id: 'unmarked-placeholder-message', direction: 'inbound', senderName: '普通成员', body: '[类型:8]', contentType: 'text', occurredAt: new Date().toISOString(), attachments: [] },
       ],
     }
     let inboxRequestCount = 0
@@ -98,6 +101,21 @@ async function main() {
     assert.equal(await card.getAttribute('data-card-kind'), 'miniprogram')
     assert.equal(await card.locator('.card-title').textContent(), '腾讯文档')
     assert.equal(await card.locator('.card-summary').textContent(), '排期表')
+    const systemRow = page.locator('.message-row[data-message-id="qq-system-message"]')
+    assert.equal(await systemRow.getAttribute('data-presentation'), 'system')
+    const systemNotice = systemRow.locator('.system-notice')
+    assert.equal(await systemNotice.evaluate((element) => Array.from(element.childNodes)
+      .filter((node) => node.nodeType === Node.TEXT_NODE).map((node) => node.textContent).join('').trim()),
+    '一位新成员加入了群聊')
+    assert.equal(await systemNotice.evaluate((element) => getComputedStyle(element).textAlign), 'center')
+    assert.equal(await systemRow.locator('.message-avatar, .message-sender').count(), 0,
+      'explicit QQ system rows hide member identity and avatar')
+    for (const id of ['unmarked-system-looking-message', 'unmarked-placeholder-message']) {
+      const ordinaryRow = page.locator(`.message-row[data-message-id="${id}"]`)
+      assert.equal(await ordinaryRow.getAttribute('data-presentation'), null)
+      assert.equal(await ordinaryRow.locator('.message-sender').count(), 1,
+        'body text alone never selects system presentation')
+    }
     assert.ok(await page.locator('.day-divider time[datetime]').count() >= 1, 'thread shows a dated day divider')
     const stamp = await page.locator('.message-row[data-message-id="text-message"] .message-meta time').getAttribute('datetime')
     assert.ok(!Number.isNaN(Date.parse(stamp)), 'message time exposes a machine-readable timestamp')
