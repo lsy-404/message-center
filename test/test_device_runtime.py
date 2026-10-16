@@ -56,6 +56,18 @@ class DeviceRuntimeTests(unittest.TestCase):
                 "conversationTitle": "Test", "senderName": "Sender",
                 "occurredAt": "2026-10-07T12:00:00.000Z", "body": ident}
 
+    def save_cursor(self, connector_id="connector-a", profile="primary", cursor=None):
+        if cursor is None:
+            cursor = {"version": 1, "conversations": {},
+                      "qqFriendDirectory": {"schema": "qfd1", "ownerUin": "1234", "entries": []}}
+        self.db.execute(
+            "INSERT INTO cursors(connector_id,profile,value) VALUES(?,?,?) "
+            "ON CONFLICT(connector_id,profile) DO UPDATE SET value=excluded.value",
+            (connector_id, profile, runtime.compact(cursor)),
+        )
+        self.db.commit()
+        return cursor
+
     def event_ack(self, received, inserted=None, upgraded=0, promoted=0, suppressed=0):
         return {"ok": True, "received": received,
                 "inserted": received if inserted is None else inserted,
@@ -671,6 +683,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(runtime.ADAPTER_SCAN_TIMEOUT, 60)
 
     def test_send_adapter_timeout_uses_longer_deadline_and_remains_uncertain(self):
+        self.save_cursor()
         command = {"id": "command-timeout", "leaseToken": "lease-timeout",
                    "idempotencyKey": "key-timeout",
                    "payload": {"externalConversationId": "primary:conversation-aaaaaaaa",
@@ -1352,6 +1365,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertFalse(any(path.startswith("/api/connectors/commands") for _, path, _ in calls))
 
     def test_started_send_is_marked_uncertain_without_second_adapter_call(self):
+        self.save_cursor()
         command = {"id": "command-1", "leaseToken": "lease-1", "idempotencyKey": "key-1",
                    "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "hello"}}
         adapter_calls = []
@@ -1372,6 +1386,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertTrue(completions[-1]["uncertain"])
 
     def test_lost_completion_response_replays_saved_result_without_resending(self):
+        self.save_cursor()
         command = {"id": "command-2", "leaseToken": "lease-2", "idempotencyKey": "key-2",
                    "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "hello"}}
         adapter_calls = []
@@ -1388,7 +1403,10 @@ class DeviceRuntimeTests(unittest.TestCase):
         relay = runtime.Relay(self.config, self.db, adapter, http)
         with self.assertRaises(OSError):
             relay.process_command(command, "primary")
-        relay.process_command(command, "primary")
+        self.db.execute("DELETE FROM cursors WHERE connector_id='connector-a' AND profile='primary'")
+        self.db.commit()
+        with patch.object(relay, "qq_send_cursor", side_effect=AssertionError("done command reloaded cursor")):
+            relay.process_command(command, "primary")
         self.assertEqual(len(adapter_calls), 1)
         self.assertEqual(completion_calls[0], completion_calls[1])
 
@@ -1406,7 +1424,105 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(adapter_calls, [])
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM command_ledger").fetchone()[0], 0)
 
+    def test_qq_send_cursor_requires_exact_connector_profile_and_valid_bounded_state(self):
+        cases = (
+            ("wrong-profile", "secondary", {"scope": "profile"}, "qq_send_scope_mismatch"),
+            ("missing", "primary", None, "qq_send_cursor_unavailable"),
+            ("invalid-json", "primary", "{", "qq_send_cursor_invalid"),
+            ("invalid-shape", "primary", {"version": 2, "conversations": {}}, "qq_send_cursor_invalid"),
+            ("oversized", "primary", {"version": 1, "conversations": {}, "x": "a" * 65540},
+             "qq_send_cursor_oversized"),
+        )
+        for index, (label, profile, stored, expected_error) in enumerate(cases):
+            with self.subTest(label=label):
+                self.db.execute("DELETE FROM cursors")
+                if isinstance(stored, str):
+                    self.db.execute(
+                        "INSERT INTO cursors(connector_id,profile,value) VALUES(?,?,?)",
+                        ("connector-a", "primary", stored),
+                    )
+                    self.db.commit()
+                elif stored is not None:
+                    self.save_cursor(cursor=stored)
+                adapter_calls = []
+                completions = []
+                relay = runtime.Relay(
+                    self.config, self.db,
+                    lambda request: adapter_calls.append(request) or qq_receipt_result(),
+                    lambda method, path, payload=None: completions.append(payload) or {"ok": True},
+                )
+                command = {"id": f"cursor-{index}", "leaseToken": "lease-cursor",
+                           "idempotencyKey": f"cursor-key-{index}",
+                           "payload": {"externalConversationId": "primary:conversation-aaaaaaaa",
+                                       "body": "hello"}}
+                relay.process_command(command, profile)
+                self.assertEqual(adapter_calls, [])
+                self.assertEqual(completions[-1]["connectorId"], "connector-a")
+                self.assertEqual(completions[-1]["leaseToken"], "lease-cursor")
+                self.assertEqual({key: completions[-1][key] for key in ("ok", "dispatched", "error")}, {
+                    "ok": False, "dispatched": False, "error": expected_error,
+                })
+                state, result, retryable = self.db.execute(
+                    "SELECT state,result,retryable FROM command_ledger WHERE connector_id=? AND idempotency_key=?",
+                    ("connector-a", f"cursor-key-{index}"),
+                ).fetchone()
+                self.assertEqual(state, "done")
+                self.assertEqual(json.loads(result), {
+                    "ok": False, "dispatched": False, "error": expected_error,
+                })
+                self.assertEqual(retryable, 0)
+
+    def test_qq_send_cursor_accepts_exact_existing_size_limit(self):
+        base = {"version": 1, "conversations": {}}
+        overhead = len(runtime.compact(dict(base, padding="")).encode("utf-8"))
+        cursor = dict(base, padding="x" * (runtime.MAX_CURSOR_BYTES - overhead))
+        self.assertEqual(len(runtime.compact(cursor).encode("utf-8")), runtime.MAX_CURSOR_BYTES)
+        self.save_cursor(cursor=cursor)
+        relay = runtime.Relay(self.config, self.db, lambda _request: {}, lambda *_args: {"ok": True})
+        self.assertEqual(relay.qq_send_cursor(self.config["connectors"][0], "primary"), cursor)
+
+    def test_qq_send_cursor_never_reads_another_connector_row(self):
+        self.config["connectors"].append({
+            "id": "connector-b", "token": "y" * 40, "kind": "qq",
+            "accountLabel": "other", "displayName": "other", "profile": "primary",
+        })
+        self.db.execute(
+            "INSERT INTO cursors(connector_id,profile,value) VALUES(?,?,?)",
+            ("connector-b", "primary", runtime.compact({"version": 1, "conversations": {}})),
+        )
+        self.db.commit()
+        relay = runtime.Relay(self.config, self.db, lambda _request: {}, lambda *_args: {"ok": True})
+        with self.assertRaisesRegex(runtime.SendPreDispatchError, "qq_send_scope_mismatch"):
+            relay.qq_send_cursor({"id": "connector-b", "kind": "qq", "profile": "primary"}, "primary")
+        with self.assertRaisesRegex(runtime.SendPreDispatchError, "qq_send_cursor_unavailable"):
+            relay.qq_send_cursor(self.config["connectors"][0], "primary")
+
+    def test_wechat_send_request_does_not_receive_qq_cursor(self):
+        wechat = {"id": "connector-b", "token": "y" * 40, "kind": "wechat",
+                  "accountLabel": "other", "displayName": "other", "profile": "secondary"}
+        self.config["connectors"].append(wechat)
+        self.save_cursor(connector_id="connector-a", profile="primary")
+        self.save_cursor(connector_id="connector-b", profile="secondary")
+        adapter_calls = []
+        completions = []
+        relay = runtime.Relay(
+            self.config, self.db,
+            lambda request: adapter_calls.append(request) or {
+                "ok": True, "receipt": "wechat-receipt", "dispatched": True,
+            },
+            lambda method, path, payload=None: completions.append(payload) or {"ok": True},
+        )
+        relay.select_connector(wechat)
+        command = {"id": "wechat-command", "leaseToken": "lease-wechat", "idempotencyKey": "wechat-key",
+                   "payload": {"externalConversationId": "secondary:conversation-aaaaaaaa", "body": "hello"}}
+        relay.process_command(command, "secondary")
+        self.assertEqual(len(adapter_calls), 1)
+        self.assertEqual(adapter_calls[0]["driver"], "wechat")
+        self.assertNotIn("cursor", adapter_calls[0])
+        self.assertNotIn("cursor", completions[-1])
+
     def test_leased_command_passes_driver_canonical_target_and_authorization(self):
+        cursor = self.save_cursor()
         command = {
             "id": "command-authorized", "leaseToken": "lease-authorized",
             "idempotencyKey": "key-authorized",
@@ -1445,11 +1561,14 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(request["body"], "exact command body")
         self.assertIs(request["confirmed"], True)
         self.assertIs(request["targetConfirmed"], True)
+        self.assertEqual(request["cursor"], cursor)
         self.assertNotIn("targetAlias", request)
+        self.assertNotIn("cursor", http_calls[-1][2])
         self.assertEqual(len(http_calls), 2)
         self.assertEqual(timeline, ["lease", "adapter"])
 
     def test_qq_receipt_external_id_is_forwarded_to_completion(self):
+        self.save_cursor()
         command = {"id": "command-receipt-id", "leaseToken": "lease-receipt-id",
                    "idempotencyKey": "key-receipt-id",
                    "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "body"}}
@@ -1462,6 +1581,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(json.loads(completion["result"]["receipt"])["sourceId"], "9007199254740993")
 
     def test_qq_receipt_mismatch_is_terminal_uncertain(self):
+        self.save_cursor()
         command = {"id": "command-bad-receipt", "leaseToken": "lease-bad-receipt",
                    "idempotencyKey": "key-bad-receipt",
                    "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "body"}}
@@ -1479,6 +1599,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(completions[-1]["error"], "qq_receipt_identity_unverified")
 
     def test_retryable_unknown_dispatch_is_uncertain_and_never_retried(self):
+        self.save_cursor()
         command = {"id": "command-4", "leaseToken": "lease-4", "idempotencyKey": "key-4",
                    "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "hello"}}
         adapter_calls = []
@@ -1494,6 +1615,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertTrue(completions[-1]["uncertain"])
 
     def test_reused_idempotency_key_with_changed_payload_is_fenced(self):
+        self.save_cursor()
         command = {"id": "command-5", "leaseToken": "lease-5", "idempotencyKey": "key-5",
                    "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "hello"}}
         adapter_calls = []

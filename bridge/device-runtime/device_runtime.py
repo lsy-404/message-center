@@ -24,6 +24,7 @@ if os.name == "posix":
 
 MAX_RESPONSE = 1024 * 1024
 MAX_SCAN_RESPONSE = 900 * 1024
+MAX_CURSOR_BYTES = 65_536
 MAX_EVENT = 256 * 1024
 MAX_OUTBOX_BATCH_MESSAGES = 20
 MAX_OUTBOX_BATCH_BYTES = MAX_SCAN_RESPONSE
@@ -55,6 +56,10 @@ class SourceReadError(RuntimeError):
         super().__init__(code)
         self.attach_failure_pid = attach_failure_pid
         self.query_gate_pending_pid = query_gate_pending_pid
+
+
+class SendPreDispatchError(RuntimeError):
+    pass
 
 
 def explicit_native_query_gate_pending(value):
@@ -798,7 +803,7 @@ class Relay:
                 encoded.append((self.connector, profile, str(message["externalId"]), body,
                                 len(raw) + media_size))
         candidate = compact(result.get("cursor"))
-        if len(candidate.encode("utf-8")) > 65536:
+        if len(candidate.encode("utf-8")) > MAX_CURSOR_BYTES:
             raise RuntimeError("cursor_too_large")
         sync_profiles(self, result.get("conversationProfiles", []))
         sync_sender_avatars(self, result.get("senderAvatars", []))
@@ -1065,6 +1070,37 @@ class Relay:
         self.http_call("POST", "/api/connectors/commands/" + urllib.parse.quote(command["id"], safe="") + "/complete",
                        {"connectorId": self.connector, "leaseToken": command["leaseToken"], **result})
 
+    def qq_send_cursor(self, connector, profile):
+        if (not isinstance(connector, dict) or connector.get("id") != self.connector
+                or connector.get("kind") != "qq" or connector.get("profile") != profile
+                or not isinstance(profile, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", profile)):
+            raise SendPreDispatchError("qq_send_scope_mismatch")
+        try:
+            row = self.db.execute(
+                "SELECT value FROM cursors WHERE connector_id=? AND profile=?",
+                (self.connector, profile),
+            ).fetchone()
+        except sqlite3.Error:
+            raise SendPreDispatchError("qq_send_cursor_unavailable") from None
+        if row is None:
+            raise SendPreDispatchError("qq_send_cursor_unavailable")
+        try:
+            raw_cursor = row[0]
+            if not isinstance(raw_cursor, str) or len(raw_cursor.encode("utf-8")) > MAX_CURSOR_BYTES:
+                raise SendPreDispatchError("qq_send_cursor_oversized")
+            cursor = json.loads(raw_cursor)
+            encoded_size = len(compact(cursor).encode("utf-8"))
+        except SendPreDispatchError:
+            raise
+        except (TypeError, ValueError, UnicodeError):
+            raise SendPreDispatchError("qq_send_cursor_invalid") from None
+        if (not isinstance(cursor, dict) or cursor.get("version") != 1
+                or not isinstance(cursor.get("conversations"), dict)):
+            raise SendPreDispatchError("qq_send_cursor_invalid")
+        if encoded_size > MAX_CURSOR_BYTES:
+            raise SendPreDispatchError("qq_send_cursor_oversized")
+        return cursor
+
     def process_command(self, command, profile):
         key = command.get("idempotencyKey")
         if not key:
@@ -1126,13 +1162,16 @@ class Relay:
             driver = connector.get("kind")
             if driver not in {"qq", "wechat"}:
                 raise RuntimeError("unsupported_connector_driver")
-            result = self.adapter_call({"op": "send", "driver": driver,
-                                        "profile": profile, "commandId": command["id"],
-                                        "idempotencyKey": key,
-                                        "conversationExternalId": payload.get("externalConversationId"),
-                                        "body": payload.get("body", ""),
-                                        "confirmed": True, "targetConfirmed": True,
-                                        "attachments": payload.get("attachments", [])})
+            request = {"op": "send", "driver": driver,
+                       "profile": profile, "commandId": command["id"],
+                       "idempotencyKey": key,
+                       "conversationExternalId": payload.get("externalConversationId"),
+                       "body": payload.get("body", ""),
+                       "confirmed": True, "targetConfirmed": True,
+                       "attachments": payload.get("attachments", [])}
+            if driver == "qq":
+                request["cursor"] = self.qq_send_cursor(connector, profile)
+            result = self.adapter_call(request)
             if result.get("ok") is True and isinstance(result.get("receipt"), str) and result.get("receipt"):
                 if driver == "qq":
                     external_id = result.get("externalId")
@@ -1157,6 +1196,8 @@ class Relay:
             else:
                 outcome = {"uncertain": True, "error": "device_send_outcome_uncertain"}
                 retryable = 0
+        except SendPreDispatchError as error:
+            outcome, retryable = {"ok": False, "dispatched": False, "error": str(error)}, 0
         except Exception:
             outcome, retryable = {"uncertain": True, "error": "device_send_outcome_uncertain"}, 0
         if not retryable:
