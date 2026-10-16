@@ -6,3 +6,4 @@
 - 新增 `test/qq-group-helper.test.mjs`：覆盖 folded/message_box 纳入、normal/direct/其他协议/unknown 排除、搜索/未读组合和自定义 display label。
 - `pnpm check` 与 `pnpm build` 在 `cloudflare-worker/ui` 通过；`node --test test/qq-group-helper.test.mjs test/channel-labels.test.mjs test/inbox-conversation-capacity.test.mjs` 9 项通过。
 - `git diff --check` 通过；尚未提交。
+- 增量修复助手进入时的空结果状态清理并同步底层筛选为 `protocol:qq`；将 QQ 导航项放在全部之后、其他动态渠道之前，维持 QQ 在微信前的原有位置。新增选择状态迁移测试。

@@ -18,6 +18,7 @@ import {
   nextConversationPage,
   pageConversations,
   previousConversationPage,
+  resolveConversationSelection,
 } from './conversation-list.mjs'
 import {
   avatarTone,
@@ -186,18 +187,18 @@ const filters = computed(() => {
     count: items.length,
     unread: items.reduce((total, item) => total + Math.max(0, Number(item.unreadCount) || 0), 0),
   })
+  const qqConversations = snapshot.value.conversations.filter((item) => item.connectorKind === 'qq')
   return [
     { id: 'all', label: '全部', channel: '', ...summarize(snapshot.value.conversations) },
+    ...(qqConversations.length ? [{
+      id: 'protocol:qq', label: 'QQ', channel: 'QQ', ...summarize(qqConversations),
+    }] : []),
     ...[...labels.values()].map((label) => ({
       id: `channel:${label}`,
       label,
       channel: label,
       ...summarize(snapshot.value.conversations.filter((item) => channelLabel(item) === label)),
     })),
-    ...(snapshot.value.conversations.some((item) => item.connectorKind === 'qq') ? [{
-      id: 'protocol:qq', label: 'QQ', channel: 'QQ',
-      ...summarize(snapshot.value.conversations.filter((item) => item.connectorKind === 'qq')),
-    }] : []),
   ]
 })
 const totalUnread = computed(() => filters.value[0]?.unread ?? 0)
@@ -809,30 +810,30 @@ function selectFilter(id: string, connectorId = '') {
   activeConnectorId.value = connectorId
   showInstances.value = false
   mobileThread.value = false
-  if (!filteredConversations.value.some((conversation) => conversation.id === selectedId.value)) {
-    const nextConversation = filteredConversations.value[0]
-    if (nextConversation) {
-      void selectConversation(nextConversation, false)
-    } else {
-      storeComposer()
-      pendingScrollToBottomId = null
-      cancelInboxRead()
-      selectedId.value = ''
-      restoreComposer('')
-      snapshot.value.messages = []
-      detailLoading.value = false
-    }
-  }
+  applyConversationSelection(filteredConversations.value)
 }
 
 function showQQGroups() {
   showQQGroupAssistant.value = true
+  activeFilter.value = 'protocol:qq'
   activeConnectorId.value = ''
   showInstances.value = false
   mobileThread.value = false
-  if (!filteredQQGroupAssistantConversations.value.some((conversation) => conversation.id === selectedId.value)) {
-    const nextConversation = filteredQQGroupAssistantConversations.value[0]
-    if (nextConversation) void selectConversation(nextConversation, false)
+  applyConversationSelection(filteredQQGroupAssistantConversations.value)
+}
+
+function applyConversationSelection(conversations: Conversation[]) {
+  const selection = resolveConversationSelection(conversations, selectedId.value)
+  if (selection.action === 'select' && selection.conversation) {
+    void selectConversation(selection.conversation, false)
+  } else if (selection.action === 'clear') {
+    storeComposer()
+    pendingScrollToBottomId = null
+    cancelInboxRead()
+    selectedId.value = ''
+    restoreComposer('')
+    snapshot.value.messages = []
+    detailLoading.value = false
   }
 }
 

@@ -18,6 +18,16 @@ export function filterQQGroupAssistantConversations(conversations) {
   return conversations.filter(isQQGroupAssistantConversation)
 }
 
+export function resolveConversationSelection(conversations, selectedId) {
+  if (conversations.some((conversation) => conversation.id === selectedId)) {
+    return { action: 'keep', conversation: null }
+  }
+  const conversation = conversations[0]
+  return conversation
+    ? { action: 'select', conversation }
+    : { action: 'clear', conversation: null }
+}
+
 export function filterConversations(conversations, options = {}) {
   const connectorKind = String(options.connectorKind || '')
   const connectorId = String(options.connectorId || '')

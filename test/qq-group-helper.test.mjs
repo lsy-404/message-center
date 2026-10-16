@@ -3,6 +3,7 @@ import test from 'node:test'
 import {
   filterConversations,
   filterQQGroupAssistantConversations,
+  resolveConversationSelection,
 } from '../cloudflare-worker/ui/src/conversation-list.mjs'
 
 const conversations = [
@@ -35,4 +36,17 @@ test('QQ list filtering uses connector kind even when its display label is custo
     filterConversations(conversations, { connectorKind: 'qq' }).map(({ id }) => id),
     ['folded', 'message-box', 'normal-group', 'direct', 'unknown-placement'],
   )
+})
+
+test('view changes keep an in-scope selection, select the first match, or clear an empty scope', () => {
+  const candidates = filterQQGroupAssistantConversations(conversations)
+  assert.deepEqual(resolveConversationSelection(candidates, 'message-box'), {
+    action: 'keep', conversation: null,
+  })
+  assert.deepEqual(resolveConversationSelection(candidates, 'wechat-selection'), {
+    action: 'select', conversation: candidates[0],
+  })
+  assert.deepEqual(resolveConversationSelection([], 'wechat-selection'), {
+    action: 'clear', conversation: null,
+  })
 })

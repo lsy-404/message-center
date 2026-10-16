@@ -6,3 +6,4 @@
 - UI 选择仍经 `selectConversationById()` / `selectConversation()`；本次不改发送、Worker schema、适配器或配置。
 - 首轮检查发现新 `connectorKind` 条件少了局部取值声明，Node 测试直接报 `ReferenceError`；补齐后相关测试全通过。
 - 首轮安装前 UI check/build 因 worktree 无 `node_modules` 失败；依据已锁定依赖文件离线安装后 check/build 通过。Worker 集成测试也因缺 `openid-client` 失败；在 `cloudflare-worker` 按 lockfile 离线安装后测试通过。
+- 视图切换需复用筛选无结果时的选择状态转移：保留范围内选择、否则选择首个匹配项、候选为空则清空会话与composer/read状态。`resolveConversationSelection()` 将该分支抽为纯函数供实际UI入口和测试共用。
