@@ -1,8 +1,5 @@
 # Findings
 
-- The public runtime's `Relay.pass_once()` flushes outbox before source reads and command polling. User-idle gating should leave outbox upload active, suppress scan/readiness auto-wake and command lease/send paths, and force heartbeat `offline` until a fresh source read after resume.
-- `Relay` owns the runtime thread; the monitor should own its own CFRunLoop thread, callback object, IOKit client, and all CF references until explicit stop. Callback reads only event type and keyboard page/usage/down; Digitizer events count as activity without retaining coordinates or touch content.
-- Root verified on-device ctypes loading for IOKit/CoreFoundation symbols and will perform native validation before installation. This implementation remains generic and does not touch QQ/SpringBoard injection or cleanup.
-- Restart state must never cause early resume. Persist the armed marker atomically; absent, malformed, stale, or unknown state starts a fresh 180-second grace. Any monitor setup/callback failure remains fail-closed.
-- The available device probe confirmed `IOHIDEventSystemClientUnscheduleWithRunLoop`; use that exact exported symbol. The event monitor proof is native callback availability only; physical HOME delivery remains unverified until a real button press is observed.
-- Python monotonic values are process-relative on the device, so private subprocesses must not compare `lastActivityAt` across processes. The shared protocol uses a random monitor ID, runtime PID, atomic generation, wall-clock `publishedAt` lease, health, and armed state; policy timing remains monotonic inside the monitor process.
+- The monitor publishes a bounded wall-clock lease with runtime PID and monitor identity. Cross-process monotonic timestamps are not comparable on this device build.
+- Activity pauses scan, command polling, and auto-wake while outbox delivery continues; heartbeat reports offline until a fresh read.
+- The relay carries `activityResumeCleanup` with a stable resume token and retains it across adapter errors until the private adapter acknowledges that exact token. The private adapter owns safe SpringBoard cleanup and QQ return.

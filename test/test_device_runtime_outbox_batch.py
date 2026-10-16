@@ -60,7 +60,8 @@ class DeviceRuntimeOutboxBatchTests(unittest.TestCase):
                 "normalizedInserted": received, "retentionDays": 30, **changes}
 
     def make_relay(self, http):
-        return runtime.Relay(self.config, self.db, lambda _request: {}, http)
+        return runtime.Relay(self.config, self.db, lambda _request: {}, http,
+                             activity_monitor=runtime.device_activity.InactiveHostMonitor())
 
     def outbox_ids(self):
         return [row[0] for row in self.db.execute(
