@@ -179,6 +179,8 @@ class DeviceActivityPolicyTests(unittest.TestCase):
             self.assertEqual(device_activity._load_saved_state(self.state_path), (None, True))
         with patch.object(device_activity.os, "open", side_effect=PermissionError):
             self.assertEqual(device_activity._load_saved_state(self.state_path), (None, True))
+        with patch.object(device_activity.os, "open", side_effect=FileNotFoundError):
+            self.assertEqual(device_activity._load_saved_state(self.state_path), (None, True))
 
         missing_path = os.path.join(self.temp.name, "new.activity.json")
         self.assertEqual(device_activity._load_saved_state(missing_path), (None, None))
