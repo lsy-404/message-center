@@ -64,9 +64,9 @@ function normalizedReplyPreview(value) {
 function normalizedInboundAttachment(attachment) {
   const externalId = String(attachment?.externalId || "");
   const mimeType = String(attachment?.mimeType || "application/octet-stream").slice(0, 200);
-  const sizeBytes = Number(attachment?.sizeBytes);
+  const sizeBytes = attachment?.sizeBytes;
   const sha256 = String(attachment?.sha256 || "");
-  if (!externalId || externalId.length > 200 || !Number.isSafeInteger(sizeBytes) ||
+  if (!externalId || externalId.length > 200 || typeof sizeBytes !== "number" || !Number.isSafeInteger(sizeBytes) ||
       sizeBytes < 1 || sizeBytes > MAX_INBOUND_ATTACHMENT_BYTES || !/^[a-f0-9]{64}$/.test(sha256)) {
     throw new Error("invalid_attachment_metadata");
   }
@@ -753,14 +753,22 @@ async function uploadConnectorFile(request, env, fileId) {
   if (!stored || stored.object_key !== objectKey) {
     if (matchesRequest(stored)) {
       let canonicalObject = await env.FILES.head(stored.object_key);
-      if (!canonicalObject) {
+      if (!inboundObjectMatches(canonicalObject, sizeBytes, sha256)) {
         const uploaded = await env.FILES.get(objectKey);
         if (!uploaded?.body) throw new Error("inbound_object_repair_failed");
-        const repaired = await env.FILES.put(stored.object_key, uploaded.body, putOptions);
-        canonicalObject = await env.FILES.head(stored.object_key);
-        if (!inboundObjectMatches(repaired, sizeBytes, sha256) ||
-            !inboundObjectMatches(canonicalObject, sizeBytes, sha256)) {
-          throw new Error("inbound_object_repair_failed");
+        try {
+          const repaired = await env.FILES.put(stored.object_key, uploaded.body, putOptions);
+          if (inboundObjectMatches(repaired, sizeBytes, sha256)) {
+            canonicalObject = repaired;
+          } else {
+            canonicalObject = await env.FILES.head(stored.object_key);
+          }
+          if (!inboundObjectMatches(canonicalObject, sizeBytes, sha256)) {
+            throw new Error("inbound_object_repair_failed");
+          }
+        } catch (error) {
+          canonicalObject = await env.FILES.head(stored.object_key);
+          if (!inboundObjectMatches(canonicalObject, sizeBytes, sha256)) throw error;
         }
       }
       await env.FILES.delete(objectKey).catch(() => {});

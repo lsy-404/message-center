@@ -18,3 +18,10 @@ Public Vue UI, Worker attachment metadata/byte handling only where needed, and r
 - [x] Add semantic root `/test` coverage for behavior and negative boundaries.
 - [x] Run targeted validation, review the diff for task/audit leakage, and commit the scoped change.
 - [x] Report contracts and any native evidence still required.
+
+## Canonical R2 repair follow-up
+- [x] Review duplicate-row repair binding and object checksum handling.
+- [x] Repair a present-but-mismatched canonical object only after an exact database/request binding.
+- [x] Reconcile ambiguous canonical puts using exact HEAD size and SHA-256, without deleting the canonical key.
+- [x] Add root `/test` fault coverage and run the Worker schema suite.
+- [x] Require JSON numeric attachment byte lengths and reject boolean/string coercions.

@@ -843,6 +843,18 @@ const invalidAttachmentMetadata = await requestEvents([{
 }]);
 assert.equal(invalidAttachmentMetadata.status, 400);
 assert.equal((await invalidAttachmentMetadata.json()).error, 'invalid_attachment_metadata');
+for (const [label, sizeBytes] of [['boolean', true], ['string', String(inboundBytes.byteLength)]]) {
+  const invalidAttachmentSizeType = await requestEvents([{
+    externalId: `message-invalid-size-${label}`, conversationExternalId: `conversation-invalid-size-${label}`,
+    conversationTitle: 'Attachment size type check', senderName: 'Member', body: '[图片]', contentType: 'mixed',
+    occurredAt: stamp, conversationType: 'direct', trigger: 'direct', attachments: [{
+      externalId: `file-invalid-size-${label}`, fileName: 'invalid.png', mimeType: 'image/png',
+      sizeBytes, sha256: createHash('sha256').update(inboundBytes).digest('hex'),
+    }],
+  }]);
+  assert.equal(invalidAttachmentSizeType.status, 400);
+  assert.equal((await invalidAttachmentSizeType.json()).error, 'invalid_attachment_metadata');
+}
 const invalidStickerPresentation = await requestEvents([{
   externalId: 'message-invalid-sticker-presentation', conversationExternalId: 'conversation-invalid-sticker-presentation',
   conversationTitle: 'Sticker marker check', senderName: 'Member', body: 'image', contentType: 'mixed',
@@ -934,6 +946,60 @@ assert.equal(replacedMismatchedObject.status, 200,
 assert.deepEqual(r2Objects.get(ambiguousInboundRow.object_key).bytes, ambiguousInboundBytes);
 assert.equal(deletedR2Keys.includes(ambiguousInboundRow.object_key), false,
   'repair never deletes a canonical object, including one verified as correct after an ambiguous write');
+
+const canonicalRaceBytes = new Uint8Array([31, 32, 33, 34]);
+const canonicalRaceExternalId = 'external-file-canonical-race';
+const canonicalRaceConversation = 'conversation-file-canonical-race';
+const canonicalRaceDigest = createHash('sha256').update(canonicalRaceBytes).digest('hex');
+const canonicalRaceKey = `inbound/${connectorId}/canonical-race`;
+const incorrectCanonicalBytes = new Uint8Array([90, 91, 92]);
+const incorrectCanonicalDigest = createHash('sha256').update(incorrectCanonicalBytes).digest();
+r2Objects.set(canonicalRaceKey, {
+  bytes: incorrectCanonicalBytes, options: {}, uploaded: new Date(),
+  checksum: incorrectCanonicalDigest.buffer.slice(
+    incorrectCanonicalDigest.byteOffset,
+    incorrectCanonicalDigest.byteOffset + incorrectCanonicalDigest.byteLength,
+  ),
+});
+let insertCanonicalRace = true;
+d1.prepare = (sql) => {
+  const statement = originalPrepare(sql);
+  return {
+    bind(...values) {
+      const bound = statement.bind(...values);
+      return {
+        run() {
+          if (insertCanonicalRace && /INSERT OR IGNORE INTO attachments/.test(sql) &&
+              /uploaded_inbound/.test(sql)) {
+            insertCanonicalRace = false;
+            database.prepare(`
+              INSERT INTO attachments (
+                id, message_id, connector_id, external_id, conversation_external_id, owner_user_id,
+                object_key, file_name, mime_type, size_bytes, sha256, state, created_at
+              ) VALUES (?, NULL, ?, ?, ?, NULL, ?, ?, ?, ?, ?, 'uploaded_inbound', ?)
+            `).run('file-canonical-race-row', connectorId, canonicalRaceExternalId,
+              canonicalRaceConversation, canonicalRaceKey, 'fixture.bin', 'application/octet-stream',
+              canonicalRaceBytes.byteLength, canonicalRaceDigest, stamp);
+          }
+          return bound.run();
+        },
+        first() { return bound.first(); },
+        all() { return bound.all(); },
+      };
+    },
+  };
+};
+r2Faults.throwAfterWriteKeys.add(canonicalRaceKey);
+const canonicalRaceRepair = await putInboundFile(
+  'file-upload-canonical-race', canonicalRaceExternalId, canonicalRaceBytes,
+  canonicalRaceConversation,
+);
+d1.prepare = originalPrepare;
+assert.equal(canonicalRaceRepair.status, 200,
+  'a matching canonical DB row with a mismatched object is repaired and reconciled after an ambiguous put');
+assert.deepEqual(r2Objects.get(canonicalRaceKey).bytes, canonicalRaceBytes);
+assert.equal(deletedR2Keys.includes(canonicalRaceKey), false,
+  'canonical repair never deletes a mismatched or successfully repaired canonical key');
 const inboundObjectCount = r2Objects.size;
 
 const fakeImage = new File([new Uint8Array([0x6e, 0x6f, 0x74, 0x2d, 0x70, 0x6e, 0x67])], 'fake.png', { type: 'image/png' });
