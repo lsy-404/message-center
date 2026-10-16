@@ -29,6 +29,13 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(request.full_url, code, "redirect_refused", headers, response)
 
 
+def _report_upload_progress(relay):
+    try:
+        relay.send_heartbeat(relay.connector, "online")
+    except Exception:
+        pass
+
+
 def _utf16_length(value):
     try:
         return len(value.encode("utf-16-le")) // 2
@@ -156,7 +163,7 @@ def _prepare_profile(profile, remaining_avatar_bytes=MAX_AVATAR_BATCH_BYTES):
 
 
 def sync_profiles(relay, profiles):
-    """PUT up to twenty profiles; any failure propagates to the scan caller."""
+    """PUT up to twenty profiles; profile failures propagate, heartbeat failures do not."""
     if not isinstance(profiles, list) or len(profiles) > MAX_PROFILES:
         raise ProfileSyncError("invalid_profile_batch")
     prepared = []
@@ -204,11 +211,12 @@ def sync_profiles(relay, profiles):
             raise ProfileSyncError("profile_invalid_response") from exc
         if not isinstance(result, dict) or result.get("ok") is not True:
             raise ProfileSyncError("profile_update_rejected")
+        _report_upload_progress(relay)
     return len(prepared)
 
 
 def sync_sender_avatars(relay, avatars):
-    """PUT bounded sender images; callers commit their source cursor only on success."""
+    """PUT bounded sender images; only upload failures block the caller's source commit."""
     if not isinstance(avatars, list) or len(avatars) > MAX_PROFILES:
         raise ProfileSyncError("invalid_sender_avatar_batch")
     prepared = []
@@ -258,4 +266,5 @@ def sync_sender_avatars(relay, avatars):
             raise ProfileSyncError("sender_avatar_invalid_response") from exc
         if not isinstance(result, dict) or result.get("ok") is not True:
             raise ProfileSyncError("sender_avatar_update_rejected")
+        _report_upload_progress(relay)
     return len(prepared)

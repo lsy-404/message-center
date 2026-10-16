@@ -9,3 +9,7 @@
 - `py_compile` 与 `git diff --check` 通过。
 - `node --test test/*.test.mjs` 未全通过：新 worktree未安装 `openid-client`，12个依赖该包的测试启动失败；31个其他用例通过。该 runtime 改动不触及 Worker/Node代码。
 - 未访问设备或云端，也未部署。
+
+- Follow-up：`conversation_profiles.py` 在每个 JSON `ok: true` profile/avatar ACK 后调用 Relay 的30秒节流在线心跳；心跳异常不会撤销已成功上传，也不进入 connector failure backoff。无效 ACK 不报告进展。
+- 新增慢批次 fake-clock 测试：20 profiles + 20 avatars，每次 ACK 模拟5秒，共200秒；确认在线心跳间隔受30秒节流且扫描/connector failure计数不变。另有无效 ACK、心跳故障与 successful sync 负控。
+- Follow-up 验证：profile tests 17/17；runtime tests 90（2 skipped）；全 Python suite 126（2 skipped）；py_compile 与 `git diff --check` 通过。

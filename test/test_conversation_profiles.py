@@ -20,6 +20,11 @@ SPEC.loader.exec_module(profiles_module)
 class FakeRelay:
     base = "https://worker.example/"
 
+    def __init__(self, heartbeat_error=None):
+        self.connector = "connector-test"
+        self.heartbeats = []
+        self.heartbeat_error = heartbeat_error
+
     def headers(self):
         return {
             "Authorization": "Bearer " + "x" * 40,
@@ -27,6 +32,12 @@ class FakeRelay:
             "User-Agent": "MessageCenterDevice/1.0",
             "Accept": "application/json",
         }
+
+    def send_heartbeat(self, connector_id, state):
+        self.heartbeats.append((connector_id, state))
+        if self.heartbeat_error is not None:
+            raise self.heartbeat_error
+        return True
 
 
 class FakeResponse:
@@ -165,12 +176,55 @@ class ConversationProfileTests(unittest.TestCase):
         self.assertEqual(len(opener.requests), 2)
 
     def test_worker_rejection_is_not_acknowledged_as_success(self):
+        relay = FakeRelay()
         rejected = FakeResponse("", json.dumps({"ok": False, "error": "invalid_conversation_profile"}).encode())
         with patch.object(profiles_module.urllib.request, "build_opener", return_value=FakeOpener([rejected])):
             with self.assertRaisesRegex(profiles_module.ProfileSyncError, "profile_update_rejected"):
-                profiles_module.sync_profiles(FakeRelay(), [
+                profiles_module.sync_profiles(relay, [
                     {"conversationExternalId": "group-1", "displayName": "Group"}
                 ])
+        self.assertEqual(relay.heartbeats, [])
+
+    def test_profile_progress_heartbeat_follows_each_valid_ack_without_affecting_sync_failure(self):
+        relay = FakeRelay(heartbeat_error=OSError("heartbeat offline"))
+        opener = FakeOpener([FakeResponse(""),
+                             FakeResponse("", b'{"ok":false,"error":"rejected"}')])
+        with patch.object(profiles_module.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaisesRegex(profiles_module.ProfileSyncError, "profile_update_rejected"):
+                profiles_module.sync_profiles(relay, [
+                    {"conversationExternalId": "group-1", "displayName": "Group 1"},
+                    {"conversationExternalId": "group-2", "displayName": "Group 2"},
+                ])
+        self.assertEqual(relay.heartbeats, [("connector-test", "online")])
+
+    def test_heartbeat_failure_does_not_cancel_valid_profile_or_avatar_sync(self):
+        png = b"\x89PNG\r\n\x1a\nprogress-avatar"
+        relay = FakeRelay(heartbeat_error=OSError("heartbeat offline"))
+        profile_opener = FakeOpener([FakeResponse("")])
+        with patch.object(profiles_module.urllib.request, "build_opener", return_value=profile_opener):
+            self.assertEqual(profiles_module.sync_profiles(relay, [
+                {"conversationExternalId": "group-1", "displayName": "Group"}
+            ]), 1)
+
+        avatar_opener = FakeOpener([FakeResponse("")])
+        with patch.object(profiles_module.urllib.request, "build_opener", return_value=avatar_opener):
+            self.assertEqual(profiles_module.sync_sender_avatars(relay, [
+                {"senderId": "sender-1", "avatarBase64": base64.b64encode(png).decode("ascii")}
+            ]), 1)
+        self.assertEqual(relay.heartbeats, [("connector-test", "online")] * 2)
+
+    def test_sender_avatar_progress_heartbeat_requires_valid_ack(self):
+        avatar = b"\x89PNG\r\n\x1a\nsender-avatar"
+        encoded = base64.b64encode(avatar).decode("ascii")
+        relay = FakeRelay()
+        opener = FakeOpener([FakeResponse(""), FakeResponse("", b'{"ok":false}')])
+        with patch.object(profiles_module.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaisesRegex(profiles_module.ProfileSyncError, "sender_avatar_update_rejected"):
+                profiles_module.sync_sender_avatars(relay, [
+                    {"senderId": "sender-1", "avatarBase64": encoded},
+                    {"senderId": "sender-2", "avatarBase64": encoded},
+                ])
+        self.assertEqual(relay.heartbeats, [("connector-test", "online")])
 
     def test_valid_png_avatar_puts_raw_bytes_with_worker_headers(self):
         avatar = b"\x89PNG\r\n\x1a\nsynthetic-png"
