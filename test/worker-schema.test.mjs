@@ -283,17 +283,34 @@ database.prepare(`
 
 const r2Objects = new Map();
 const deletedR2Keys = [];
+const r2Faults = {
+  throwAfterWriteKeys: new Set(),
+  wrongPutResultKeys: new Set(),
+  failHeadKeys: new Set(),
+  failHeadAfterWriteKeys: new Set(),
+};
 let paginatedInboundSweep = false;
 const r2 = {
   async put(key, body, options = {}) {
     const bytes = new Uint8Array(await new Response(body).arrayBuffer());
-    r2Objects.set(key, { bytes, options, uploaded: new Date() });
+    const checksum = createHash('sha256').update(bytes).digest();
+    if (options.sha256 && checksum.toString('hex') !== options.sha256) throw new Error('r2_checksum_mismatch');
+    const checksumArrayBuffer = checksum.buffer.slice(checksum.byteOffset, checksum.byteOffset + checksum.byteLength);
+    const value = { bytes, options, uploaded: new Date(), checksum: checksumArrayBuffer };
+    r2Objects.set(key, value);
+    if (r2Faults.failHeadAfterWriteKeys.delete(key)) r2Faults.failHeadKeys.add(key);
+    if (r2Faults.throwAfterWriteKeys.delete(key)) throw new Error('fixture_r2_put_ambiguous');
+    if (r2Faults.wrongPutResultKeys.delete(key)) {
+      return { size: bytes.byteLength + 1, checksums: { sha256: checksumArrayBuffer } };
+    }
+    return { size: bytes.byteLength, checksums: { sha256: checksumArrayBuffer } };
   },
   async delete(key) { deletedR2Keys.push(key); r2Objects.delete(key); },
   async head(key) {
+    if (r2Faults.failHeadKeys.delete(key)) throw new Error('fixture_r2_head_unavailable');
     const value = r2Objects.get(key);
     if (!value) return null;
-    return { size: value.bytes.byteLength, customMetadata: value.options.customMetadata,
+    return { size: value.bytes.byteLength, checksums: { sha256: value.checksum }, customMetadata: value.options.customMetadata,
       httpMetadata: value.options.httpMetadata, uploaded: value.uploaded };
   },
   async get(key) {
@@ -763,14 +780,14 @@ database.prepare(`
   UPDATE conversations SET trust_tier = 'untrusted', agent_policy_json = '{}' WHERE id = 'conversation-row'
 `).run();
 
-async function putInboundFile(fileId, externalId, bytes, conversationExternalId = 'conversation-file-test', mimeType = 'application/octet-stream') {
+async function putInboundFile(fileId, externalId, bytes, conversationExternalId = 'conversation-file-test', mimeType = 'application/octet-stream', announcedSize = bytes.byteLength) {
   const sha256 = createHash('sha256').update(bytes).digest('hex');
   return worker.fetch(new Request(`https://message.example.com/api/connectors/files/${fileId}`, {
     method: 'PUT',
     headers: {
       authorization: `Bearer ${connectorToken}`,
       'content-type': mimeType,
-      'content-length': String(bytes.byteLength),
+      'content-length': String(announcedSize),
       'x-connector-id': connectorId,
       'x-conversation-id': conversationExternalId,
       'x-file-external-id': externalId,
@@ -786,6 +803,16 @@ const firstInboundFile = await putInboundFile('file-upload-one', 'external-file-
 assert.equal(firstInboundFile.status, 201);
 assert.equal((await firstInboundFile.json()).reused, false);
 assert.equal(r2Objects.size, 1);
+const mismatchedInboundLength = await putInboundFile('file-size-mismatch', 'external-size-mismatch',
+  inboundBytes, 'conversation-file-test', 'application/octet-stream', inboundBytes.byteLength - 1);
+assert.equal(mismatchedInboundLength.status, 400);
+assert.equal((await mismatchedInboundLength.json()).error, 'uploaded_file_integrity_mismatch');
+assert.equal(r2Objects.size, 1, 'object with actual bytes that disagree with declared length is removed');
+const overLimitInboundLength = await putInboundFile('file-size-over-limit', 'external-size-over-limit',
+  inboundBytes, 'conversation-file-test', 'application/octet-stream', 50 * 1024 * 1024 + 1);
+assert.equal(overLimitInboundLength.status, 400);
+assert.equal((await overLimitInboundLength.json()).error, 'invalid_file_metadata');
+assert.equal(r2Objects.size, 1, 'declared bytes above the existing upload budget never reach R2');
 const repeatedInboundFile = await putInboundFile('file-upload-two', 'external-file-one', inboundBytes);
 assert.equal(repeatedInboundFile.status, 200);
 assert.deepEqual(await repeatedInboundFile.json(), {
@@ -805,6 +832,48 @@ const crossConversationInbound = await putInboundFile(
 );
 assert.equal(crossConversationInbound.status, 400);
 assert.equal((await crossConversationInbound.json()).error, 'file_external_id_conflict');
+
+const invalidAttachmentMetadata = await requestEvents([{
+  externalId: 'message-size-over-limit', conversationExternalId: 'conversation-size-over-limit',
+  conversationTitle: 'Attachment size check', senderName: 'Member', body: '[图片]', contentType: 'mixed',
+  occurredAt: stamp, conversationType: 'direct', trigger: 'direct', attachments: [{
+    externalId: 'file-size-over-limit-event', fileName: 'oversized.png', mimeType: 'image/png',
+    sizeBytes: 50 * 1024 * 1024 + 1, sha256: 'a'.repeat(64),
+  }],
+}]);
+assert.equal(invalidAttachmentMetadata.status, 400);
+assert.equal((await invalidAttachmentMetadata.json()).error, 'invalid_attachment_metadata');
+for (const [label, sizeBytes] of [['boolean', true], ['string', String(inboundBytes.byteLength)]]) {
+  const invalidAttachmentSizeType = await requestEvents([{
+    externalId: `message-invalid-size-${label}`, conversationExternalId: `conversation-invalid-size-${label}`,
+    conversationTitle: 'Attachment size type check', senderName: 'Member', body: '[图片]', contentType: 'mixed',
+    occurredAt: stamp, conversationType: 'direct', trigger: 'direct', attachments: [{
+      externalId: `file-invalid-size-${label}`, fileName: 'invalid.png', mimeType: 'image/png',
+      sizeBytes, sha256: createHash('sha256').update(inboundBytes).digest('hex'),
+    }],
+  }]);
+  assert.equal(invalidAttachmentSizeType.status, 400);
+  assert.equal((await invalidAttachmentSizeType.json()).error, 'invalid_attachment_metadata');
+}
+const invalidStickerPresentation = await requestEvents([{
+  externalId: 'message-invalid-sticker-presentation', conversationExternalId: 'conversation-invalid-sticker-presentation',
+  conversationTitle: 'Sticker marker check', senderName: 'Member', body: 'image', contentType: 'mixed',
+  occurredAt: stamp, conversationType: 'direct', trigger: 'direct', attachments: [{
+    externalId: 'file-invalid-sticker-presentation', fileName: 'asset.png', mimeType: 'image/png',
+    sizeBytes: inboundBytes.byteLength, sha256: createHash('sha256').update(inboundBytes).digest('hex'),
+    presentation: 'emoji',
+  }],
+}]);
+assert.equal(invalidStickerPresentation.status, 400);
+assert.equal((await invalidStickerPresentation.json()).error, 'invalid_attachment_presentation');
+const staleReplyText = await requestEvents([{
+  externalId: 'message-stale-reply', conversationExternalId: 'conversation-stale-reply',
+  conversationTitle: 'Reply check', senderName: 'Member', body: 'response',
+  occurredAt: stamp, conversationType: 'direct', trigger: 'direct', attachments: [],
+  reply: { sourceText: 'must be suppressed', sourceTextTruncated: false, sourceExpired: true },
+}]);
+assert.equal(staleReplyText.status, 400);
+assert.equal((await staleReplyText.json()).error, 'invalid_reply_preview');
 
 const originalPrepare = d1.prepare;
 let failInboundInsertAfterCommit = true;
@@ -834,11 +903,103 @@ const ambiguousInboundRow = database.prepare(`
 `).get(connectorId);
 assert.equal(r2Objects.has(ambiguousInboundRow.object_key), true);
 r2Objects.delete(ambiguousInboundRow.object_key);
+r2Faults.throwAfterWriteKeys.add(ambiguousInboundRow.object_key);
 const repairedInbound = await putInboundFile(
   'file-upload-ambiguous-retry', 'external-file-ambiguous', ambiguousInboundBytes, 'conversation-file-ambiguous',
 );
 assert.equal(repairedInbound.status, 200);
 assert.equal(r2Objects.has(ambiguousInboundRow.object_key), true);
+assert.deepEqual(r2Objects.get(ambiguousInboundRow.object_key).bytes, ambiguousInboundBytes,
+  'a put that writes the expected object before throwing is reconciled by HEAD');
+
+r2Objects.delete(ambiguousInboundRow.object_key);
+r2Faults.wrongPutResultKeys.add(ambiguousInboundRow.object_key);
+const wrongPutMetadataRepair = await putInboundFile(
+  'file-upload-wrong-put-metadata', 'external-file-ambiguous', ambiguousInboundBytes, 'conversation-file-ambiguous',
+);
+assert.equal(wrongPutMetadataRepair.status, 200,
+  'HEAD reconciles a mismatched put result only when the stored object has the expected size and digest');
+
+r2Objects.delete(ambiguousInboundRow.object_key);
+r2Faults.throwAfterWriteKeys.add(ambiguousInboundRow.object_key);
+r2Faults.failHeadAfterWriteKeys.add(ambiguousInboundRow.object_key);
+const headFailureRepair = await putInboundFile(
+  'file-upload-head-failure', 'external-file-ambiguous', ambiguousInboundBytes, 'conversation-file-ambiguous',
+);
+assert.equal(headFailureRepair.status, 400, 'failed reconciliation does not claim an ambiguous write succeeded');
+assert.equal(r2Objects.has(ambiguousInboundRow.object_key), true,
+  'failed HEAD does not delete or overwrite the possible valid canonical object');
+const retryAfterHeadFailure = await putInboundFile(
+  'file-upload-head-failure-retry', 'external-file-ambiguous', ambiguousInboundBytes, 'conversation-file-ambiguous',
+);
+assert.equal(retryAfterHeadFailure.status, 200, 'a later retry recognizes the valid object left by an ambiguous put');
+
+const badChecksum = new Uint8Array(32).buffer;
+r2Objects.set(ambiguousInboundRow.object_key, {
+  bytes: new Uint8Array([8, 8, 8]), options: {}, uploaded: new Date(), checksum: badChecksum,
+});
+const replacedMismatchedObject = await putInboundFile(
+  'file-upload-wrong-object-retry', 'external-file-ambiguous', ambiguousInboundBytes, 'conversation-file-ambiguous',
+);
+assert.equal(replacedMismatchedObject.status, 200,
+  'an exact database/request binding allows replacing a confirmed mismatched canonical object');
+assert.deepEqual(r2Objects.get(ambiguousInboundRow.object_key).bytes, ambiguousInboundBytes);
+assert.equal(deletedR2Keys.includes(ambiguousInboundRow.object_key), false,
+  'repair never deletes a canonical object, including one verified as correct after an ambiguous write');
+
+const canonicalRaceBytes = new Uint8Array([31, 32, 33, 34]);
+const canonicalRaceExternalId = 'external-file-canonical-race';
+const canonicalRaceConversation = 'conversation-file-canonical-race';
+const canonicalRaceDigest = createHash('sha256').update(canonicalRaceBytes).digest('hex');
+const canonicalRaceKey = `inbound/${connectorId}/canonical-race`;
+const incorrectCanonicalBytes = new Uint8Array([90, 91, 92]);
+const incorrectCanonicalDigest = createHash('sha256').update(incorrectCanonicalBytes).digest();
+r2Objects.set(canonicalRaceKey, {
+  bytes: incorrectCanonicalBytes, options: {}, uploaded: new Date(),
+  checksum: incorrectCanonicalDigest.buffer.slice(
+    incorrectCanonicalDigest.byteOffset,
+    incorrectCanonicalDigest.byteOffset + incorrectCanonicalDigest.byteLength,
+  ),
+});
+let insertCanonicalRace = true;
+d1.prepare = (sql) => {
+  const statement = originalPrepare(sql);
+  return {
+    bind(...values) {
+      const bound = statement.bind(...values);
+      return {
+        run() {
+          if (insertCanonicalRace && /INSERT OR IGNORE INTO attachments/.test(sql) &&
+              /uploaded_inbound/.test(sql)) {
+            insertCanonicalRace = false;
+            database.prepare(`
+              INSERT INTO attachments (
+                id, message_id, connector_id, external_id, conversation_external_id, owner_user_id,
+                object_key, file_name, mime_type, size_bytes, sha256, state, created_at
+              ) VALUES (?, NULL, ?, ?, ?, NULL, ?, ?, ?, ?, ?, 'uploaded_inbound', ?)
+            `).run('file-canonical-race-row', connectorId, canonicalRaceExternalId,
+              canonicalRaceConversation, canonicalRaceKey, 'fixture.bin', 'application/octet-stream',
+              canonicalRaceBytes.byteLength, canonicalRaceDigest, stamp);
+          }
+          return bound.run();
+        },
+        first() { return bound.first(); },
+        all() { return bound.all(); },
+      };
+    },
+  };
+};
+r2Faults.throwAfterWriteKeys.add(canonicalRaceKey);
+const canonicalRaceRepair = await putInboundFile(
+  'file-upload-canonical-race', canonicalRaceExternalId, canonicalRaceBytes,
+  canonicalRaceConversation,
+);
+d1.prepare = originalPrepare;
+assert.equal(canonicalRaceRepair.status, 200,
+  'a matching canonical DB row with a mismatched object is repaired and reconciled after an ambiguous put');
+assert.deepEqual(r2Objects.get(canonicalRaceKey).bytes, canonicalRaceBytes);
+assert.equal(deletedR2Keys.includes(canonicalRaceKey), false,
+  'canonical repair never deletes a mismatched or successfully repaired canonical key');
 const inboundObjectCount = r2Objects.size;
 
 const fakeImage = new File([new Uint8Array([0x6e, 0x6f, 0x74, 0x2d, 0x70, 0x6e, 0x67])], 'fake.png', { type: 'image/png' });
@@ -1381,6 +1542,43 @@ async function postEvents(messages) {
   assert.equal(response.status, 200);
   return response.json();
 }
+
+const stickerBytes = new Uint8Array([21, 22, 23, 24]);
+const stickerConversationExternalId = 'conversation-sticker-contract';
+const stickerFileExternalId = 'file-sticker-contract';
+const stickerDigest = createHash('sha256').update(stickerBytes).digest('hex');
+const stickerUpload = await putInboundFile('file-sticker-contract', stickerFileExternalId, stickerBytes,
+  stickerConversationExternalId, 'image/png');
+assert.equal(stickerUpload.status, 201);
+await postEvents([{
+  externalId: 'message-sticker-contract', conversationExternalId: stickerConversationExternalId,
+  conversationTitle: 'Sticker contract', senderName: 'Member', body: '[表情]', contentType: 'mixed',
+  occurredAt: stamp, conversationType: 'direct', trigger: 'direct', reply: {
+    sourceText: 'quoted source text', sourceTextTruncated: true, sourceExpired: false,
+  }, attachments: [{ externalId: stickerFileExternalId, fileName: 'fixture.bin', mimeType: 'image/png',
+    sizeBytes: stickerBytes.byteLength, sha256: stickerDigest, presentation: 'sticker' }],
+}]);
+const stickerConversationId = database.prepare(`
+  SELECT id FROM conversations WHERE connector_id = ? AND external_id = ?
+`).get(connectorId, stickerConversationExternalId).id;
+const stickerInboxResponse = await worker.fetch(new Request(
+  `https://message.example.com/api/inbox?conversationId=${encodeURIComponent(stickerConversationId)}`,
+  { headers: { ...auth.headers } },
+), workerEnv, {});
+assert.equal(stickerInboxResponse.status, 200);
+const stickerInbox = await stickerInboxResponse.json();
+const stickerMessageId = database.prepare(`
+  SELECT id FROM messages WHERE connector_id = ? AND external_id = 'message-sticker-contract'
+`).get(connectorId).id;
+const stickerMessage = stickerInbox.messages.find((message) => message.id === stickerMessageId);
+assert.deepEqual(stickerMessage.attachments[0], {
+  id: 'file-sticker-contract', fileName: 'fixture.bin', mimeType: 'image/png', sizeBytes: stickerBytes.byteLength,
+  sha256: stickerDigest, state: 'received', downloadable: true, presentation: 'sticker',
+});
+assert.equal(Object.hasOwn(stickerMessage.attachments[0], 'externalId'), false);
+assert.deepEqual(stickerMessage.reply, {
+  sourceText: 'quoted source text', sourceTextTruncated: true, sourceExpired: false,
+});
 
 await postEvents([{
   externalId: 'message-no-watermark', conversationExternalId: 'profile-no-watermark',

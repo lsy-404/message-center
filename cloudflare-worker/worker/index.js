@@ -46,6 +46,71 @@ async function sha256Hex(value) {
     .map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+const MAX_INBOUND_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+const MAX_REPLY_SOURCE_TEXT_LENGTH = 4000;
+
+function normalizedReplyPreview(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      typeof value.sourceText !== "string" || value.sourceText.length > MAX_REPLY_SOURCE_TEXT_LENGTH ||
+      typeof value.sourceTextTruncated !== "boolean" || typeof value.sourceExpired !== "boolean") return null;
+  if (value.sourceExpired && value.sourceText) return null;
+  return {
+    sourceText: value.sourceExpired ? "" : value.sourceText,
+    sourceTextTruncated: value.sourceTextTruncated,
+    sourceExpired: value.sourceExpired,
+  };
+}
+
+function normalizedInboundAttachment(attachment) {
+  const externalId = String(attachment?.externalId || "");
+  const mimeType = String(attachment?.mimeType || "application/octet-stream").slice(0, 200);
+  const sizeBytes = attachment?.sizeBytes;
+  const sha256 = String(attachment?.sha256 || "");
+  if (!externalId || externalId.length > 200 || typeof sizeBytes !== "number" || !Number.isSafeInteger(sizeBytes) ||
+      sizeBytes < 1 || sizeBytes > MAX_INBOUND_ATTACHMENT_BYTES || !/^[a-f0-9]{64}$/.test(sha256)) {
+    throw new Error("invalid_attachment_metadata");
+  }
+  const presentation = attachment?.presentation;
+  if (presentation !== undefined && presentation !== null && presentation !== "" &&
+      (presentation !== "sticker" || !mimeType.startsWith("image/"))) {
+    throw new Error("invalid_attachment_presentation");
+  }
+  return {
+    externalId,
+    fileName: cleanName(attachment?.fileName),
+    mimeType,
+    sizeBytes,
+    sha256,
+    ...(presentation === "sticker" ? { presentation } : {}),
+  };
+}
+
+function r2ChecksumHex(checksum) {
+  if (!(checksum instanceof ArrayBuffer)) return "";
+  return Array.from(new Uint8Array(checksum), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function inboundObjectMatches(object, sizeBytes, sha256) {
+  return object && Number(object.size) === sizeBytes && r2ChecksumHex(object.checksums?.sha256) === sha256;
+}
+
+function boundedInboundFileBody(body, expectedBytes) {
+  let receivedBytes = 0;
+  return body.pipeThrough(new TransformStream({
+    transform(chunk, controller) {
+      receivedBytes += chunk.byteLength;
+      if (receivedBytes > expectedBytes || receivedBytes > MAX_INBOUND_ATTACHMENT_BYTES) {
+        controller.error(new Error("uploaded_file_integrity_mismatch"));
+        return;
+      }
+      controller.enqueue(chunk);
+    },
+    flush(controller) {
+      if (receivedBytes !== expectedBytes) controller.error(new Error("uploaded_file_integrity_mismatch"));
+    },
+  }));
+}
+
 function imageMime(bytes) {
   if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 &&
       bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) return "image/png";
@@ -593,7 +658,8 @@ async function uploadConnectorFile(request, env, fileId) {
   const mimeType = (request.headers.get("content-type") || "application/octet-stream").slice(0, 200);
   const sizeBytes = Number(request.headers.get("content-length") || 0);
   if (!validId(connectorId) || !validShort(fileId) || !conversationExternalId || !externalId ||
-      !/^[a-f0-9]{64}$/.test(sha256) || sizeBytes < 1 || sizeBytes > 50 * 1024 * 1024 || !request.body) {
+      !/^[a-f0-9]{64}$/.test(sha256) || !Number.isSafeInteger(sizeBytes) || sizeBytes < 1 ||
+      sizeBytes > MAX_INBOUND_ATTACHMENT_BYTES || !request.body) {
     throw new Error("invalid_file_metadata");
   }
   const connector = await connectorRow(env, connectorId);
@@ -618,10 +684,18 @@ async function uploadConnectorFile(request, env, fileId) {
       throw new Error("inbound_file_cleanup_in_progress");
     }
     let object = await env.FILES.head(previous.object_key);
-    if (!object) {
-      await env.FILES.put(previous.object_key, request.body, putOptions);
-      object = await env.FILES.head(previous.object_key);
-      if (!object || Number(object.size) !== sizeBytes) throw new Error("inbound_object_repair_failed");
+    if (!inboundObjectMatches(object, sizeBytes, sha256)) {
+      try {
+        object = await env.FILES.put(previous.object_key, boundedInboundFileBody(request.body, sizeBytes), putOptions);
+        if (!inboundObjectMatches(object, sizeBytes, sha256)) {
+          object = await env.FILES.head(previous.object_key);
+          if (!inboundObjectMatches(object, sizeBytes, sha256)) throw new Error("inbound_object_repair_failed");
+        }
+      } catch (error) {
+        const reconciled = await env.FILES.head(previous.object_key);
+        if (!inboundObjectMatches(reconciled, sizeBytes, sha256)) throw error;
+        object = reconciled;
+      }
     }
     if (!previous.message_id) {
       const revived = await env.DB.prepare(`
@@ -635,11 +709,18 @@ async function uploadConnectorFile(request, env, fileId) {
   const objectKey = `inbound/${connectorId}/${crypto.randomUUID()}`;
   let putCompleted = false;
   try {
-    await env.FILES.put(objectKey, request.body, putOptions);
+    const uploaded = await env.FILES.put(objectKey, boundedInboundFileBody(request.body, sizeBytes), putOptions);
+    if (!inboundObjectMatches(uploaded, sizeBytes, sha256)) {
+      await env.FILES.delete(objectKey).catch(() => {});
+      throw new Error("uploaded_file_integrity_mismatch");
+    }
     putCompleted = true;
   } catch (error) {
     const object = await env.FILES.head(objectKey).catch(() => null);
-    if (!object || Number(object.size) !== sizeBytes || object.customMetadata?.sha256 !== sha256) throw error;
+    if (!inboundObjectMatches(object, sizeBytes, sha256)) {
+      if (object) await env.FILES.delete(objectKey).catch(() => {});
+      throw error;
+    }
     putCompleted = true;
   }
   try {
@@ -672,13 +753,22 @@ async function uploadConnectorFile(request, env, fileId) {
   if (!stored || stored.object_key !== objectKey) {
     if (matchesRequest(stored)) {
       let canonicalObject = await env.FILES.head(stored.object_key);
-      if (!canonicalObject) {
+      if (!inboundObjectMatches(canonicalObject, sizeBytes, sha256)) {
         const uploaded = await env.FILES.get(objectKey);
         if (!uploaded?.body) throw new Error("inbound_object_repair_failed");
-        await env.FILES.put(stored.object_key, uploaded.body, putOptions);
-        canonicalObject = await env.FILES.head(stored.object_key);
-        if (!canonicalObject || Number(canonicalObject.size) !== sizeBytes) {
-          throw new Error("inbound_object_repair_failed");
+        try {
+          const repaired = await env.FILES.put(stored.object_key, uploaded.body, putOptions);
+          if (inboundObjectMatches(repaired, sizeBytes, sha256)) {
+            canonicalObject = repaired;
+          } else {
+            canonicalObject = await env.FILES.head(stored.object_key);
+          }
+          if (!inboundObjectMatches(canonicalObject, sizeBytes, sha256)) {
+            throw new Error("inbound_object_repair_failed");
+          }
+        } catch (error) {
+          canonicalObject = await env.FILES.head(stored.object_key);
+          if (!inboundObjectMatches(canonicalObject, sizeBytes, sha256)) throw error;
         }
       }
       await env.FILES.delete(objectKey).catch(() => {});
@@ -1199,8 +1289,8 @@ async function ensureImmediateMessageState(env, input) {
     `).bind(crypto.randomUUID(), input.messageId, input.connectorId, externalId.slice(0, 200),
       input.conversationExternalId, cleanName(attachment.fileName),
       String(attachment.mimeType || "application/octet-stream").slice(0, 200),
-      Math.max(0, Math.min(Number(attachment.sizeBytes || 0), 100 * 1024 * 1024)),
-      /^[a-f0-9]{64}$/.test(String(attachment.sha256 || "")) ? attachment.sha256 : "", input.stamp));
+      attachment.sizeBytes,
+      attachment.sha256, input.stamp));
     statements.push(env.DB.prepare(`
       UPDATE attachments SET message_id = ?,
         state = CASE WHEN object_key IS NULL THEN 'remote' ELSE 'received' END
@@ -1246,14 +1336,7 @@ function mergeAttachmentMetadata(existing, incoming) {
   const merged = [];
   const byId = new Map();
   for (const attachment of [...existing, ...incoming]) {
-    const value = {
-      externalId: String(attachment?.externalId || "").slice(0, 200),
-      fileName: cleanName(attachment?.fileName),
-      mimeType: String(attachment?.mimeType || "application/octet-stream").slice(0, 200),
-      sizeBytes: Math.max(0, Math.min(Number(attachment?.sizeBytes || 0), 100 * 1024 * 1024)),
-      sha256: /^[a-f0-9]{64}$/.test(String(attachment?.sha256 || "")) ? attachment.sha256 : "",
-    };
-    if (!value.externalId) throw new Error("invalid_attachment_metadata");
+    const value = normalizedInboundAttachment(attachment);
     const previous = byId.get(value.externalId);
     if (previous) {
       if (JSON.stringify(previous) !== JSON.stringify(value)) {
@@ -1330,7 +1413,12 @@ async function ingestEvents(request, env) {
       suppressed += 1;
       continue;
     }
-    const attachments = Array.isArray(item.attachments) ? item.attachments.slice(0, 20) : [];
+    const attachments = item.attachments === undefined ? [] : item.attachments;
+    if (!Array.isArray(attachments)) throw new Error("invalid_attachment_metadata");
+    if (attachments.length > 20) throw new Error("too_many_attachments");
+    const attachmentMetadata = attachments.map((attachment) => normalizedInboundAttachment(attachment));
+    const replyPreview = normalizedReplyPreview(item.reply);
+    if (item.reply !== undefined && item.reply !== null && !replyPreview) throw new Error("invalid_reply_preview");
     const incomingBody = String(item.body || "").slice(0, 20_000);
     const incomingContentType = String(item.contentType || (attachments.length ? "mixed" : "text")).slice(0, 50);
     if (event.presentation === "system" &&
@@ -1341,19 +1429,14 @@ async function ingestEvents(request, env) {
     if (attachments.some((attachment) => !canReceiveAttachment(capabilities, attachment?.mimeType))) {
       throw new Error("receive_files_not_supported");
     }
-    const attachmentMetadata = attachments.map((attachment) => ({
-      externalId: String(attachment?.externalId || "").slice(0, 200),
-      fileName: cleanName(attachment?.fileName),
-      mimeType: String(attachment?.mimeType || "application/octet-stream").slice(0, 200),
-      sizeBytes: Math.max(0, Math.min(Number(attachment?.sizeBytes || 0), 100 * 1024 * 1024)),
-      sha256: /^[a-f0-9]{64}$/.test(String(attachment?.sha256 || "")) ? attachment.sha256 : "",
-    })).filter((attachment) => attachment.externalId);
     const suppliedMetadata = item.metadata && typeof item.metadata === "object" ? { ...item.metadata } : {};
     delete suppliedMetadata.presentation;
+    delete suppliedMetadata.reply;
     let metadata = JSON.stringify({ ...suppliedMetadata,
       conversationType: event.conversationType, trigger: event.trigger, mentioned: event.mentioned,
       placement: event.placement, context: event.context, attachments: attachmentMetadata,
       observedAt: event.observedAt, isSelf: event.isSelf,
+      ...(replyPreview ? { reply: replyPreview } : {}),
       ...(event.presentation ? { presentation: event.presentation } : {}) });
     const conversationExternalId = String(item.conversationExternalId).slice(0, 500);
     let conversation = await env.DB.prepare(`
@@ -1569,12 +1652,13 @@ async function ingestGroupTextBackups(request, env) {
     }
     const attachmentMetadata = [];
     for (const attachment of attachments) {
-      const externalId = String(attachment?.externalId || "");
+      const normalized = normalizedInboundAttachment(attachment);
+      const externalId = normalized.externalId;
       const rawFileName = attachment?.fileName;
-      const fileName = cleanName(rawFileName);
-      const mimeType = String(attachment?.mimeType || "");
-      const sizeBytes = attachment?.sizeBytes;
-      const sha256 = String(attachment?.sha256 || "");
+      const fileName = normalized.fileName;
+      const mimeType = normalized.mimeType;
+      const sizeBytes = normalized.sizeBytes;
+      const sha256 = normalized.sha256;
       if (!capabilities.has("receive_images") || !validShort(externalId) ||
           typeof rawFileName !== "string" || !rawFileName.trim() ||
           /[\u0000-\u001f\u007f]/.test(rawFileName) ||
@@ -1598,7 +1682,7 @@ async function ingestGroupTextBackups(request, env) {
           (uploaded.state === "received" && !existingMessage)) {
         throw new Error("group_backup_attachment_not_uploaded");
       }
-      attachmentMetadata.push({ externalId, fileName, mimeType, sizeBytes, sha256 });
+      attachmentMetadata.push(normalized);
     }
     const placement = new Set(["normal", "folded", "message_box"]).has(String(item?.placement))
       ? String(item.placement) : "unknown";
@@ -1939,7 +2023,7 @@ async function readInbox(env, selectedConversationId) {
     const attachmentMap = new Map();
     if (ids.length) {
       const files = await env.DB.prepare(`
-        SELECT id, message_id, file_name, mime_type, size_bytes, sha256, state, object_key
+        SELECT id, message_id, external_id, file_name, mime_type, size_bytes, sha256, state, object_key
         FROM attachments
         WHERE message_id IN (
           SELECT id FROM messages WHERE conversation_id = ?
@@ -1949,7 +2033,7 @@ async function readInbox(env, selectedConversationId) {
       `).bind(selected).all();
       for (const row of files.results || []) {
         const list = attachmentMap.get(row.message_id) || [];
-        list.push({ id: row.id, fileName: row.file_name, mimeType: row.mime_type, sizeBytes: row.size_bytes,
+        list.push({ id: row.id, externalId: row.external_id, fileName: row.file_name, mimeType: row.mime_type, sizeBytes: row.size_bytes,
           sha256: row.sha256, state: row.state, downloadable: Boolean(row.object_key) });
         attachmentMap.set(row.message_id, list);
       }
@@ -1957,6 +2041,15 @@ async function readInbox(env, selectedConversationId) {
     messages = (messageResult.results || []).map((row) => {
       const attachments = attachmentMap.get(row.id) || [];
       const metadata = safeJson(row.metadata_json, {});
+      const metadataAttachments = new Map((Array.isArray(metadata.attachments) ? metadata.attachments : [])
+        .map((attachment) => [String(attachment?.externalId || ""), attachment]));
+      const displayedAttachments = attachments.map((attachment) => {
+        const stored = metadataAttachments.get(attachment.externalId);
+        const { externalId, ...publicAttachment } = attachment;
+        return stored?.presentation === "sticker" && attachment.mimeType?.startsWith("image/")
+          ? { ...publicAttachment, presentation: "sticker" } : publicAttachment;
+      });
+      const reply = normalizedReplyPreview(metadata.reply);
       const verifiedSystemPresentation = row.connector_kind === "qq" && row.direction === "inbound" &&
         metadata.presentation === "system" && row.content_type === "text" && String(row.body || "").trim().length > 0 &&
         attachments.length === 0;
@@ -1969,7 +2062,8 @@ async function readInbox(env, selectedConversationId) {
         authorRole: row.direction !== "outbound" ? "contact"
           : String(row.created_by || "").startsWith("agent:") ? "agent" : "owner",
         agentRead: row.agent_state ? row.agent_state !== "pending" : null,
-        attachments,
+        attachments: displayedAttachments,
+        ...(reply ? { reply } : {}),
         ...(verifiedSystemPresentation ? { presentation: "system" } : {}),
       };
     });
@@ -2910,6 +3004,8 @@ async function readClaimedAgentMessage(env, messageId, leaseToken, leaseExpiresA
         ? metadata.placement : "unknown",
       context: Array.isArray(metadata.context) ? metadata.context.slice(-20) : [],
     },
+    ...(normalizedReplyPreview(metadata.reply)
+      ? { reply: normalizedReplyPreview(metadata.reply) } : {}),
     attachments: (files.results || []).map((file) => ({ id: file.id, fileName: file.file_name,
       mimeType: file.mime_type, sizeBytes: file.size_bytes, sha256: file.sha256, state: file.state,
       downloadPath: file.object_key ? `/api/files/${file.id}` : null })),

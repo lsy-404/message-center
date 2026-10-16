@@ -76,3 +76,5 @@
 | 215 | 215_[Audit]_qq-graytip-presentation | Adversarially review the optional QQ system graytip presentation path from Worker through the device runtime | Ensure only the verified QQ system source upgrades the exact stored type-8 body while all other messages remain unchanged | ✅ Completed |
 
 | 214 | [Feature] QQ gray-tip presentation | Carry an explicit QQ system marker through ingestion, safely upgrade exact legacy placeholders, and render centered system text | QQ gray-tip records need system presentation without inferring from type/body or changing sender identity | ✅ Completed |
+
+| 221 | [BugFix] QQ sticker content and quote preview | Render explicitly classified QQ stickers within a compact display box, validate inbound attachment bytes and preserve structured quote content | Image stickers can render at full image size and attachment/reply metadata must cross Worker/UI boundaries safely | 🔄 Public changes locally verified; native image discovery and browser proof remain with root |
