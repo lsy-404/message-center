@@ -248,6 +248,74 @@ class DeviceRuntimeTests(unittest.TestCase):
             relay.scan_profile("primary")
         self.assertEqual(caught.exception.attach_failure_pid, 12345)
 
+    def test_native_query_gate_classification_requires_exact_safe_metadata(self):
+        valid = {"stage": "query_gate", "errorCode": "native-query-busy",
+                 "dispatch": "not_started", "processId": 12345}
+        self.assertTrue(runtime.explicit_native_query_gate_pending(valid))
+        for invalid in (
+            None,
+            {key: value for key, value in valid.items() if key != "processId"},
+            {**valid, "processId": True},
+            {**valid, "processId": 1},
+            {**valid, "stage": "attach"},
+            {**valid, "errorCode": "timeout"},
+            {**valid, "dispatch": "unknown"},
+            {**valid, "extra": "ignored"},
+        ):
+            self.assertFalse(runtime.explicit_native_query_gate_pending(invalid))
+
+        relay = runtime.Relay(self.config, self.db, lambda _request: {
+            "ok": False, "sourceReadOk": False, "nativeFailure": valid})
+        with self.assertRaises(runtime.SourceReadError) as caught:
+            relay.scan_profile("primary")
+        self.assertEqual(caught.exception.query_gate_pending_pid, 12345)
+        self.assertIsNone(caught.exception.attach_failure_pid)
+
+    def test_query_gate_streak_is_exact_same_pid_and_recovers_only_on_third(self):
+        config = self.auto_wake_config()
+        config["connectors"] = config["connectors"][:1]
+        requests = []
+        relay = runtime.Relay(config, self.db,
+                              lambda request: requests.append(dict(request)) or self.wake_result(True))
+        relay.source_read_failed("connector-a", query_gate_pending_pid=12345)
+        relay.source_read_failed("connector-a", query_gate_pending_pid=12345)
+        self.assertFalse(relay.recover_query_gate_after_failures("connector-a"))
+        relay.source_read_failed("connector-a", query_gate_pending_pid=12346)
+        self.assertEqual(relay.query_gate_failure_streak["connector-a"], (12346, 1))
+        relay.source_read_failed("connector-a", query_gate_pending_pid=12346)
+        self.assertFalse(relay.recover_query_gate_after_failures("connector-a"))
+        relay.source_read_failed("connector-a", query_gate_pending_pid=12346)
+        self.assertTrue(relay.recover_query_gate_after_failures("connector-a"))
+        self.assertEqual(requests, [{"op": "ensure-active", "reason": "query_gate_pending",
+                                     "driver": "qq", "observedPid": 12346}])
+        self.assertEqual(relay.query_gate_failure_streak["connector-a"], (None, 0))
+        for _ in range(3):
+            relay.source_read_failed("connector-a", query_gate_pending_pid=12346)
+        self.assertFalse(relay.recover_query_gate_after_failures("connector-a"))
+        self.assertEqual(len(requests), 1)
+        self.assertFalse(any(request.get("op") == "send" for request in requests))
+        self.assertFalse(relay.ensure_active(
+            recovery_driver="qq", recovery_reason="query_gate_pending", observed_pid=True))
+        self.assertFalse(relay.ensure_active(
+            recovery_driver="qq", recovery_reason="query_gate_pending", observed_pid=1))
+
+    def test_non_gate_error_and_success_reset_query_gate_streak(self):
+        failed_helper = runtime.Relay(self.config, self.db, lambda _request: (_ for _ in ()).throw(
+            RuntimeError("native-helper-timeout")))
+        with self.assertRaises(runtime.SourceReadError) as caught:
+            failed_helper.scan_profile("primary")
+        self.assertIsNone(caught.exception.query_gate_pending_pid)
+
+        relay = runtime.Relay(self.config, self.db, lambda _request: {
+            "ok": True, "sourceReadOk": True, "health": "online",
+            "cursor": {"next": "same"}, "messages": []})
+        relay.source_read_failed("connector-a", query_gate_pending_pid=12345)
+        relay.source_read_failed("connector-a")
+        self.assertEqual(relay.query_gate_failure_streak["connector-a"], (None, 0))
+        relay.source_read_failed("connector-a", query_gate_pending_pid=12345)
+        self.assertTrue(relay.scan_profile("primary"))
+        self.assertEqual(relay.query_gate_failure_streak["connector-a"], (None, 0))
+
     def test_changed_process_resets_attach_streak_and_requests_observed_pid(self):
         config = self.auto_wake_config()
         config["connectors"] = config["connectors"][:1]
@@ -313,7 +381,10 @@ class DeviceRuntimeTests(unittest.TestCase):
                               lambda request: requests.append(dict(request)) or self.wake_result(True))
         relay.source_read_failed("connector-a", attach_failure_pid=12345)
         relay.source_read_failed("connector-a", attach_failure_pid=12345)
-        self.assertEqual(relay.attach_failure_streak["connector-a"], (12345, 2))
+        relay.source_read_failed("connector-a", query_gate_pending_pid=12345)
+        relay.source_read_failed("connector-a", query_gate_pending_pid=12345)
+        self.assertEqual(relay.attach_failure_streak["connector-a"], (None, 0))
+        self.assertEqual(relay.query_gate_failure_streak["connector-a"], (12345, 2))
         self.db.execute(
             "UPDATE source_recovery SET consecutive_failures=153 WHERE connector_id=?",
             ("connector-a",),
@@ -326,7 +397,12 @@ class DeviceRuntimeTests(unittest.TestCase):
                                       lambda request: requests.append(dict(request)) or self.wake_result(True))
             self.assertEqual(restarted.source_failures["connector-a"], 153)
             self.assertEqual(restarted.attach_failure_streak["connector-a"], (None, 0))
+            self.assertEqual(restarted.query_gate_failure_streak["connector-a"], (None, 0))
             self.assertFalse(restarted.recover_attach_after_failures("connector-a"))
+            self.assertFalse(restarted.recover_query_gate_after_failures("connector-a"))
+            restarted.source_read_failed("connector-a", query_gate_pending_pid=12345)
+            restarted.source_read_failed("connector-a", query_gate_pending_pid=12345)
+            self.assertFalse(restarted.recover_query_gate_after_failures("connector-a"))
             restarted.source_read_failed("connector-a", attach_failure_pid=12345)
             restarted.source_read_failed("connector-a", attach_failure_pid=12345)
             self.assertFalse(restarted.recover_attach_after_failures("connector-a"))
@@ -355,6 +431,33 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertNotIn("private-profile", captured.getvalue())
         self.assertNotIn("target", captured.getvalue())
         self.assertNotIn("secret", captured.getvalue())
+
+    def test_source_read_failure_logs_explicit_query_gate_only_after_strict_validation(self):
+        valid = {"stage": "query_gate", "errorCode": "native-query-busy",
+                 "dispatch": "not_started", "processId": 12345}
+        relay = runtime.Relay(self.config, self.db, lambda _request: {
+            "ok": False, "sourceReadOk": False, "nativeFailure": valid},
+            lambda *_args: {"ok": True, "commands": []})
+        captured = io.StringIO()
+        with redirect_stderr(captured):
+            relay.pass_once()
+        records = [json.loads(line) for line in captured.getvalue().splitlines()]
+        record = next(item for item in records if "classification" in item)
+        self.assertEqual(record["classification"], "explicit_query_gate")
+        self.assertEqual(record["processId"], 12345)
+        self.assertEqual(record["consecutiveFailures"], 1)
+
+        invalid = {**valid, "dispatch": "unknown"}
+        relay = runtime.Relay(self.config, self.db, lambda _request: {
+            "ok": False, "sourceReadOk": False, "nativeFailure": invalid},
+            lambda *_args: {"ok": True, "commands": []})
+        captured = io.StringIO()
+        with redirect_stderr(captured):
+            relay.pass_once()
+        records = [json.loads(line) for line in captured.getvalue().splitlines()]
+        record = next(item for item in records if "classification" in item)
+        self.assertEqual(record["classification"], "source_unclassified")
+        self.assertIsNone(record["processId"])
 
     def test_source_read_failure_logs_explicit_attach_only_after_strict_validation(self):
         valid = {"stage": "attach", "errorCode": "timeout",

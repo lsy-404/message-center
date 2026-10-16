@@ -61,3 +61,5 @@
 | 044 | [BugFix] Self group event routing | Deliver self-authored background group events through normal event ingestion | The legacy group-backup route classifies all background group records as inbound and rejects some media | 🔄 In progress |
 
 | 045 | [BugFix] wake-readiness-heartbeat-freshness | 刷新长步骤后的 readiness 并在真实 outbox ACK 后及时更新心跳 | 慢上传和慢扫描跨越心跳/ readiness TTL 后被显示为离线或关闭后续门禁 | 🔄 进行中 |
+
+| 046 | [BugFix] QQ query pending recovery | Recover only after repeated exact pending-gate evidence for the same QQ PID | A pinned callback gate can otherwise remain occupied while generic active-app wakeups leave QQ running | 🔄 进行中 |

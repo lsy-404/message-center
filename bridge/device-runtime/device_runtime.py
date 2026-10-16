@@ -51,9 +51,19 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class SourceReadError(RuntimeError):
-    def __init__(self, code, *, attach_failure_pid=None):
+    def __init__(self, code, *, attach_failure_pid=None, query_gate_pending_pid=None):
         super().__init__(code)
         self.attach_failure_pid = attach_failure_pid
+        self.query_gate_pending_pid = query_gate_pending_pid
+
+
+def explicit_native_query_gate_pending(value):
+    if type(value) is not dict or set(value) != {"stage", "errorCode", "dispatch", "processId"}:
+        return False
+    return (type(value["stage"]) is str and value["stage"] == "query_gate"
+            and type(value["errorCode"]) is str and value["errorCode"] == "native-query-busy"
+            and type(value["dispatch"]) is str and value["dispatch"] == "not_started"
+            and type(value["processId"]) is int and value["processId"] > 1)
 
 
 def explicit_native_attach_failure(value):
@@ -351,6 +361,7 @@ class Relay:
         self.source_failures = {item["id"]: recovery_rows.get(item["id"], (0, 0, 0))[0]
                                 for item in self.connectors}
         self.attach_failure_streak = {item["id"]: (None, 0) for item in self.connectors}
+        self.query_gate_failure_streak = {item["id"]: (None, 0) for item in self.connectors}
         self.source_last_success = {item["id"]: recovery_rows.get(item["id"], (0, 0, 0, 0))[1]
                                     for item in self.connectors}
         self.source_recovery_after = {item["id"]: recovery_rows.get(item["id"], (0, 0, 0, 0))[2]
@@ -418,7 +429,7 @@ class Relay:
         self.source_state_durable[connector_id] = True
         return True
 
-    def source_read_failed(self, connector_id, attach_failure_pid=None):
+    def source_read_failed(self, connector_id, attach_failure_pid=None, query_gate_pending_pid=None):
         self.source_failures[connector_id] += 1
         current_pid, count = self.attach_failure_streak[connector_id]
         if self.auto_wake and type(attach_failure_pid) is int and attach_failure_pid > 1:
@@ -426,11 +437,18 @@ class Relay:
                 attach_failure_pid, count + 1 if current_pid == attach_failure_pid else 1)
         else:
             self.attach_failure_streak[connector_id] = (None, 0)
+        gate_pid, gate_count = self.query_gate_failure_streak[connector_id]
+        if self.auto_wake and type(query_gate_pending_pid) is int and query_gate_pending_pid > 1:
+            self.query_gate_failure_streak[connector_id] = (
+                query_gate_pending_pid, gate_count + 1 if gate_pid == query_gate_pending_pid else 1)
+        else:
+            self.query_gate_failure_streak[connector_id] = (None, 0)
         return self.persist_source_state(connector_id)
 
     def source_read_succeeded(self, connector_id):
         self.source_failures[connector_id] = 0
         self.attach_failure_streak[connector_id] = (None, 0)
+        self.query_gate_failure_streak[connector_id] = (None, 0)
         self.source_last_success[connector_id] = time.time()
         self.persist_source_state(connector_id)
 
@@ -469,6 +487,29 @@ class Relay:
                 recovery_driver=self.connector_by_id[connector_id].get("kind"),
                 recovery_reason="attach_failure",
                 observed_pid=self.attach_failure_streak[connector_id][0],
+            )
+        except Exception:
+            return False
+
+    def recover_query_gate_after_failures(self, connector_id):
+        now = time.time()
+        streak = self.query_gate_failure_streak[connector_id]
+        if (not self.auto_wake
+                or not self.source_state_durable[connector_id]
+                or streak[1] < SOURCE_RECOVERY_FAILURE_THRESHOLD
+                or now < self.source_recovery_after[connector_id]
+                or now < self.source_settle_until[connector_id]):
+            return False
+        self.source_recovery_after[connector_id] = now + SOURCE_RECOVERY_COOLDOWN
+        self.query_gate_failure_streak[connector_id] = (None, 0)
+        if not self.persist_source_state(connector_id):
+            return False
+        self.health[connector_id] = False
+        try:
+            return self.ensure_active(
+                recovery_driver=self.connector_by_id[connector_id].get("kind"),
+                recovery_reason="query_gate_pending",
+                observed_pid=streak[0],
             )
         except Exception:
             return False
@@ -661,10 +702,13 @@ class Relay:
         if type(source_read_ok) is not bool:
             raise RuntimeError("invalid_scan_result")
         if source_read_ok is False:
+            failure = result.get("nativeFailure")
             raise SourceReadError(
                 "source_read_failed",
-                attach_failure_pid=(result["nativeFailure"]["processId"]
-                                    if explicit_native_attach_failure(result.get("nativeFailure")) else None),
+                attach_failure_pid=(failure["processId"]
+                                    if explicit_native_attach_failure(failure) else None),
+                query_gate_pending_pid=(failure["processId"]
+                                        if explicit_native_query_gate_pending(failure) else None),
             )
         if (result.get("ok") is not True or "cursor" not in result or
                 not isinstance(result.get("messages"), list)):
@@ -821,12 +865,12 @@ class Relay:
             request = {"op": "ensure-active", "driver": "qq"}
             if recovery_driver is not None:
                 if (recovery_driver != "qq"
-                        or recovery_reason not in {"read_failure", "attach_failure"}
-                        or (recovery_reason == "attach_failure"
+                        or recovery_reason not in {"read_failure", "attach_failure", "query_gate_pending"}
+                        or (recovery_reason in {"attach_failure", "query_gate_pending"}
                             and (type(observed_pid) is not int or observed_pid <= 1))):
                     raise RuntimeError("invalid_recovery_driver")
                 request.update({"reason": recovery_reason, "driver": recovery_driver})
-                if recovery_reason == "attach_failure":
+                if recovery_reason in {"attach_failure", "query_gate_pending"}:
                     request["observedPid"] = observed_pid
             result = self.adapter_call(request)
             if (not isinstance(result, dict) or set(result) != {"ok", "ready", "attempted", "reason"} or
@@ -1180,12 +1224,16 @@ class Relay:
                 except SourceReadError as error:
                     self.health[connector_id] = False
                     self.last_scan[connector_id] = time.monotonic() - self.scan_interval[connector_id]
-                    source_state_saved = self.source_read_failed(
-                        connector_id, attach_failure_pid=error.attach_failure_pid,
-                    )
                     failure_pid = (error.attach_failure_pid
                                    if type(error.attach_failure_pid) is int and error.attach_failure_pid > 1
                                    else None)
+                    query_gate_pid = (error.query_gate_pending_pid
+                                      if type(error.query_gate_pending_pid) is int
+                                      and error.query_gate_pending_pid > 1 else None)
+                    source_state_saved = self.source_read_failed(
+                        connector_id, attach_failure_pid=failure_pid,
+                        query_gate_pending_pid=query_gate_pid,
+                    )
                     driver = self.connector_by_id[connector_id].get("kind")
                     if driver in {"qq", "wechat"}:
                         try:
@@ -1195,8 +1243,10 @@ class Relay:
                                 "observedAt": observed_at,
                                 "driver": driver,
                                 "consecutiveFailures": self.source_failures[connector_id],
-                                "classification": "explicit_attach" if failure_pid is not None else "source_unclassified",
-                                "processId": failure_pid,
+                                "classification": ("explicit_attach" if failure_pid is not None else
+                                                   "explicit_query_gate" if query_gate_pid is not None else
+                                                   "source_unclassified"),
+                                "processId": (failure_pid if failure_pid is not None else query_gate_pid),
                             }) + "\n")
                             sys.stderr.flush()
                         except Exception:
@@ -1206,6 +1256,8 @@ class Relay:
                         if source_state_saved:
                             if error.attach_failure_pid is not None:
                                 self.recover_attach_after_failures(connector_id)
+                            elif query_gate_pid is not None:
+                                self.recover_query_gate_after_failures(connector_id)
                             else:
                                 self.recover_source_after_failures(connector_id)
                     else:
@@ -1213,6 +1265,7 @@ class Relay:
                 except Exception:
                     self.health[connector_id] = False
                     self.attach_failure_streak[connector_id] = (None, 0)
+                    self.query_gate_failure_streak[connector_id] = (None, 0)
                     self.last_scan[connector_id] = time.monotonic() - self.scan_interval[connector_id]
                     if self.auto_wake:
                         self.wake_scan_failed(connector_id)
