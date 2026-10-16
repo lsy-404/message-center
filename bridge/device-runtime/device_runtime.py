@@ -18,6 +18,7 @@ import urllib.parse
 import urllib.request
 
 from conversation_profiles import sync_profiles, sync_sender_avatars
+import device_activity
 
 if os.name == "posix":
     import fcntl
@@ -463,7 +464,8 @@ def wake_error_category(error):
 
 
 class Relay:
-    def __init__(self, config, db=None, adapter_call=None, http_call=None):
+    def __init__(self, config, db=None, adapter_call=None, http_call=None,
+                 activity_monitor=None):
         self.config = config
         self.db = db or open_database(config["database"])
         self.adapter_call = adapter_call or (
@@ -528,6 +530,41 @@ class Relay:
         self.heartbeat_retry_at = {item["id"]: 0 for item in self.connectors}
         self.heartbeat_last_state = {item["id"]: None for item in self.connectors}
         self.heartbeat_last_sent = {item["id"]: float("-inf") for item in self.connectors}
+        self.activity_monitor = (activity_monitor if activity_monitor is not None else
+                                 device_activity.create_monitor(
+                                     config["database"] + ".activity.json"))
+        self.activity_monitor.start()
+        self.activity_pause_active = False
+        self.activity_fresh_required = set()
+
+    def activity_state(self):
+        try:
+            state = self.activity_monitor.snapshot()
+        except Exception:
+            state = None
+        if (not isinstance(state, dict) or type(state.get("healthy")) is not bool or
+                type(state.get("armed")) is not bool or
+                type(state.get("shouldPause")) is not bool):
+            state = {"healthy": False, "armed": True, "shouldPause": True,
+                     "reason": "activity_state_unknown"}
+        paused = state["shouldPause"] or state["armed"] or not state["healthy"]
+        if paused and not self.activity_pause_active:
+            self.activity_fresh_required.update(self.connector_by_id)
+            for connector_id in self.connector_by_id:
+                self.health[connector_id] = False
+                self.last_scan[connector_id] = float("-inf")
+            self.wake_ready = False
+        self.activity_pause_active = paused
+        return state | {"shouldPause": paused}
+
+    def activity_paused(self):
+        return self.activity_state()["shouldPause"]
+
+    def close(self):
+        try:
+            self.activity_monitor.stop()
+        except Exception:
+            pass
 
     def media_directory_for(self, connector_id):
         if not any(item["id"] == connector_id for item in self.connectors):
@@ -823,6 +860,8 @@ class Relay:
             raise
 
     def scan_profile(self, profile, history=False):
+        if self.activity_paused():
+            return None
         ceiling = max(1, int(self.config.get("outboxMaxBytes", DEFAULT_OUTBOX_BYTES)) // len(self.connectors))
         if self.count_bytes(self.connector) >= ceiling:
             return None
@@ -843,6 +882,8 @@ class Relay:
                                         "maxMediaBytes": remaining, "history": bool(history)})
         except Exception as error:
             raise SourceReadError("source_read_failed") from error
+        if self.activity_paused():
+            return None
         if not isinstance(result, dict):
             raise RuntimeError("invalid_scan_result")
         source_read_ok = result.get("sourceReadOk")
@@ -961,6 +1002,8 @@ class Relay:
         candidate = compact(result.get("cursor"))
         if len(candidate.encode("utf-8")) > MAX_CURSOR_BYTES:
             raise RuntimeError("cursor_too_large")
+        if self.activity_paused():
+            return None
         sync_profiles(self, result.get("conversationProfiles", []))
         sync_sender_avatars(self, result.get("senderAvatars", []))
         self.db.execute("BEGIN IMMEDIATE")
@@ -1014,6 +1057,8 @@ class Relay:
         return result.get("health") == "online"
 
     def ensure_active(self, recovery_driver=None, recovery_reason="read_failure", observed_pid=None):
+        if self.activity_paused():
+            return False
         if not self.auto_wake:
             return True
         now = time.monotonic()
@@ -1357,6 +1402,8 @@ class Relay:
                     pass
 
     def process_command(self, command, profile):
+        if self.activity_paused():
+            return False
         key = command.get("idempotencyKey")
         if not key:
             self.complete(command, {"ok": False, "error": "invalid_idempotency_key"})
@@ -1411,6 +1458,13 @@ class Relay:
                             (self.connector, key))
             self.db.commit()
             self.complete(command, {"retry": True, "error": "device_not_ready"})
+            return
+        if self.activity_paused():
+            self.db.execute("UPDATE command_ledger SET state='retry',retryable=1 WHERE connector_id=? AND idempotency_key=?",
+                            (self.connector, key))
+            self.db.commit()
+            self.complete(command, {"retry": True, "dispatched": False,
+                                    "error": "human_use_active"})
             return
         priority_read = None
         try:
@@ -1489,6 +1543,7 @@ class Relay:
                 self.failed(connector["id"])
 
     def pass_once(self):
+        self.activity_state()
         self.ensure_active()
         delivered_connectors = set()
         for _ in range(MAX_DELIVERIES_PER_PASS):
@@ -1497,7 +1552,9 @@ class Relay:
                 if not connector_id:
                     break
                 delivered_connectors.add(connector_id)
-                self.send_heartbeat(connector_id, "online")
+                heartbeat_state = ("offline" if self.activity_paused() or
+                                   connector_id in self.activity_fresh_required else "online")
+                self.send_heartbeat(connector_id, heartbeat_state)
             except Exception:
                 break
         pending_connectors = {row[0] for row in self.db.execute("SELECT DISTINCT connector_id FROM outbox")}
@@ -1506,9 +1563,11 @@ class Relay:
             profile = connector["profile"]
             connector_id = connector["id"]
             ready = self.ensure_active()
+            activity_paused = self.activity_paused()
             force_scan = self.auto_wake and ready and connector_id in self.wake_scan_pending
             scan_due = (time.monotonic() - self.last_scan[connector_id] >= self.scan_interval[connector_id])
-            scan_allowed = (ready if self.auto_wake else self.eligible(connector_id))
+            scan_allowed = (not activity_paused and
+                            (ready if self.auto_wake else self.eligible(connector_id)))
             scan_retry_allowed = (force_scan or time.monotonic() >= self.wake_scan_retry_at[connector_id])
             if (connector_id not in pending_connectors and scan_allowed and scan_retry_allowed and
                     time.time() >= self.source_settle_until[connector_id] and
@@ -1521,6 +1580,7 @@ class Relay:
                     else:
                         self.health[connector_id] = scan_health
                         self.last_scan[connector_id] = time.monotonic()
+                        self.activity_fresh_required.discard(connector_id)
                         if self.auto_wake:
                             self.wake_scan_succeeded(connector_id)
                         else:
@@ -1580,16 +1640,21 @@ class Relay:
                         self.wake_scan_pending.discard(connector_id)
                     self.cleanup_unreferenced_media()
             ready = self.ensure_active()
+            activity_paused = self.activity_paused()
             source_fresh = (ready and self.health[connector_id] and
                             time.monotonic() - self.last_scan[connector_id] <=
                             self.scan_interval[connector_id] + 30)
-            heartbeat_state = "online" if connector_id in delivered_connectors or source_fresh else "offline"
+            heartbeat_state = ("online" if not activity_paused and
+                               connector_id not in self.activity_fresh_required and
+                               (connector_id in delivered_connectors or source_fresh)
+                               else "offline")
             self.send_heartbeat(connector_id, heartbeat_state)
         for connector in self.connectors:
             self.select_connector(connector)
             connector_id = self.connector
             ready = self.ensure_active()
-            if (not ready or connector.get("receiveOnly") is True or not self.eligible(connector_id) or
+            if (self.activity_paused() or not ready or connector.get("receiveOnly") is True or
+                    not self.eligible(connector_id) or
                     not self.health.get(connector_id) or
                     time.time() < self.source_settle_until[connector_id] or
                     time.monotonic() - self.last_scan[connector_id] > self.scan_interval[connector_id] + 30):
@@ -1629,17 +1694,20 @@ def main(argv):
             raise SystemExit("device_runtime_already_running")
     relay = Relay(config)
     backoff = 1
-    while True:
-        try:
-            relay.register_connectors()
-            relay.pass_once()
-            backoff = 1
-            time.sleep(15)
-        except KeyboardInterrupt:
-            return
-        except Exception:
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 300)
+    try:
+        while True:
+            try:
+                relay.register_connectors()
+                relay.pass_once()
+                backoff = 1
+                time.sleep(15)
+            except KeyboardInterrupt:
+                return
+            except Exception:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 300)
+    finally:
+        relay.close()
 
 
 if __name__ == "__main__":
