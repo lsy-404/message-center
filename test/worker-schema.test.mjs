@@ -283,6 +283,12 @@ database.prepare(`
 
 const r2Objects = new Map();
 const deletedR2Keys = [];
+const r2Faults = {
+  throwAfterWriteKeys: new Set(),
+  wrongPutResultKeys: new Set(),
+  failHeadKeys: new Set(),
+  failHeadAfterWriteKeys: new Set(),
+};
 let paginatedInboundSweep = false;
 const r2 = {
   async put(key, body, options = {}) {
@@ -292,10 +298,16 @@ const r2 = {
     const checksumArrayBuffer = checksum.buffer.slice(checksum.byteOffset, checksum.byteOffset + checksum.byteLength);
     const value = { bytes, options, uploaded: new Date(), checksum: checksumArrayBuffer };
     r2Objects.set(key, value);
+    if (r2Faults.failHeadAfterWriteKeys.delete(key)) r2Faults.failHeadKeys.add(key);
+    if (r2Faults.throwAfterWriteKeys.delete(key)) throw new Error('fixture_r2_put_ambiguous');
+    if (r2Faults.wrongPutResultKeys.delete(key)) {
+      return { size: bytes.byteLength + 1, checksums: { sha256: checksumArrayBuffer } };
+    }
     return { size: bytes.byteLength, checksums: { sha256: checksumArrayBuffer } };
   },
   async delete(key) { deletedR2Keys.push(key); r2Objects.delete(key); },
   async head(key) {
+    if (r2Faults.failHeadKeys.delete(key)) throw new Error('fixture_r2_head_unavailable');
     const value = r2Objects.get(key);
     if (!value) return null;
     return { size: value.bytes.byteLength, checksums: { sha256: value.checksum }, customMetadata: value.options.customMetadata,
@@ -879,11 +891,49 @@ const ambiguousInboundRow = database.prepare(`
 `).get(connectorId);
 assert.equal(r2Objects.has(ambiguousInboundRow.object_key), true);
 r2Objects.delete(ambiguousInboundRow.object_key);
+r2Faults.throwAfterWriteKeys.add(ambiguousInboundRow.object_key);
 const repairedInbound = await putInboundFile(
   'file-upload-ambiguous-retry', 'external-file-ambiguous', ambiguousInboundBytes, 'conversation-file-ambiguous',
 );
 assert.equal(repairedInbound.status, 200);
 assert.equal(r2Objects.has(ambiguousInboundRow.object_key), true);
+assert.deepEqual(r2Objects.get(ambiguousInboundRow.object_key).bytes, ambiguousInboundBytes,
+  'a put that writes the expected object before throwing is reconciled by HEAD');
+
+r2Objects.delete(ambiguousInboundRow.object_key);
+r2Faults.wrongPutResultKeys.add(ambiguousInboundRow.object_key);
+const wrongPutMetadataRepair = await putInboundFile(
+  'file-upload-wrong-put-metadata', 'external-file-ambiguous', ambiguousInboundBytes, 'conversation-file-ambiguous',
+);
+assert.equal(wrongPutMetadataRepair.status, 200,
+  'HEAD reconciles a mismatched put result only when the stored object has the expected size and digest');
+
+r2Objects.delete(ambiguousInboundRow.object_key);
+r2Faults.throwAfterWriteKeys.add(ambiguousInboundRow.object_key);
+r2Faults.failHeadAfterWriteKeys.add(ambiguousInboundRow.object_key);
+const headFailureRepair = await putInboundFile(
+  'file-upload-head-failure', 'external-file-ambiguous', ambiguousInboundBytes, 'conversation-file-ambiguous',
+);
+assert.equal(headFailureRepair.status, 400, 'failed reconciliation does not claim an ambiguous write succeeded');
+assert.equal(r2Objects.has(ambiguousInboundRow.object_key), true,
+  'failed HEAD does not delete or overwrite the possible valid canonical object');
+const retryAfterHeadFailure = await putInboundFile(
+  'file-upload-head-failure-retry', 'external-file-ambiguous', ambiguousInboundBytes, 'conversation-file-ambiguous',
+);
+assert.equal(retryAfterHeadFailure.status, 200, 'a later retry recognizes the valid object left by an ambiguous put');
+
+const badChecksum = new Uint8Array(32).buffer;
+r2Objects.set(ambiguousInboundRow.object_key, {
+  bytes: new Uint8Array([8, 8, 8]), options: {}, uploaded: new Date(), checksum: badChecksum,
+});
+const replacedMismatchedObject = await putInboundFile(
+  'file-upload-wrong-object-retry', 'external-file-ambiguous', ambiguousInboundBytes, 'conversation-file-ambiguous',
+);
+assert.equal(replacedMismatchedObject.status, 200,
+  'an exact database/request binding allows replacing a confirmed mismatched canonical object');
+assert.deepEqual(r2Objects.get(ambiguousInboundRow.object_key).bytes, ambiguousInboundBytes);
+assert.equal(deletedR2Keys.includes(ambiguousInboundRow.object_key), false,
+  'repair never deletes a canonical object, including one verified as correct after an ambiguous write');
 const inboundObjectCount = r2Objects.size;
 
 const fakeImage = new File([new Uint8Array([0x6e, 0x6f, 0x74, 0x2d, 0x70, 0x6e, 0x67])], 'fake.png', { type: 'image/png' });

@@ -684,12 +684,18 @@ async function uploadConnectorFile(request, env, fileId) {
       throw new Error("inbound_file_cleanup_in_progress");
     }
     let object = await env.FILES.head(previous.object_key);
-    if (object && !inboundObjectMatches(object, sizeBytes, sha256)) {
-      throw new Error("inbound_object_integrity_mismatch");
-    }
-    if (!object) {
-      object = await env.FILES.put(previous.object_key, boundedInboundFileBody(request.body, sizeBytes), putOptions);
-      if (!inboundObjectMatches(object, sizeBytes, sha256)) throw new Error("inbound_object_repair_failed");
+    if (!inboundObjectMatches(object, sizeBytes, sha256)) {
+      try {
+        object = await env.FILES.put(previous.object_key, boundedInboundFileBody(request.body, sizeBytes), putOptions);
+        if (!inboundObjectMatches(object, sizeBytes, sha256)) {
+          object = await env.FILES.head(previous.object_key);
+          if (!inboundObjectMatches(object, sizeBytes, sha256)) throw new Error("inbound_object_repair_failed");
+        }
+      } catch (error) {
+        const reconciled = await env.FILES.head(previous.object_key);
+        if (!inboundObjectMatches(reconciled, sizeBytes, sha256)) throw error;
+        object = reconciled;
+      }
     }
     if (!previous.message_id) {
       const revived = await env.DB.prepare(`
