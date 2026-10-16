@@ -546,9 +546,10 @@ class Relay:
             state = None
         if (not isinstance(state, dict) or type(state.get("healthy")) is not bool or
                 type(state.get("armed")) is not bool or
-                type(state.get("shouldPause")) is not bool):
+                type(state.get("shouldPause")) is not bool or
+                type(state.get("cleanupRequired")) is not bool):
             state = {"healthy": False, "armed": True, "shouldPause": True,
-                     "reason": "activity_state_unknown"}
+                     "cleanupRequired": True, "reason": "activity_state_unknown"}
         paused = state["shouldPause"] or state["armed"] or not state["healthy"]
         was_paused = self.activity_pause_active
         if paused and not was_paused:
@@ -560,16 +561,17 @@ class Relay:
                 self.last_scan[connector_id] = float("-inf")
             self.wake_ready = False
         elif was_paused and not paused:
-            request_fields = getattr(self.activity_monitor, "request_fields", None)
-            fields = request_fields() if callable(request_fields) else None
-            token = fields.get("activityResumeToken") if isinstance(fields, dict) else None
-            if type(token) is str and token:
-                self.activity_resume_pending = True
-                self.activity_resume_token = token
-            else:
-                paused = True
-                state = state | {"healthy": False, "armed": True,
-                                 "reason": "activity_resume_token_unknown"}
+            if state["cleanupRequired"]:
+                request_fields = getattr(self.activity_monitor, "request_fields", None)
+                fields = request_fields() if callable(request_fields) else None
+                token = fields.get("activityResumeToken") if isinstance(fields, dict) else None
+                if type(token) is str and token:
+                    self.activity_resume_pending = True
+                    self.activity_resume_token = token
+                else:
+                    paused = True
+                    state = state | {"healthy": False, "armed": True,
+                                     "reason": "activity_resume_token_unknown"}
         self.activity_pause_active = paused
         return state | {"shouldPause": paused}
 
@@ -602,6 +604,9 @@ class Relay:
                 response.get("activityResumeCleanupComplete") is True and
                 response.get("activityResumeCleanupToken") ==
                 request.get("activityResumeToken") == self.activity_resume_token):
+            acknowledge = getattr(self.activity_monitor, "acknowledge_cleanup", None)
+            if not callable(acknowledge) or not acknowledge(self.activity_resume_token):
+                return response
             response = dict(response)
             response.pop("activityResumeCleanupComplete")
             response.pop("activityResumeCleanupToken")

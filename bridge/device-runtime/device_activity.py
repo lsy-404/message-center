@@ -20,7 +20,7 @@ KEYBOARD_USAGE_FIELD = KEYBOARD_USAGE_PAGE_FIELD + 1
 KEYBOARD_DOWN_FIELD = KEYBOARD_USAGE_PAGE_FIELD + 2
 CONSUMER_USAGE_PAGE = 0x0C
 HOME_USAGE = 0x40
-STATE_VERSION = 3
+STATE_VERSION = 4
 HEARTBEAT_SECONDS = 2.0
 
 
@@ -55,7 +55,7 @@ def _atomic_state_write(path: str, state: dict[str, Any]) -> None:
             os.unlink(temporary)
 
 
-def _load_armed_state(path: str) -> Optional[bool]:
+def _load_saved_state(path: str) -> tuple[Optional[bool], Optional[bool]]:
     try:
         with open(path, "r", encoding="utf-8") as stream:
             encoded = stream.read(MAX_STATE_BYTES + 1)
@@ -63,13 +63,14 @@ def _load_armed_state(path: str) -> Optional[bool]:
             return None
         raw = json.loads(encoded)
     except FileNotFoundError:
-        return None
+        return None, None
     except Exception:
-        return None
+        return None, None
     if (not isinstance(raw, dict) or raw.get("version") != STATE_VERSION or
             type(raw.get("armed")) is not bool):
-        return None
-    return raw["armed"]
+        return None, None
+    cleanup_required = raw.get("cleanupRequired")
+    return raw["armed"], cleanup_required if type(cleanup_required) is bool else None
 
 
 class ActivityPolicy:
@@ -87,6 +88,7 @@ class ActivityPolicy:
         self._healthy = False
         self._failed = False
         self._armed = True
+        self._cleanup_required = False
         self._last_activity_at: Optional[float] = None
         self._home_sequence = 0
         self._digitizer_sequence = 0
@@ -105,6 +107,7 @@ class ActivityPolicy:
             "publishedAt": published_at,
             "healthy": self._healthy,
             "armed": self._armed,
+            "cleanupRequired": self._cleanup_required,
             "lastActivityAt": self._last_activity_at,
             "homeSequence": self._home_sequence,
             "digitizerSequence": self._digitizer_sequence,
@@ -120,6 +123,7 @@ class ActivityPolicy:
                     self._healthy = False
                     self._failed = True
                     self._armed = True
+                    self._cleanup_required = True
                     self._reason = "clock_invalid"
                     return False
                 state = self._state_locked(published_at)
@@ -138,14 +142,18 @@ class ActivityPolicy:
 
     def start_grace(self) -> bool:
         now = self.clock()
-        saved_armed = _load_armed_state(self.state_path)
+        saved_armed, saved_cleanup = _load_saved_state(self.state_path)
+        state_exists = os.path.exists(self.state_path)
         with self._lock:
             self._armed = True
+            self._cleanup_required = (
+                saved_cleanup if saved_cleanup is not None else
+                saved_armed is True or (saved_armed is None and state_exists))
             self._last_activity_at = now
             self._home_sequence = 0
             self._healthy = False
             self._failed = False
-            self._reason = "restart_pause" if saved_armed is True else "startup_grace"
+            self._reason = "restart_pause" if self._cleanup_required else "startup_grace"
             self._state_generation += 1
         try:
             if not self._persist_current():
@@ -179,6 +187,7 @@ class ActivityPolicy:
             self._healthy = False
             self._failed = True
             self._armed = True
+            self._cleanup_required = True
             self._reason = reason
             self._persistence_pending = True
             self._state_generation += 1
@@ -196,23 +205,48 @@ class ActivityPolicy:
                 self._healthy = False
                 self._failed = True
                 self._armed = True
+                self._cleanup_required = True
                 self._reason = "monotonic_clock_invalid"
                 self._persistence_pending = True
                 self._state_generation += 1
                 return
-            was_armed = self._armed
+            was_cleanup_required = self._cleanup_required
             self._armed = True
+            self._cleanup_required = True
             self._last_activity_at = float(now)
             if kind == "home":
                 self._home_sequence += 1
             elif kind == "digitizer":
                 self._digitizer_sequence += 1
             self._reason = "human_activity"
-            if not was_armed:
+            if not was_cleanup_required:
                 self._persistence_pending = True
                 self._state_generation += 1
-        if not was_armed:
+        if not was_cleanup_required:
             self._persist_current()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._healthy = False
+            self._failed = True
+            self._reason = "monitor_stopped"
+            self._persistence_pending = True
+            self._state_generation += 1
+        self._persist_current()
+
+    def acknowledge_cleanup(self, token: str) -> bool:
+        with self._lock:
+            expected = "{}:{}:{}:{}".format(
+                self.monitor_id, os.getpid(), self._home_sequence,
+                self._digitizer_sequence)
+            if (token != expected or self._armed or not self._healthy or
+                    not self._cleanup_required):
+                return False
+            self._cleanup_required = False
+            self._reason = "idle"
+            self._state_generation += 1
+            self._persistence_pending = True
+        return self._persist_current()
 
     def heartbeat(self) -> bool:
         now = self.clock()
@@ -238,6 +272,7 @@ class ActivityPolicy:
                 self._healthy = False
                 self._failed = True
                 self._armed = True
+                self._cleanup_required = True
                 self._reason = "monotonic_clock_invalid"
                 self._persistence_pending = True
                 self._state_generation += 1
@@ -250,6 +285,7 @@ class ActivityPolicy:
                 self._state_generation += 1
             healthy = self._healthy and not self._persistence_pending
             armed = self._armed
+            cleanup_required = self._cleanup_required
             last_activity_at = self._last_activity_at
             home_sequence = self._home_sequence
             digitizer_sequence = self._digitizer_sequence
@@ -259,11 +295,13 @@ class ActivityPolicy:
             with self._lock:
                 healthy = self._healthy and not self._persistence_pending
                 armed = self._armed
+                cleanup_required = self._cleanup_required
                 reason = self._reason
         idle_for = None if last_activity_at is None else max(0.0, now - last_activity_at)
         return {
             "healthy": healthy,
             "armed": armed,
+            "cleanupRequired": cleanup_required,
             "shouldPause": (not healthy) or armed,
             "homeSequence": home_sequence,
             "digitizerSequence": digitizer_sequence,
@@ -280,6 +318,7 @@ class InactiveHostMonitor:
 
     def snapshot(self) -> dict[str, Any]:
         return {"healthy": True, "armed": False, "shouldPause": False,
+                "cleanupRequired": False,
                 "homeSequence": 0, "lastActivityAt": None, "idleFor": None,
                 "reason": "unsupported_host", "monitorId": None}
 
@@ -324,9 +363,12 @@ class NativeActivityMonitor:
                 state["digitizerSequence"]),
         }
 
+    def acknowledge_cleanup(self, token: str) -> bool:
+        return self.policy.acknowledge_cleanup(token)
+
     def stop(self, timeout: float = 3.0) -> None:
         self._stop_event.set()
-        self.policy.fail("monitor_stopped")
+        self.policy.stop()
         thread = self._thread
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=max(0.0, timeout))

@@ -25,6 +25,7 @@ class ManualMonitor:
     def __init__(self, *, healthy=True, armed=False):
         self.healthy = healthy
         self.armed = armed
+        self.cleanup_required = armed
         self.home_sequence = 0
         self.last_activity_at = 0.0
 
@@ -34,7 +35,8 @@ class ManualMonitor:
     def snapshot(self):
         paused = not self.healthy or self.armed
         return {"healthy": self.healthy, "armed": self.armed,
-                "shouldPause": paused, "homeSequence": self.home_sequence,
+                "shouldPause": paused, "cleanupRequired": self.cleanup_required,
+                "homeSequence": self.home_sequence,
                 "lastActivityAt": self.last_activity_at,
                 "idleFor": 0.0, "reason": "manual"}
 
@@ -49,6 +51,10 @@ class ManualMonitor:
             "activityResumeToken": "a" * 32 + ":123:{}:{}".format(
                 self.home_sequence, 0),
         }
+
+    def acknowledge_cleanup(self, token):
+        self.cleanup_required = False
+        return True
 
 
 class DeviceActivityPolicyTests(unittest.TestCase):
@@ -90,6 +96,44 @@ class DeviceActivityPolicyTests(unittest.TestCase):
             state = json.load(state_file)
         self.assertFalse(state["healthy"])
         self.assertTrue(state["armed"])
+
+    def test_startup_grace_and_idle_stop_do_not_require_card_cleanup(self):
+        self.assertFalse(self.policy.snapshot()["cleanupRequired"])
+        self.clock.value += 180
+        self.assertFalse(self.policy.snapshot()["shouldPause"])
+        self.policy.stop()
+        with open(self.state_path, encoding="utf-8") as state_file:
+            stopped = json.load(state_file)
+        self.assertFalse(stopped["healthy"])
+        self.assertFalse(stopped["armed"])
+        self.assertFalse(stopped["cleanupRequired"])
+
+        restarted = device_activity.ActivityPolicy(self.state_path, clock=self.clock)
+        self.assertTrue(restarted.start_grace())
+        restarted.mark_ready()
+        self.clock.value += 180
+        resumed = restarted.snapshot()
+        self.assertFalse(resumed["shouldPause"])
+        self.assertFalse(resumed["cleanupRequired"])
+
+    def test_human_pause_survives_restart_and_cleanup_ack_is_persisted(self):
+        self.policy.record_activity("home")
+        self.assertTrue(self.policy.snapshot()["cleanupRequired"])
+        restarted = device_activity.ActivityPolicy(self.state_path, clock=self.clock)
+        self.assertTrue(restarted.start_grace())
+        restarted.mark_ready()
+        self.clock.value += 180
+        idle = restarted.snapshot()
+        self.assertFalse(idle["shouldPause"])
+        self.assertTrue(idle["cleanupRequired"])
+        token = "{}:{}:{}:{}".format(
+            restarted.monitor_id, os.getpid(), idle["homeSequence"],
+            idle["digitizerSequence"])
+        self.assertTrue(restarted.acknowledge_cleanup(token))
+        self.assertFalse(restarted.snapshot()["cleanupRequired"])
+        with open(self.state_path, encoding="utf-8") as state_file:
+            saved = json.load(state_file)
+        self.assertFalse(saved["cleanupRequired"])
 
     def test_native_monitor_exposes_durable_state_lease_and_resume_token(self):
         monitor = device_activity.NativeActivityMonitor(self.state_path,
@@ -156,8 +200,9 @@ class DeviceActivityPolicyTests(unittest.TestCase):
         unknown = device_activity.ActivityPolicy(self.state_path, clock=self.clock)
         self.assertTrue(unknown.start_grace())
         unknown.mark_ready()
-        self.assertEqual(unknown.snapshot()["reason"], "startup_grace")
+        self.assertEqual(unknown.snapshot()["reason"], "restart_pause")
         self.assertTrue(unknown.snapshot()["shouldPause"])
+        self.assertTrue(unknown.snapshot()["cleanupRequired"])
 
     def test_high_rate_activity_stays_in_memory_without_per_event_disk_writes(self):
         self.clock.value += 180
@@ -366,6 +411,22 @@ class DeviceActivityRuntimeTests(unittest.TestCase):
         self.assertTrue(requests[0]["activityResumeCleanup"])
         self.assertFalse(relay.activity_resume_pending)
         self.assertFalse(relay.wake_ready)
+        relay.close()
+
+    def test_startup_grace_resume_does_not_request_cleanup(self):
+        monitor = ManualMonitor(armed=True)
+        monitor.cleanup_required = False
+        calls = []
+        relay = self.make_relay(
+            monitor, lambda request: calls.append(request) or
+            {"ok": True, "ready": True, "attempted": False, "reason": "ready"},
+            config=dict(self.config, autoWake=True))
+        self.assertTrue(relay.activity_state()["shouldPause"])
+        monitor.armed = False
+        relay.activity_state()
+        relay.ensure_active()
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("activityResumeCleanup", calls[0])
         relay.close()
 
     def test_unrequested_cleanup_ack_is_not_stripped(self):
