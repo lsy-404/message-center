@@ -34,6 +34,7 @@ STAGING_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
 IMAGE_MIME = re.compile(r"^image/[a-z0-9.+-]{1,100}$", re.IGNORECASE)
 DEFAULT_OUTBOX_BYTES = 128 * 1024 * 1024
 MAX_DELIVERIES_PER_PASS = 5
+HEARTBEAT_MIN_INTERVAL = 30
 ADAPTER_SCAN_TIMEOUT = 60
 ADAPTER_SEND_TIMEOUT = 90
 ADAPTER_WAKE_TIMEOUT = 55
@@ -367,6 +368,8 @@ class Relay:
         self.retry_at = {item["id"]: 0 for item in self.connectors}
         self.heartbeat_failures = {item["id"]: 0 for item in self.connectors}
         self.heartbeat_retry_at = {item["id"]: 0 for item in self.connectors}
+        self.heartbeat_last_state = {item["id"]: None for item in self.connectors}
+        self.heartbeat_last_sent = {item["id"]: float("-inf") for item in self.connectors}
 
     def media_directory_for(self, connector_id):
         if not any(item["id"] == connector_id for item in self.connectors):
@@ -479,6 +482,26 @@ class Relay:
     def heartbeat_succeeded(self, connector_id):
         self.heartbeat_failures[connector_id] = 0
         self.heartbeat_retry_at[connector_id] = 0
+
+    def send_heartbeat(self, connector_id, state):
+        now = time.monotonic()
+        if now < self.heartbeat_retry_at[connector_id]:
+            return False
+        if (self.heartbeat_last_state[connector_id] == state and
+                now - self.heartbeat_last_sent[connector_id] < HEARTBEAT_MIN_INTERVAL):
+            return False
+        self.select_connector(self.connector_by_id[connector_id])
+        try:
+            self.http_call("POST", "/api/connectors/heartbeat", {
+                "connectorId": connector_id,
+                "state": state})
+        except Exception:
+            self.heartbeat_failed(connector_id)
+            return False
+        self.heartbeat_succeeded(connector_id)
+        self.heartbeat_last_state[connector_id] = state
+        self.heartbeat_last_sent[connector_id] = time.monotonic()
+        return True
 
     def select_connector(self, connector):
         self.connector = connector["id"]
@@ -1118,7 +1141,7 @@ class Relay:
                 self.failed(connector["id"])
 
     def pass_once(self):
-        ready = self.ensure_active()
+        self.ensure_active()
         delivered_connectors = set()
         for _ in range(MAX_DELIVERIES_PER_PASS):
             try:
@@ -1126,6 +1149,7 @@ class Relay:
                 if not connector_id:
                     break
                 delivered_connectors.add(connector_id)
+                self.send_heartbeat(connector_id, "online")
             except Exception:
                 break
         pending_connectors = {row[0] for row in self.db.execute("SELECT DISTINCT connector_id FROM outbox")}
@@ -1133,7 +1157,7 @@ class Relay:
             self.select_connector(connector)
             profile = connector["profile"]
             connector_id = connector["id"]
-            ready = self.wake_readiness_current()
+            ready = self.ensure_active()
             force_scan = self.auto_wake and ready and connector_id in self.wake_scan_pending
             scan_due = (time.monotonic() - self.last_scan[connector_id] >= self.scan_interval[connector_id])
             scan_allowed = (ready if self.auto_wake else self.eligible(connector_id))
@@ -1198,24 +1222,16 @@ class Relay:
                     if force_scan and not backpressured:
                         self.wake_scan_pending.discard(connector_id)
                     self.cleanup_unreferenced_media()
-            if time.monotonic() >= self.heartbeat_retry_at[connector_id]:
-                ready = self.wake_readiness_current()
-                source_fresh = (ready and self.health[connector_id] and
-                                time.monotonic() - self.last_scan[connector_id] <=
-                                self.scan_interval[connector_id] + 30)
-                heartbeat_state = "online" if connector_id in delivered_connectors or source_fresh else "offline"
-                try:
-                    self.http_call("POST", "/api/connectors/heartbeat", {
-                        "connectorId": self.connector,
-                        "state": heartbeat_state})
-                except Exception:
-                    self.heartbeat_failed(connector_id)
-                else:
-                    self.heartbeat_succeeded(connector_id)
+            ready = self.ensure_active()
+            source_fresh = (ready and self.health[connector_id] and
+                            time.monotonic() - self.last_scan[connector_id] <=
+                            self.scan_interval[connector_id] + 30)
+            heartbeat_state = "online" if connector_id in delivered_connectors or source_fresh else "offline"
+            self.send_heartbeat(connector_id, heartbeat_state)
         for connector in self.connectors:
             self.select_connector(connector)
             connector_id = self.connector
-            ready = self.wake_readiness_current()
+            ready = self.ensure_active()
             if (not ready or connector.get("receiveOnly") is True or not self.eligible(connector_id) or
                     not self.health.get(connector_id) or
                     time.time() < self.source_settle_until[connector_id] or

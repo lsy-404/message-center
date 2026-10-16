@@ -59,3 +59,5 @@
 | 042 | [BugFix] Receipt native-ID reconciliation | Associate confirmed QQ sends with their exact source-derived event ID and deduplicate self events | Outbound rows retain a null native ID after confirmed sends, leaving a potential cross-path duplicate | 🔄 In progress |
 | 043 | [BugFix] QQ retry and receipt conflict | Prevent contradictory retry acknowledgements from requeueing confirmed or uncertain QQ sends | A retry flag currently takes precedence over successful delivery evidence | ✅ Implemented and locally verified |
 | 044 | [BugFix] Self group event routing | Deliver self-authored background group events through normal event ingestion | The legacy group-backup route classifies all background group records as inbound and rejects some media | 🔄 In progress |
+
+| 045 | [BugFix] wake-readiness-heartbeat-freshness | 刷新长步骤后的 readiness 并在真实 outbox ACK 后及时更新心跳 | 慢上传和慢扫描跨越心跳/ readiness TTL 后被显示为离线或关闭后续门禁 | 🔄 进行中 |

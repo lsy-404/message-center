@@ -1576,7 +1576,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(scanned, ["connector-a", "connector-b", "connector-a"])
         self.assertTrue(relay.health["connector-b"])
 
-    def test_control_loop_sends_heartbeats_every_pass_and_scans_on_idle_interval(self):
+    def test_control_loop_throttles_same_state_heartbeats_and_scans_on_idle_interval(self):
         calls = []
         scans = []
         now = [1000.0]
@@ -1594,7 +1594,7 @@ class DeviceRuntimeTests(unittest.TestCase):
             now[0] += 285
             relay.pass_once()
         self.assertEqual(len(scans), 2)
-        self.assertEqual(len([call for call in calls if call[1].endswith("/heartbeat")]), 3)
+        self.assertEqual(len([call for call in calls if call[1].endswith("/heartbeat")]), 2)
 
     def test_scan_failure_still_sends_offline_heartbeat_during_connector_backoff(self):
         heartbeat_payloads = []
@@ -1615,7 +1615,7 @@ class DeviceRuntimeTests(unittest.TestCase):
             now[0] += 1
             relay.pass_once()
 
-        self.assertEqual(len(heartbeat_payloads), 2)
+        self.assertEqual(len(heartbeat_payloads), 1)
         self.assertTrue(all(item["state"] == "offline" for item in heartbeat_payloads))
 
     def test_outbox_ack_keeps_heartbeat_online_without_opening_command_gate(self):
@@ -1644,6 +1644,62 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
         self.assertFalse(any(method == "GET" and path.startswith("/api/connectors/commands")
                              for method, path, _payload in calls))
+
+    def test_slow_outbox_acks_emit_throttled_progress_heartbeats(self):
+        for ident in ("queued-a", "queued-b", "queued-c"):
+            message = self.event(ident)
+            self.db.execute(
+                "INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,1)",
+                ("connector-a", ident, ident, runtime.compact(message)),
+            )
+        self.db.commit()
+        now = [100.0]
+        calls = []
+
+        def http(method, path, payload=None):
+            calls.append((now[0], method, path, payload))
+            if path.endswith("/events"):
+                now[0] += 60
+                return self.event_ack(len(payload["messages"]))
+            return {"ok": True, "commands": []}
+
+        relay = runtime.Relay(self.config, self.db,
+                              lambda _request: {"ok": True, "sourceReadOk": False}, http)
+        with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]):
+            relay.pass_once()
+
+        heartbeat_rows = [row for row in calls if row[2].endswith("/heartbeat")]
+        event_rows = [row for row in calls if row[2].endswith("/events")]
+        self.assertEqual(len(event_rows), 3)
+        self.assertEqual([row[3]["state"] for row in heartbeat_rows], ["online"] * 3)
+        for index, event_row in enumerate(event_rows):
+            following = [row for row in calls if row[0] >= event_row[0] + 60]
+            self.assertTrue(following)
+            self.assertTrue(following[0][2].endswith("/heartbeat"))
+            self.assertEqual(following[0][3]["state"], "online")
+        self.assertFalse(any(row[1] == "GET" and "/commands?" in row[2] for row in calls))
+
+    def test_same_state_heartbeat_is_throttled_but_state_change_is_immediate(self):
+        now = [100.0]
+        calls = []
+
+        def http(method, path, payload=None):
+            calls.append((now[0], payload["state"]))
+            return {"ok": True}
+
+        relay = runtime.Relay(self.config, self.db, http_call=http)
+        with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]):
+            self.assertTrue(relay.send_heartbeat("connector-a", "online"))
+            now[0] += 10
+            self.assertFalse(relay.send_heartbeat("connector-a", "online"))
+            self.assertTrue(relay.send_heartbeat("connector-a", "offline"))
+            now[0] += 10
+            self.assertFalse(relay.send_heartbeat("connector-a", "offline"))
+            now[0] += runtime.HEARTBEAT_MIN_INTERVAL
+            self.assertTrue(relay.send_heartbeat("connector-a", "offline"))
+
+        self.assertEqual(calls, [(100.0, "online"), (110.0, "offline"),
+                                 (150.0, "offline")])
 
     def test_failed_outbox_delivery_does_not_extend_offline_heartbeat(self):
         message = self.event("queued")
@@ -1945,23 +2001,113 @@ class DeviceRuntimeTests(unittest.TestCase):
         now = [100]
         adapter_calls = []
         http_calls = []
+
+        def adapter(request):
+            adapter_calls.append(request)
+            if request["op"] == "ensure-active":
+                return self.wake_result(len([item for item in adapter_calls
+                                             if item["op"] == "ensure-active"]) == 1)
+            raise AssertionError("scan must remain gated after fresh readiness is false")
+
         def http_call(method, path, payload=None):
             http_calls.append(path)
             if path.endswith("/events"):
                 now[0] += 61
                 return self.event_ack(1)
             return {"ok": True}
-        relay = runtime.Relay(self.auto_wake_config(), self.db,
-                              lambda req: adapter_calls.append(req) or self.wake_result(True), http_call)
+        relay = runtime.Relay(self.auto_wake_config(), self.db, adapter, http_call)
         self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,?)",
                          ("connector-a", "primary", "queued", runtime.compact(self.event("queued")), 100))
         self.db.commit()
         with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]):
             relay.pass_once()
-        self.assertEqual(adapter_calls, [{"op": "ensure-active", "driver": "qq"}])
+        self.assertEqual(adapter_calls, [{"op": "ensure-active", "driver": "qq"},
+                                         {"op": "ensure-active", "driver": "qq"}])
         self.assertEqual(sum(path.endswith("/events") for path in http_calls), 1)
         self.assertFalse(any("/commands?" in path for path in http_calls))
         self.assertEqual(sum(path.endswith("/heartbeat") for path in http_calls), 2)
+
+    def test_slow_scan_and_profile_sync_refresh_readiness_before_online_and_command_gate(self):
+        now = [100.0]
+        adapter_calls = []
+        http_calls = []
+
+        def adapter(request):
+            adapter_calls.append(request)
+            if request["op"] == "ensure-active":
+                return self.wake_result(True)
+            now[0] += 35
+            return {"ok": True, "sourceReadOk": True, "health": "online",
+                    "cursor": None, "messages": [],
+                    "conversationProfiles": [{"conversationExternalId": "primary:conversation-aaaaaaaa",
+                                               "displayName": "Test"}],
+                    "senderAvatars": [{"id": "sender-a", "sha256": "a" * 64}]}
+
+        def http(method, path, payload=None):
+            http_calls.append((now[0], method, path, payload))
+            return {"ok": True, "commands": []}
+
+        relay = runtime.Relay(self.auto_wake_config(), self.db, adapter, http)
+        relay.connectors = relay.connectors[:1]
+        relay.connector_by_id = {relay.connectors[0]["id"]: relay.connectors[0]}
+        relay.health["connector-a"] = True
+        relay.wake_ready = True
+        relay.wake_readiness_established = True
+        relay.wake_ready_at = now[0]
+        relay.last_wake_attempt = now[0]
+
+        def slow_profile_sync(*_args):
+            now[0] += 20
+
+        def slow_avatar_sync(*_args):
+            now[0] += 20
+
+        with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(runtime, "sync_profiles", side_effect=slow_profile_sync), \
+                patch.object(runtime, "sync_sender_avatars", side_effect=slow_avatar_sync):
+            relay.pass_once()
+
+        self.assertEqual(sum(item["op"] == "ensure-active" for item in adapter_calls), 1)
+        self.assertEqual(sum(item["op"] == "scan" for item in adapter_calls), 1)
+        heartbeats = [row for row in http_calls if row[2].endswith("/heartbeat")]
+        self.assertEqual([row[3]["state"] for row in heartbeats], ["online"])
+        self.assertTrue(any(row[1] == "GET" and "/commands?" in row[2] for row in http_calls))
+
+    def test_slow_scan_with_fresh_not_ready_result_stays_offline_and_gates_commands(self):
+        now = [100.0]
+        adapter_calls = []
+        http_calls = []
+
+        def adapter(request):
+            adapter_calls.append(request)
+            if request["op"] == "ensure-active":
+                return self.wake_result(False)
+            now[0] += 70
+            return {"ok": True, "sourceReadOk": True, "health": "online",
+                    "cursor": None, "messages": []}
+
+        def http(method, path, payload=None):
+            http_calls.append((method, path, payload))
+            return {"ok": True, "commands": []}
+
+        relay = runtime.Relay(self.auto_wake_config(), self.db, adapter, http)
+        relay.connectors = relay.connectors[:1]
+        relay.connector_by_id = {relay.connectors[0]["id"]: relay.connectors[0]}
+        relay.health["connector-a"] = True
+        relay.wake_ready = True
+        relay.wake_readiness_established = True
+        relay.wake_ready_at = now[0]
+        relay.last_wake_attempt = now[0]
+
+        with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]):
+            relay.pass_once()
+
+        self.assertEqual(sum(item["op"] == "ensure-active" for item in adapter_calls), 1)
+        self.assertEqual(sum(item["op"] == "scan" for item in adapter_calls), 1)
+        heartbeat = next(payload for _method, path, payload in http_calls if path.endswith("/heartbeat"))
+        self.assertEqual(heartbeat["state"], "offline")
+        self.assertFalse(any(method == "GET" and "/commands?" in path
+                             for method, path, _payload in http_calls))
 
     def test_auto_wake_recovery_forces_fresh_scan_without_clearing_cloud_backoff(self):
         scans = []
