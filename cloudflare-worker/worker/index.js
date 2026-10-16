@@ -2480,17 +2480,17 @@ function verifiedQQExternalId(result) {
     hash = Math.imul(hash, 0x01000193) >>> 0;
   }
   const alias = `message-${hash.toString(16).padStart(8, "0")}`;
-  const expectedExternalId = result.externalId.match(/^([A-Za-z0-9_.-]{1,64}):(message-[a-f0-9]{8})$/);
+  const expectedExternalId = result.externalId.match(/^([A-Za-z0-9_.-]{1,64}):qq-message:(-?(?:0|[1-9][0-9]*))$/);
   return {
     present: true,
-    valid: Boolean(expectedExternalId && expectedExternalId[2] === alias &&
+    valid: Boolean(expectedExternalId && expectedExternalId[2] === sourceId &&
       receipt.messageAlias === alias && receipt.messageType === 1 && receipt.sendStatus === 2 &&
       receipt.confirmation === "verified-status"),
     externalId: expectedExternalId ? result.externalId : null,
   };
 }
 
-async function completeCommand(request, env, commandId) {
+async function completeCommand(request, env, commandId, batchRetry = false) {
   const authenticatedConnectorId = request.headers.get("x-connector-id") || "";
   if (!await hasConnectorRole(request, env, authenticatedConnectorId)) return fail("unauthorized", 401);
   const body = await readJson(request, 64 * 1024);
@@ -2501,18 +2501,23 @@ async function completeCommand(request, env, commandId) {
   const stamp = now();
   const command = await env.DB.prepare(`
     SELECT c.message_id, c.conversation_id, c.kind, c.payload_json,
-      m.direction, m.external_id, m.body, m.content_type, m.created_by, m.sender_name
+      k.kind AS connector_kind, m.direction, m.external_id, m.body, m.content_type, m.created_by, m.sender_name
     FROM commands c JOIN messages m ON m.id = c.message_id
+    JOIN connector_instances k ON k.id = c.connector_id
     WHERE c.id = ? AND c.connector_id = ? AND c.state = 'leased' AND c.lease_token = ?
       AND lease_expires_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
   `).bind(commandId, connectorId, leaseToken).first();
   if (!command) throw new Error("invalid_command_lease");
   const resultValue = body.result && typeof body.result === "object" ? body.result : {};
-  const qqIdentity = body.ok === true ? verifiedQQExternalId(resultValue) : { present: false };
+  const isQQConnector = command.connector_kind === "qq";
+  const qqIdentity = body.ok === true && isQQConnector ? verifiedQQExternalId(resultValue) : { present: false };
   let state = body.retry === true ? "pending" : body.uncertain === true ? "manual_review" : body.ok === true ? "completed" : "failed";
   let completionMessageId = command.message_id;
   let mergeFromMessageId = null;
-  if (state === "completed" && qqIdentity.present) {
+  if (state === "completed" && isQQConnector && (!qqIdentity.present || !qqIdentity.valid)) {
+    state = "manual_review";
+  }
+  if (state === "completed" && isQQConnector && qqIdentity.present) {
     if (!qqIdentity.valid || command.kind !== "send_text" || command.direction !== "outbound" ||
         command.external_id !== null || command.content_type !== "text" ||
         String(command.body || "") !== String(safeJson(command.payload_json, {}).body || "")) {
@@ -2572,7 +2577,9 @@ async function completeCommand(request, env, commandId) {
       mergeFromMessageId, connectorId, command.conversation_id, command.body,
       mergeFromMessageId, mergeFromMessageId, mergeFromMessageId, commandId]
     : [];
-  const results = await env.DB.batch([
+  let results;
+  try {
+    results = await env.DB.batch([
     env.DB.prepare(`
       UPDATE commands SET state = ?, result_json = ?, completed_at = ?, message_id = ?
       WHERE id = ? AND connector_id = ? AND state = 'leased' AND lease_token = ?
@@ -2604,7 +2611,29 @@ async function completeCommand(request, env, commandId) {
       UPDATE commands SET lease_token = NULL, lease_expires_at = NULL
       WHERE id = ? AND connector_id = ? AND state = ? AND lease_token = ?
     `).bind(commandId, connectorId, state, leaseToken),
-  ]);
+    ]);
+  } catch (error) {
+    const isExternalIdRace = error instanceof Error &&
+      error.message.includes("UNIQUE constraint failed: messages.connector_id, messages.external_id");
+    if (!batchRetry && isExternalIdRace && state === "completed" && isQQConnector && qqIdentity.valid) {
+      const racedEvent = await env.DB.prepare(`
+        SELECT id, conversation_id, direction, body, content_type, metadata_json,
+          (SELECT COUNT(*) FROM attachments WHERE message_id = messages.id) AS attachment_count,
+          (SELECT COUNT(*) FROM agent_queue WHERE message_id = messages.id) AS agent_queue_count
+        FROM messages WHERE connector_id = ? AND external_id = ?
+      `).bind(connectorId, qqIdentity.externalId).first();
+      if (racedEvent && racedEvent.conversation_id === command.conversation_id &&
+          racedEvent.direction === "outbound" && racedEvent.body === command.body &&
+          racedEvent.content_type === "text" && safeJson(racedEvent.metadata_json, {}).isSelf === true &&
+          racedEvent.attachment_count === 0 && racedEvent.agent_queue_count === 0) {
+        const retryRequest = new Request(request.url, {
+          method: "POST", headers: request.headers, body: JSON.stringify(body),
+        });
+        return completeCommand(retryRequest, env, commandId, true);
+      }
+    }
+    throw error;
+  }
   if (!count(results[0]?.meta?.changes) || !count(results.at(-1)?.meta?.changes) ||
       (mergeFromMessageId && !count(results[3]?.meta?.changes))) {
     throw new Error("invalid_command_lease");

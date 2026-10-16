@@ -6,3 +6,6 @@
 - Worker event ingest marks self events outbound and skips the inbound agent queue.
 - Command completion handles receipt-first ID attachment and exact event-first consolidation within the fenced D1 batch; unsafe matches become terminal manual review.
 - Focused Worker SQLite, Worker schema, and runtime suites pass.
+- Review follow-up gates QQ receipt validation on the trusted connector kind, requires a valid receipt for successful QQ completions, and leaves generic WeChat receipts on the shared non-QQ path.
+- Replaced the collision-prone alias as message identity with profile-scoped canonical native int64 IDs across the adapter, runtime, and Worker; added the known FNV collision regression.
+- Added deterministic event-insert-between-pre-read-and-batch coverage; the Worker retries exact reconciliation once after atomic rollback, without replaying a send.

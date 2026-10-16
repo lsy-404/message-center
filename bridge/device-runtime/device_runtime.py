@@ -180,7 +180,7 @@ def verified_qq_external_id(profile, external_id, receipt_text):
             and type(receipt.get("messageType")) is int and receipt["messageType"] == 1
             and type(receipt.get("sendStatus")) is int and receipt["sendStatus"] == 2
             and receipt.get("confirmation") == "verified-status"
-            and external_id == f"{profile}:{alias}")
+            and external_id == f"{profile}:qq-message:{source_id}")
 
 
 def resolve_local_paths(config, config_path):

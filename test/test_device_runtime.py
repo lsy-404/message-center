@@ -26,7 +26,7 @@ def qq_receipt_result():
                "messageType": 1, "sendStatus": 2, "confirmation": "verified-status"}
     return {"ok": True, "dispatched": True,
             "receipt": json.dumps(receipt, separators=(",", ":")),
-            "externalId": "primary:message-aeb18cd1"}
+            "externalId": "primary:qq-message:9007199254740993"}
 
 
 class DeviceRuntimeTests(unittest.TestCase):
@@ -59,14 +59,21 @@ class DeviceRuntimeTests(unittest.TestCase):
                 "inserted": received if inserted is None else inserted,
                 "upgraded": upgraded, "promoted": promoted, "suppressed": suppressed}
 
-    def test_qq_receipt_identity_requires_exact_source_alias_and_profile(self):
+    def test_qq_receipt_identity_requires_exact_native_id_alias_and_profile(self):
         valid = qq_receipt_result()
         self.assertTrue(runtime.verified_qq_external_id(
             "primary", valid["externalId"], valid["receipt"]))
         self.assertFalse(runtime.verified_qq_external_id(
             "other-profile", valid["externalId"], valid["receipt"]))
         self.assertFalse(runtime.verified_qq_external_id(
-            "primary", "primary:message-00000000", valid["receipt"]))
+            "primary", "primary:qq-message:9007199254740992", valid["receipt"]))
+        collision_receipt = json.loads(valid["receipt"])
+        collision_receipt["sourceId"] = "2328622970"
+        collision_receipt["messageAlias"] = "message-e37f9132"
+        self.assertTrue(runtime.verified_qq_external_id(
+            "primary", "primary:qq-message:2328622970", json.dumps(collision_receipt)))
+        self.assertFalse(runtime.verified_qq_external_id(
+            "primary", "primary:qq-message:2948735191", json.dumps(collision_receipt)))
         bad_receipt = json.loads(valid["receipt"])
         bad_receipt["sourceId"] = "9007199254740992"
         self.assertFalse(runtime.verified_qq_external_id(
@@ -1306,7 +1313,7 @@ class DeviceRuntimeTests(unittest.TestCase):
                               lambda method, path, payload=None: completions.append(payload) or {"ok": True})
         relay.process_command(command, "primary")
         completion = next(payload for payload in completions if payload and "result" in payload)
-        self.assertEqual(completion["result"]["externalId"], "primary:message-aeb18cd1")
+        self.assertEqual(completion["result"]["externalId"], "primary:qq-message:9007199254740993")
         self.assertEqual(json.loads(completion["result"]["receipt"])["sourceId"], "9007199254740993")
 
     def test_qq_receipt_mismatch_is_terminal_uncertain(self):
