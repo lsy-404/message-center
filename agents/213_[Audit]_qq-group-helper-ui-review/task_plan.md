@@ -5,4 +5,5 @@
 - [x] Review search, unread, pagination, selection, and back-navigation behavior.
 - [x] Run the targeted Node tests and relevant UI checks.
 - [x] Record findings and send actionable blockers to the task owner.
-- [ ] Re-review the corrected candidate and verify the state-clearing/order regressions.
+- [x] Re-review the corrected candidate and verify the state-clearing/order regressions.
+- [ ] Verify empty selection remains empty after automatic and manual refresh.
