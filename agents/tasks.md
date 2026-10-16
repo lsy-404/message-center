@@ -74,3 +74,5 @@
 | 195 | [BugFix] QQ create_script timeout recovery | Accept only explicit pre-dispatch QQ create_script timeouts and route them through existing same-PID bounded recovery | Repeated Frida script-creation timeouts need the existing safe QQ recovery path | ✅ Locally verified |
 | 212 | [Feature] QQ 群助手入口 | 在收件箱提供 QQ 折叠/消息盒子群的独立入口，保持现有搜索、未读和聊天选择流程 | 群目录已同步但 folded/message_box 会话缺少可进入的用户界面 | 🔄 进行中 |
 | 215 | 215_[Audit]_qq-graytip-presentation | Adversarially review the optional QQ system graytip presentation path from Worker through the device runtime | Ensure only the verified QQ system source upgrades the exact stored type-8 body while all other messages remain unchanged | 🔄 In progress |
+
+| 214 | [Feature] QQ gray-tip presentation | Carry an explicit QQ system marker through ingestion, safely upgrade exact legacy placeholders, and render centered system text | QQ gray-tip records need system presentation without inferring from type/body or changing sender identity | ✅ Completed |

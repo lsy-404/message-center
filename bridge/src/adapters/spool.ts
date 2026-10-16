@@ -41,6 +41,7 @@ const MessageSchema = z.object({
   sender: IdentitySchema,
   receivedAt: z.iso.datetime().default(() => new Date().toISOString()),
   text: z.string().max(100_000),
+  presentation: z.enum(["system"]).optional(),
   attachments: z.array(AttachmentSchema).max(20).default([]),
   conversationType: z.enum(["direct", "group"]).optional(),
   trigger: z.enum(["direct", "mention", "explicit_request", "background"]).optional(),
