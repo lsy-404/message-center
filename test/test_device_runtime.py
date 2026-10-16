@@ -52,7 +52,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.temp.cleanup()
 
     def event(self, ident):
-        return {"externalId": ident, "conversationExternalId": "primary:conversation-aaaaaaaa",
+        return {"externalId": ident, "conversationExternalId": "conversation-aaaaaaaa",
                 "conversationTitle": "Test", "senderName": "Sender",
                 "occurredAt": "2026-10-07T12:00:00.000Z", "body": ident}
 
@@ -100,6 +100,15 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertFalse(runtime.verified_qq_external_id(
             "primary", valid["externalId"], json.dumps(bad_receipt)))
 
+    def test_qq_command_conversation_id_uses_raw_worker_external_alias(self):
+        self.assertEqual(
+            runtime.qq_command_conversation_alias("conversation-aaaaaaaa"),
+            "conversation-aaaaaaaa",
+        )
+        self.assertIsNone(runtime.qq_command_conversation_alias("primary:conversation-aaaaaaaa"))
+        self.assertIsNone(runtime.qq_command_conversation_alias("conversation-aaaaaaaa:primary"))
+        self.assertIsNone(runtime.qq_command_conversation_alias("conversation-AAAAAAAA"))
+
     def backup_ack(self, received, inserted=None, normalized_inserted=None):
         return {"ok": True, "received": received,
                 "inserted": received if inserted is None else inserted,
@@ -109,7 +118,7 @@ class DeviceRuntimeTests(unittest.TestCase):
     def test_profile_sync_failure_preserves_cursor_and_outbox(self):
         result = {"ok": True, "sourceReadOk": True, "health": "online", "cursor": {"next": "2"},
                   "messages": [self.event("new-1")],
-                  "conversationProfiles": [{"conversationExternalId": "primary:conversation-aaaaaaaa", "displayName": "中文 😀"}]}
+                  "conversationProfiles": [{"conversationExternalId": "conversation-aaaaaaaa", "displayName": "中文 😀"}]}
         relay = runtime.Relay(self.config, self.db, lambda _: result)
         with patch.object(runtime, "sync_profiles", side_effect=RuntimeError("offline")):
             with self.assertRaises(RuntimeError):
@@ -689,7 +698,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.save_cursor()
         command = {"id": "command-timeout", "leaseToken": "lease-timeout",
                    "idempotencyKey": "key-timeout",
-                   "payload": {"externalConversationId": "primary:conversation-aaaaaaaa",
+                   "payload": {"externalConversationId": "conversation-aaaaaaaa",
                                "body": "synthetic"}}
         with patch.object(runtime, "run_adapter", side_effect=RuntimeError("adapter_timeout")) as run:
             relay = runtime.Relay(
@@ -1370,7 +1379,7 @@ class DeviceRuntimeTests(unittest.TestCase):
     def test_started_send_is_marked_uncertain_without_second_adapter_call(self):
         self.save_cursor()
         command = {"id": "command-1", "leaseToken": "lease-1", "idempotencyKey": "key-1",
-                   "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "hello"}}
+                   "payload": {"externalConversationId": "conversation-aaaaaaaa", "body": "hello"}}
         adapter_calls = []
         completions = []
         def adapter(request):
@@ -1391,7 +1400,7 @@ class DeviceRuntimeTests(unittest.TestCase):
     def test_lost_completion_response_replays_saved_result_without_resending(self):
         self.save_cursor()
         command = {"id": "command-2", "leaseToken": "lease-2", "idempotencyKey": "key-2",
-                   "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "hello"}}
+                   "payload": {"externalConversationId": "conversation-aaaaaaaa", "body": "hello"}}
         adapter_calls = []
         completion_calls = []
         def adapter(request):
@@ -1415,7 +1424,7 @@ class DeviceRuntimeTests(unittest.TestCase):
 
     def test_invalid_lease_is_checked_before_native_send(self):
         command = {"id": "command-3", "leaseToken": "expired", "idempotencyKey": "key-3",
-                   "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "hello"}}
+                   "payload": {"externalConversationId": "conversation-aaaaaaaa", "body": "hello"}}
         adapter_calls = []
         def http(method, path, payload=None):
             if path.endswith("/lease"):
@@ -1456,7 +1465,7 @@ class DeviceRuntimeTests(unittest.TestCase):
                 )
                 command = {"id": f"cursor-{index}", "leaseToken": "lease-cursor",
                            "idempotencyKey": f"cursor-key-{index}",
-                           "payload": {"externalConversationId": "primary:conversation-aaaaaaaa",
+                           "payload": {"externalConversationId": "conversation-aaaaaaaa",
                                        "body": "hello"}}
                 relay.process_command(command, profile)
                 self.assertEqual(adapter_calls, [])
@@ -1517,7 +1526,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         )
         relay.select_connector(wechat)
         command = {"id": "wechat-command", "leaseToken": "lease-wechat", "idempotencyKey": "wechat-key",
-                   "payload": {"externalConversationId": "secondary:conversation-aaaaaaaa", "body": "hello"}}
+                   "payload": {"externalConversationId": "conversation-aaaaaaaa", "body": "hello"}}
         relay.process_command(command, "secondary")
         self.assertEqual(len(adapter_calls), 1)
         self.assertEqual(adapter_calls[0]["driver"], "wechat")
@@ -1533,7 +1542,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         command = {
             "id": "command-authorized", "leaseToken": "lease-authorized",
             "idempotencyKey": "key-authorized",
-            "payload": {"externalConversationId": "primary:conversation-aaaaaaaa",
+            "payload": {"externalConversationId": "conversation-aaaaaaaa",
                         "body": "exact command body"},
         }
         adapter_calls = []
@@ -1564,7 +1573,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         request = adapter_calls[0]
         self.assertEqual(request["driver"], "qq")
         self.assertEqual(request["profile"], "primary")
-        self.assertEqual(request["conversationExternalId"], "primary:conversation-aaaaaaaa")
+        self.assertEqual(request["conversationExternalId"], "conversation-aaaaaaaa")
         self.assertEqual(request["body"], "exact command body")
         self.assertIs(request["confirmed"], True)
         self.assertIs(request["targetConfirmed"], True)
@@ -1578,7 +1587,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.save_cursor()
         command = {"id": "command-receipt-id", "leaseToken": "lease-receipt-id",
                    "idempotencyKey": "key-receipt-id",
-                   "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "body"}}
+                   "payload": {"externalConversationId": "conversation-aaaaaaaa", "body": "body"}}
         completions = []
         relay = runtime.Relay(self.config, self.db, lambda _: qq_receipt_result(),
                               lambda method, path, payload=None: completions.append(payload) or {"ok": True})
@@ -1592,9 +1601,11 @@ class DeviceRuntimeTests(unittest.TestCase):
         trace = []
         self.db.set_trace_callback(trace.append)
         adapter_calls = []
+        adapter_requests = []
 
         def adapter(_request):
             adapter_calls.append(True)
+            adapter_requests.append(_request)
             latest = dict(cursor, conversations={"conversation-aaaaaaaa": {"head": "new-head"}},
                           next={"page": 17}, sweep={"active": False})
             self.db.execute(
@@ -1611,7 +1622,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         command = {
             "id": "priority-command", "leaseToken": "priority-lease",
             "idempotencyKey": "priority-key",
-            "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "sent"},
+            "payload": {"externalConversationId": "conversation-aaaaaaaa", "body": "sent"},
         }
         relay.process_command(command, "primary")
 
@@ -1631,6 +1642,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(ledger[0], "done")
         self.assertTrue(json.loads(ledger[1])["ok"])
         self.assertEqual(adapter_calls, [True])
+        self.assertEqual(adapter_requests[0]["conversationExternalId"], "conversation-aaaaaaaa")
         transaction = trace[trace.index("BEGIN IMMEDIATE", max(
             index for index, statement in enumerate(trace) if statement == "BEGIN IMMEDIATE")):]
         completed = next(i for i, statement in enumerate(transaction)
@@ -1675,7 +1687,7 @@ class DeviceRuntimeTests(unittest.TestCase):
                 command = {
                     "id": f"priority-negative-{index}", "leaseToken": "lease",
                     "idempotencyKey": f"priority-negative-key-{index}",
-                    "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "sent"},
+                    "payload": {"externalConversationId": "conversation-aaaaaaaa", "body": "sent"},
                 }
                 relay.process_command(command, "primary")
                 stored = json.loads(self.db.execute(
@@ -1715,7 +1727,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         relay.select_connector(self.config["connectors"][1])
         command = {
             "id": "priority-scope", "leaseToken": "lease", "idempotencyKey": "priority-scope-key",
-            "payload": {"externalConversationId": "secondary:conversation-bbbbbbbb", "body": "sent"},
+            "payload": {"externalConversationId": "conversation-bbbbbbbb", "body": "sent"},
         }
         relay.process_command(command, "secondary")
         primary_after = json.loads(self.db.execute(
@@ -1739,7 +1751,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         command = {
             "id": "priority-malformed", "leaseToken": "lease",
             "idempotencyKey": "priority-malformed-key",
-            "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "sent"},
+            "payload": {"externalConversationId": "conversation-aaaaaaaa", "body": "sent"},
         }
         calls = []
         relay = runtime.Relay(
@@ -1773,7 +1785,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         command = {
             "id": "priority-capacity", "leaseToken": "lease",
             "idempotencyKey": "priority-capacity-key",
-            "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "sent"},
+            "payload": {"externalConversationId": "conversation-aaaaaaaa", "body": "sent"},
         }
         relay = runtime.Relay(self.config, self.db, lambda _request: qq_receipt_result(),
                               lambda *_args: {"ok": True})
@@ -1790,7 +1802,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         other = {
             "id": "priority-capacity-second", "leaseToken": "lease",
             "idempotencyKey": "priority-capacity-key-second",
-            "payload": {"externalConversationId": "primary:conversation-bbbbbbbb", "body": "sent"},
+            "payload": {"externalConversationId": "conversation-bbbbbbbb", "body": "sent"},
         }
         relay.process_command(other, "primary")
         queue = json.loads(self.db.execute(
@@ -1812,7 +1824,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.save_cursor(cursor=cursor)
         command = {
             "id": "priority-size", "leaseToken": "lease", "idempotencyKey": "priority-size-key",
-            "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "sent"},
+            "payload": {"externalConversationId": "conversation-aaaaaaaa", "body": "sent"},
         }
         relay = runtime.Relay(self.config, self.db, lambda _request: qq_receipt_result(),
                               lambda *_args: {"ok": True})
@@ -1839,7 +1851,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         command = {
             "id": "priority-write-failure", "leaseToken": "lease",
             "idempotencyKey": "priority-write-failure-key",
-            "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "sent"},
+            "payload": {"externalConversationId": "conversation-aaaaaaaa", "body": "sent"},
         }
         relay = runtime.Relay(self.config, self.db, lambda _request: qq_receipt_result(),
                               lambda *_args: {"ok": True})
@@ -1858,7 +1870,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.save_cursor()
         command = {"id": "command-bad-receipt", "leaseToken": "lease-bad-receipt",
                    "idempotencyKey": "key-bad-receipt",
-                   "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "body"}}
+                   "payload": {"externalConversationId": "conversation-aaaaaaaa", "body": "body"}}
         adapter_calls = []
         completions = []
         result = qq_receipt_result()
@@ -1875,7 +1887,7 @@ class DeviceRuntimeTests(unittest.TestCase):
     def test_retryable_unknown_dispatch_is_uncertain_and_never_retried(self):
         self.save_cursor()
         command = {"id": "command-4", "leaseToken": "lease-4", "idempotencyKey": "key-4",
-                   "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "hello"}}
+                   "payload": {"externalConversationId": "conversation-aaaaaaaa", "body": "hello"}}
         adapter_calls = []
         completions = []
         def adapter(request):
@@ -1891,7 +1903,7 @@ class DeviceRuntimeTests(unittest.TestCase):
     def test_reused_idempotency_key_with_changed_payload_is_fenced(self):
         self.save_cursor()
         command = {"id": "command-5", "leaseToken": "lease-5", "idempotencyKey": "key-5",
-                   "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "hello"}}
+                   "payload": {"externalConversationId": "conversation-aaaaaaaa", "body": "hello"}}
         adapter_calls = []
         completions = []
         relay = runtime.Relay(self.config, self.db,
@@ -1899,7 +1911,7 @@ class DeviceRuntimeTests(unittest.TestCase):
                               lambda method, path, payload=None: completions.append(payload) or {"ok": True})
         relay.process_command(command, "primary")
         changed = dict(command, id="command-6", leaseToken="lease-6",
-                       payload={"externalConversationId": "primary:conversation-bbbbbbbb", "body": "different"})
+                       payload={"externalConversationId": "conversation-bbbbbbbb", "body": "different"})
         relay.process_command(changed, "primary")
         self.assertEqual(len(adapter_calls), 1)
         self.assertEqual(completions[-1]["error"], "device_idempotency_key_conflict")
@@ -2648,7 +2660,7 @@ class DeviceRuntimeTests(unittest.TestCase):
             now[0] += 35
             return {"ok": True, "sourceReadOk": True, "health": "online",
                     "cursor": None, "messages": [],
-                    "conversationProfiles": [{"conversationExternalId": "primary:conversation-aaaaaaaa",
+                    "conversationProfiles": [{"conversationExternalId": "conversation-aaaaaaaa",
                                                "displayName": "Test"}],
                     "senderAvatars": [{"id": "sender-a", "sha256": "a" * 64}]}
 

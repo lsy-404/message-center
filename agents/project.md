@@ -36,3 +36,5 @@ Cloudflare Worker、D1、R2；Vue 前端与 @platform-kit/fluent；通用连接�
 - [038_[BugFix]_wake-pipe-reliability](038_[BugFix]_wake-pipe-reliability/task_plan.md)：适配器管道就绪竞态与脱敏唤醒错误分类已本地修复并验证；未据此认定实机根因。
 - [039_[BugFix]_source-health-recovery](039_[BugFix]_source-health-recovery/task_plan.md)：显式在线读取成功语义、离线读失败的游标保护与有界唤醒恢复。
 - [040_[Feature]_qq_only_runtime_contract](040_[Feature]_qq_only_runtime_contract/task_plan.md)：允许 QQ 单源配置，并为原生 readiness 请求声明 QQ driver。
+
+- [050_[BugFix]_qq_priority_alias_contract](050_[BugFix]_qq_priority_alias_contract/task_plan.md)：Align confirmed-send readback registration with the canonical conversation alias passed by the Worker.

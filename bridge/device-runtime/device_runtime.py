@@ -324,16 +324,11 @@ def valid_qq_confirmed_read_queue(value, owner_uin):
     return value
 
 
-def qq_command_conversation_alias(profile, external_conversation_id):
-    if not isinstance(profile, str) or not isinstance(external_conversation_id, str):
+def qq_command_conversation_alias(external_conversation_id):
+    if (not isinstance(external_conversation_id, str)
+            or re.fullmatch(r"conversation-[a-f0-9]{8}", external_conversation_id) is None):
         return None
-    prefix = profile + ":"
-    if not external_conversation_id.startswith(prefix):
-        return None
-    alias = external_conversation_id[len(prefix):]
-    if re.fullmatch(r"conversation-[a-f0-9]{8}", alias) is None:
-        return None
-    return alias
+    return external_conversation_id
 
 
 def resolve_local_paths(config, config_path):
@@ -1415,8 +1410,7 @@ class Relay:
                         outcome = {"ok": True, "result": {
                             "receipt": result["receipt"], "externalId": external_id}}
                         receipt = json.loads(result["receipt"])
-                        alias = qq_command_conversation_alias(
-                            profile, payload.get("externalConversationId"))
+                        alias = qq_command_conversation_alias(payload.get("externalConversationId"))
                         if alias is not None:
                             priority_read = (alias, receipt["sourceId"])
                     else:
