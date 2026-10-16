@@ -1443,8 +1443,10 @@ async function ingestEvents(request, env) {
           UPDATE messages SET body = ?, content_type = 'text', metadata_json = ?
           WHERE id = ? AND connector_id = ? AND external_id = ? AND conversation_id = ?
             AND direction = 'inbound' AND content_type = 'text' AND body = '[类型:8]'
+            AND metadata_json = ?
             AND NOT EXISTS (SELECT 1 FROM attachments a WHERE a.message_id = messages.id)
-        `).bind(upgradedBody, metadata, existing.id, connectorId, item.externalId, conversation.id).run();
+        `).bind(upgradedBody, metadata, existing.id, connectorId, item.externalId, conversation.id,
+          existing.metadata_json).run();
         if (count(graytipUpgrade.meta?.changes)) {
           upgraded += 1;
           canonicalBody = upgradedBody;
@@ -1956,7 +1958,8 @@ async function readInbox(env, selectedConversationId) {
       const attachments = attachmentMap.get(row.id) || [];
       const metadata = safeJson(row.metadata_json, {});
       const verifiedSystemPresentation = row.connector_kind === "qq" && row.direction === "inbound" &&
-        metadata.presentation === "system" && attachments.length === 0;
+        metadata.presentation === "system" && row.content_type === "text" && String(row.body || "").trim().length > 0 &&
+        attachments.length === 0;
       return {
         id: row.id, conversationId: row.conversation_id, direction: row.direction,
         senderName: row.sender_name, body: row.body, contentType: row.content_type,
@@ -2395,10 +2398,11 @@ async function queueOutbound(env, input, retryDepth = 0) {
       )
       SELECT ?, ?, ?, NULL, 'outbound', ?, ?, ?, ?, 'queued', '{}', ?, ?, ?
       WHERE EXISTS (
-        SELECT 1 FROM agent_queue q
+        SELECT 1 FROM agent_queue q JOIN messages source_message ON source_message.id = q.message_id
         WHERE q.message_id = ? AND q.state = 'leased' AND q.lease_token = ?
           AND q.leased_by = ?
           AND q.lease_expires_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+          AND COALESCE(json_extract(source_message.metadata_json, '$.presentation'), '') != 'system'
       )
     `).bind(messageId, input.conversationId, conversation.connector_id, input.userId,
       input.userName.slice(0, 200), body, files.length ? "mixed" : "text", stamp, input.userId, stamp,
@@ -2976,6 +2980,7 @@ async function agentTool(env, name, args) {
       FROM agent_queue q JOIN messages m ON m.id = q.message_id
       JOIN conversations c ON c.id = m.conversation_id
       WHERE q.message_id = ? AND q.state = 'leased' AND q.lease_token = ? AND q.leased_by = ?
+        AND COALESCE(json_extract(m.metadata_json, '$.presentation'), '') != 'system'
     `).bind(args.messageId, args.leaseToken, args.consumerId).first();
     if (!row || text(row.lease_expires_at) < now()) throw new Error("invalid_message_lease");
     const scope = agentScope(row);

@@ -193,11 +193,18 @@ assert.equal(database.prepare(`
 `).get().total, 1);
 assert.equal(database.prepare("SELECT queue_class FROM messages WHERE id = 'message-background'").get().queue_class, 'background');
 
+let beforeGraytipUpgrade;
 function d1Statement(sql, args = []) {
   const statement = database.prepare(sql);
   return {
     bind(...values) { return d1Statement(sql, values); },
     async run() {
+      if (sql.includes("UPDATE messages SET body = ?, content_type = 'text', metadata_json = ?") &&
+          beforeGraytipUpgrade) {
+        const interleave = beforeGraytipUpgrade;
+        beforeGraytipUpgrade = null;
+        interleave();
+      }
       const result = statement.run(...args);
       return { meta: { changes: Number(result.changes) } };
     },
@@ -2075,6 +2082,15 @@ const legacyIdentityBefore = { ...database.prepare(`
   SELECT sender_id, sender_name, direction, occurred_at, created_at, delivery_state, queue_class
   FROM messages WHERE id = 'graytip-legacy-row'
 `).get() };
+database.prepare(`
+  UPDATE conversations SET trust_tier = 'trusted', agent_policy_json = ?
+  WHERE id = 'graytip-legacy-conversation'
+`).run(JSON.stringify({ enabled: true, requiredPrefix: '', allowedSenderIds: [], projectIds: [],
+  allowedActions: ['send_text'], replyPolicy: 'informational' }));
+const legacyPreUpgradeClaim = await callAgentTool('claim_message', {
+  consumerId: 'graytip-legacy-consumer', messageId: 'graytip-legacy-row',
+});
+assert.equal(legacyPreUpgradeClaim.acquired, true);
 const legacyUpgrade = await postEvents([{
   ...graytipMessage,
   externalId: 'qq-graytip-legacy-id',
@@ -2094,6 +2110,19 @@ assert.deepEqual({ ...database.prepare(`
 `).get() }, {
   ...legacyIdentityBefore, body: '一位成员加入了群聊', presentation: 'system',
 });
+const legacyReply = await callAgentToolResult('reply_message', {
+  consumerId: 'graytip-legacy-consumer', messageId: 'graytip-legacy-row',
+  leaseToken: legacyPreUpgradeClaim.message.leaseToken,
+  clientRequestId: 'graytip-legacy-reply-request', text: 'must not reply to a system row',
+});
+assert.equal(legacyReply.isError, true);
+assert.equal(legacyReply.content[0].text, 'invalid_message_lease');
+assert.equal(database.prepare(`
+  SELECT COUNT(*) AS total FROM commands WHERE idempotency_key = 'graytip-legacy-reply-request'
+`).get().total, 0, 'a lease acquired before upgrade cannot create a reply command after upgrade');
+assert.equal(database.prepare(`
+  SELECT state FROM agent_queue WHERE message_id = 'graytip-legacy-row'
+`).get().state, 'leased', 'reply rejection preserves the historical lease audit state');
 const legacyReplay = await postEvents([{
   ...graytipMessage,
   externalId: 'qq-graytip-legacy-id', conversationExternalId: 'qq-graytip-legacy-conversation',
@@ -2109,7 +2138,49 @@ const graytipClaim = await callAgentTool('claim_message', {
 });
 assert.equal(graytipClaim.acquired, false, 'the explicit claim path also rejects upgraded system rows');
 assert.equal(database.prepare('SELECT state FROM agent_queue WHERE message_id = ?')
-  .get('graytip-legacy-row').state, 'pending', 'system exclusions do not consume the old queue row');
+  .get('graytip-legacy-row').state, 'leased', 'system exclusions do not consume the old queue lease');
+
+database.prepare(`
+  INSERT INTO messages (
+    id, conversation_id, connector_id, external_id, direction, sender_id, sender_name, body,
+    content_type, delivery_state, queue_class, metadata_json, occurred_at, created_at
+  ) VALUES ('graytip-reply-race-row', 'graytip-legacy-conversation', ?, 'qq-graytip-reply-race-id',
+    'inbound', 'sender-kept', 'Sender kept', 'ordinary request', 'text', 'received', 'immediate',
+    '{"trigger":"direct","conversationType":"direct"}', ?, ?)
+`).run(connectorId, stamp, stamp);
+database.prepare(`
+  INSERT INTO agent_queue (message_id, created_at)
+  VALUES ('graytip-reply-race-row', ?)
+`).run(stamp);
+const graytipRaceClaim = await callAgentTool('claim_message', {
+  consumerId: 'graytip-race-consumer', messageId: 'graytip-reply-race-row',
+});
+assert.equal(graytipRaceClaim.acquired, true);
+const beforeGraytipReplyBatch = d1.batch;
+let upgradeBeforeReplyBatch = true;
+d1.batch = async (statements) => {
+  if (upgradeBeforeReplyBatch) {
+    upgradeBeforeReplyBatch = false;
+    database.prepare(`
+      UPDATE messages SET body = ?, metadata_json = ? WHERE id = 'graytip-reply-race-row'
+    `).run('A member joined', JSON.stringify({ presentation: 'system' }));
+  }
+  return beforeGraytipReplyBatch(statements);
+};
+const graytipReplyRace = await callAgentToolResult('reply_message', {
+  consumerId: 'graytip-race-consumer', messageId: 'graytip-reply-race-row',
+  leaseToken: graytipRaceClaim.message.leaseToken,
+  clientRequestId: 'graytip-reply-race-request', text: 'must not race an upgrade',
+});
+d1.batch = beforeGraytipReplyBatch;
+assert.equal(graytipReplyRace.isError, true);
+assert.equal(graytipReplyRace.content[0].text, 'invalid_message_lease');
+assert.equal(database.prepare(`
+  SELECT COUNT(*) AS total FROM commands WHERE idempotency_key = 'graytip-reply-race-request'
+`).get().total, 0, 'atomic reply insertion rechecks that the leased source remains non-system');
+assert.equal(database.prepare(`
+  SELECT state FROM agent_queue WHERE message_id = 'graytip-reply-race-row'
+`).get().state, 'leased');
 
 database.prepare(`
   INSERT INTO conversations (
@@ -2171,6 +2242,39 @@ database.prepare(`
   INSERT INTO conversations (
     id, connector_id, external_id, title, avatar_label, trust_tier, agent_policy_json,
     unread_count, last_message_preview, created_at, updated_at
+  ) VALUES ('graytip-racing-conversation', ?, 'qq-graytip-racing-conversation', 'Racing placeholder',
+    'Ra', 'untrusted', '{}', 0, '[类型:8]', ?, ?)
+`).run(connectorId, stamp, stamp);
+database.prepare(`
+  INSERT INTO messages (
+    id, conversation_id, connector_id, external_id, direction, sender_id, sender_name, body,
+    content_type, delivery_state, queue_class, metadata_json, occurred_at, created_at
+  ) VALUES ('graytip-racing-row', 'graytip-racing-conversation', ?, 'qq-graytip-racing-id',
+    'inbound', 'sender-kept', 'Sender kept', '[类型:8]', 'text', 'received', 'immediate', '{}', ?, ?)
+`).run(connectorId, stamp, stamp);
+beforeGraytipUpgrade = () => {
+  database.prepare(`
+    UPDATE messages SET metadata_json = ? WHERE id = 'graytip-racing-row'
+  `).run(JSON.stringify({ attachments: [{ externalId: 'racing-file' }] }));
+};
+const racingPlaceholderConflict = await requestEvents([{
+  ...graytipMessage, externalId: 'qq-graytip-racing-id',
+  conversationExternalId: 'qq-graytip-racing-conversation', conversationTitle: 'Racing placeholder',
+  body: 'metadata-only attachment raced with gray-tip upgrade',
+}]);
+assert.equal(racingPlaceholderConflict.status, 400,
+  'a metadata attachment write between read and update must invalidate the gray-tip CAS');
+assert.equal((await racingPlaceholderConflict.json()).error, 'message_external_id_conflict');
+assert.deepEqual({ ...database.prepare(`
+  SELECT body, metadata_json FROM messages WHERE id = 'graytip-racing-row'
+`).get() }, {
+  body: '[类型:8]', metadata_json: JSON.stringify({ attachments: [{ externalId: 'racing-file' }] }),
+});
+
+database.prepare(`
+  INSERT INTO conversations (
+    id, connector_id, external_id, title, avatar_label, trust_tier, agent_policy_json,
+    unread_count, last_message_preview, created_at, updated_at
   ) VALUES ('graytip-legit-conversation', ?, 'qq-graytip-legit-conversation', 'Legitimate text',
     'Le', 'untrusted', '{}', 0, 'real text', ?, ?)
 `).run(connectorId, stamp, stamp);
@@ -2212,6 +2316,27 @@ const metadataOnlyInbox = await metadataOnlyInboxResponse.json();
 const metadataOnlyMessage = metadataOnlyInbox.messages.find((message) => message.body === '[类型:8]');
 assert.ok(metadataOnlyMessage);
 assert.equal(metadataOnlyMessage.presentation, undefined, 'the API does not infer system presentation from body or supplied metadata');
+
+database.prepare(`
+  INSERT INTO messages (
+    id, conversation_id, connector_id, external_id, direction, sender_id, sender_name, body,
+    content_type, delivery_state, queue_class, metadata_json, occurred_at, created_at
+  ) VALUES
+    ('graytip-blank-marked-row', ?, ?, 'qq-graytip-blank-marked', 'inbound', 'sender-kept', 'Sender kept',
+      '   ', 'text', 'received', 'immediate', '{"presentation":"system"}', ?, ?),
+    ('graytip-nontext-marked-row', ?, ?, 'qq-graytip-nontext-marked', 'inbound', 'sender-kept', 'Sender kept',
+      'attachment placeholder', 'image', 'received', 'immediate', '{"presentation":"system"}', ?, ?)
+`).run(metadataOnlyConversationId, connectorId, stamp, stamp,
+  metadataOnlyConversationId, connectorId, stamp, stamp);
+const constrainedInboxResponse = await worker.fetch(new Request(
+  `https://message.example.com/api/inbox?conversationId=${encodeURIComponent(metadataOnlyConversationId)}`,
+  { headers: { ...auth.headers } },
+), workerEnv, {});
+const constrainedInbox = await constrainedInboxResponse.json();
+for (const id of ['graytip-blank-marked-row', 'graytip-nontext-marked-row']) {
+  assert.equal(constrainedInbox.messages.find((message) => message.id === id).presentation, undefined,
+    'malformed legacy system metadata must not create a presentation marker');
+}
 
 database.prepare("UPDATE connector_instances SET kind = 'im' WHERE id = ?").run(connectorId);
 database.close();
