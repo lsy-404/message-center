@@ -5,6 +5,7 @@ import json
 import math
 import os
 import platform
+import secrets
 import tempfile
 import threading
 import time
@@ -19,13 +20,15 @@ KEYBOARD_USAGE_FIELD = KEYBOARD_USAGE_PAGE_FIELD + 1
 KEYBOARD_DOWN_FIELD = KEYBOARD_USAGE_PAGE_FIELD + 2
 CONSUMER_USAGE_PAGE = 0x0C
 HOME_USAGE = 0x40
+STATE_VERSION = 3
+HEARTBEAT_SECONDS = 2.0
 
 
 class ActivityStateError(RuntimeError):
     pass
 
 
-def _atomic_state_write(path: str, armed: bool) -> None:
+def _atomic_state_write(path: str, state: dict[str, Any]) -> None:
     parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, mode=0o700, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=".device-activity-", dir=parent)
@@ -33,8 +36,7 @@ def _atomic_state_write(path: str, armed: bool) -> None:
         if hasattr(os, "fchmod"):
             os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump({"version": 1, "armed": bool(armed)}, stream,
-                      separators=(",", ":"))
+            json.dump(state, stream, separators=(",", ":"))
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
@@ -64,8 +66,7 @@ def _load_armed_state(path: str) -> Optional[bool]:
         return None
     except Exception:
         return None
-    if (not isinstance(raw, dict) or set(raw) != {"version", "armed"} or
-            type(raw.get("version")) is not int or raw["version"] != 1 or
+    if (not isinstance(raw, dict) or raw.get("version") != STATE_VERSION or
             type(raw.get("armed")) is not bool):
         return None
     return raw["armed"]
@@ -78,9 +79,11 @@ class ActivityPolicy:
                 or not math.isfinite(float(idle_seconds)) or idle_seconds <= 0):
             raise ValueError("invalid_idle_seconds")
         self.state_path = os.fspath(state_path)
+        self.monitor_id = secrets.token_hex(16)
         self.idle_seconds = float(idle_seconds)
         self.clock = clock
         self._lock = threading.Lock()
+        self._persist_lock = threading.Lock()
         self._healthy = False
         self._failed = False
         self._armed = True
@@ -90,6 +93,48 @@ class ActivityPolicy:
         self._persistence_pending = False
         self._state_generation = 0
         self._reason = "monitor_starting"
+        self._last_persisted_at: Optional[float] = None
+        self._persisted_generation = 0
+
+    def _state_locked(self, published_at: float) -> dict[str, Any]:
+        return {
+            "version": STATE_VERSION,
+            "monitorId": self.monitor_id,
+            "runtimePid": os.getpid(),
+            "generation": self._persisted_generation + 1,
+            "publishedAt": published_at,
+            "healthy": self._healthy,
+            "armed": self._armed,
+            "lastActivityAt": self._last_activity_at,
+            "homeSequence": self._home_sequence,
+            "digitizerSequence": self._digitizer_sequence,
+        }
+
+    def _persist_current(self) -> bool:
+        with self._persist_lock:
+            now = self.clock()
+            published_at = time.time()
+            with self._lock:
+                if (isinstance(now, bool) or not isinstance(now, (int, float)) or
+                        not math.isfinite(float(now)) or not math.isfinite(published_at)):
+                    self._healthy = False
+                    self._failed = True
+                    self._armed = True
+                    self._reason = "clock_invalid"
+                    return False
+                state = self._state_locked(published_at)
+                generation = self._state_generation
+            try:
+                _atomic_state_write(self.state_path, state)
+            except Exception:
+                self.fail("state_unavailable", persist=False)
+                return False
+            with self._lock:
+                self._persisted_generation += 1
+                self._last_persisted_at = float(now)
+                if generation == self._state_generation:
+                    self._persistence_pending = False
+                return not self._persistence_pending
 
     def start_grace(self) -> bool:
         now = self.clock()
@@ -103,7 +148,8 @@ class ActivityPolicy:
             self._reason = "restart_pause" if saved_armed is True else "startup_grace"
             self._state_generation += 1
         try:
-            _atomic_state_write(self.state_path, True)
+            if not self._persist_current():
+                return False
         except Exception:
             self.fail("state_unavailable")
             return False
@@ -124,8 +170,11 @@ class ActivityPolicy:
             self._healthy = True
             if self._reason not in {"restart_pause", "human_activity"}:
                 self._reason = "startup_grace"
+            self._state_generation += 1
+            self._persistence_pending = True
+        self._persist_current()
 
-    def fail(self, reason: str = "monitor_failed") -> None:
+    def fail(self, reason: str = "monitor_failed", *, persist: bool = True) -> None:
         with self._lock:
             self._healthy = False
             self._failed = True
@@ -133,6 +182,8 @@ class ActivityPolicy:
             self._reason = reason
             self._persistence_pending = True
             self._state_generation += 1
+        if persist:
+            self._persist_current()
 
     def record_activity(self, kind: str, at: Optional[float] = None) -> None:
         if kind not in {"home", "digitizer"}:
@@ -140,6 +191,7 @@ class ActivityPolicy:
         now = self.clock() if at is None else at
         with self._lock:
             if (isinstance(now, bool) or not isinstance(now, (int, float))
+                    or not math.isfinite(float(now))
                     or self._last_activity_at is None or now < self._last_activity_at):
                 self._healthy = False
                 self._failed = True
@@ -159,26 +211,23 @@ class ActivityPolicy:
             if not was_armed:
                 self._persistence_pending = True
                 self._state_generation += 1
+        if not was_armed:
+            self._persist_current()
+
+    def heartbeat(self) -> bool:
+        now = self.clock()
+        with self._lock:
+            if (self._last_persisted_at is not None and
+                    now - self._last_persisted_at < HEARTBEAT_SECONDS and
+                    not self._persistence_pending):
+                return True
+        return self._persist_current()
 
     def flush_pending_state(self) -> bool:
         with self._lock:
             if not self._persistence_pending:
                 return True
-            armed = self._armed
-            generation = self._state_generation
-        try:
-            _atomic_state_write(self.state_path, armed)
-        except Exception:
-            self.fail("state_unavailable")
-            return False
-        with self._lock:
-            if generation == self._state_generation:
-                self._persistence_pending = False
-            if self._reason == "state_unavailable":
-                self._healthy = False
-                self._failed = True
-                return False
-            return not self._persistence_pending
+        return self._persist_current()
 
     def snapshot(self) -> dict[str, Any]:
         now = self.clock()
@@ -221,6 +270,15 @@ class ActivityPolicy:
             "lastActivityAt": last_activity_at,
             "idleFor": idle_for,
             "reason": reason,
+            "monitorId": self.monitor_id,
+            "runtimePid": os.getpid(),
+        }
+
+    def request_fields(self) -> dict[str, Any]:
+        return {
+            "activityStatePath": self.policy.state_path,
+            "activityMonitorId": self.policy.monitor_id,
+            "activityRuntimePid": os.getpid(),
         }
 
 
@@ -231,7 +289,7 @@ class InactiveHostMonitor:
     def snapshot(self) -> dict[str, Any]:
         return {"healthy": True, "armed": False, "shouldPause": False,
                 "homeSequence": 0, "lastActivityAt": None, "idleFor": None,
-                "reason": "unsupported_host"}
+                "reason": "unsupported_host", "monitorId": None}
 
     def stop(self) -> None:
         return None
@@ -369,6 +427,7 @@ class NativeActivityMonitor:
             while not self._stop_event.is_set():
                 result = cf.CFRunLoopRunInMode(self._mode, 1.0, False)
                 self.policy.flush_pending_state()
+                self.policy.heartbeat()
                 if result == 1:
                     raise ActivityStateError("run_loop_finished")
         except Exception:

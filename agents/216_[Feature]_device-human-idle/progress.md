@@ -6,3 +6,5 @@
 - 2026-10-16: Native symbol binding uses the verified `IOHIDEventSystemClientUnscheduleWithRunLoop` export and unregisters before unscheduling/releasing. Synthetic policy and runtime tests pass; no device install or physical HOME claim was made.
 - 2026-10-16: Validation passed: 13 focused activity tests, 118 runtime tests (2 skipped), `py_compile`, and `git diff --check`.
 - 2026-10-16: Committed scoped changes locally; no push.
+- 2026-10-16: Root device observation found Python monotonic values are process-relative. Added a versioned atomic cross-process lease with monitor identity, runtime PID, generation, wall-clock publish time, health, armed state, and bounded heartbeats; public runtime now adds the exact state path and identity to adapter subprocess requests.
+- 2026-10-16: Follow-up validation passed: 14 activity tests, 118 runtime tests (2 skipped), Python compilation, and diff checks.

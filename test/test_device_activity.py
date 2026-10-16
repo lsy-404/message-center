@@ -62,7 +62,14 @@ class DeviceActivityPolicyTests(unittest.TestCase):
         self.clock.value += 0.001
         self.assertFalse(self.policy.snapshot()["shouldPause"])
         with open(self.state_path, encoding="utf-8") as state_file:
-            self.assertEqual(json.load(state_file), {"version": 1, "armed": False})
+            saved = json.load(state_file)
+        self.assertEqual(saved["version"], device_activity.STATE_VERSION)
+        self.assertEqual(saved["monitorId"], self.policy.monitor_id)
+        self.assertEqual(saved["runtimePid"], os.getpid())
+        self.assertTrue(saved["healthy"])
+        self.assertFalse(saved["armed"])
+        self.assertEqual(saved["generation"], 3)
+        self.assertIsInstance(saved["publishedAt"], (int, float))
 
     def test_home_and_digitizer_activity_renew_the_grace(self):
         self.clock.value += 150
@@ -126,7 +133,7 @@ class DeviceActivityPolicyTests(unittest.TestCase):
             for index in range(2416):
                 self.clock.value += 0.01
                 self.policy.record_activity("digitizer")
-            self.assertEqual(write_state.call_count, 0)
+            self.assertEqual(write_state.call_count, 1)
         self.assertEqual(self.policy.snapshot()["homeSequence"], 0)
         self.assertTrue(self.policy.snapshot()["shouldPause"])
 
@@ -134,9 +141,10 @@ class DeviceActivityPolicyTests(unittest.TestCase):
         self.clock.value += 180
         real_write = device_activity._atomic_state_write
 
-        def write_then_home(path, armed):
-            real_write(path, armed)
-            self.policy.record_activity("home", self.clock.value + 0.001)
+        def write_then_home(path, state):
+            real_write(path, state)
+            with patch.object(self.policy, "_persist_current", return_value=True):
+                self.policy.record_activity("home", self.clock.value + 0.001)
 
         with patch.object(device_activity, "_atomic_state_write", side_effect=write_then_home):
             state = self.policy.snapshot()
@@ -220,7 +228,6 @@ class DeviceActivityPolicyTests(unittest.TestCase):
             with self.assertRaises(AttributeError):
                 monitor._bind()
 
-
 class DeviceActivityRuntimeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -246,6 +253,22 @@ class DeviceActivityRuntimeTests(unittest.TestCase):
                              adapter_call=adapter_call or (lambda _: {}),
                              http_call=http_call or (lambda *_args: {"ok": True}),
                              activity_monitor=monitor)
+
+    def test_runtime_adapter_requests_carry_monitor_identity_and_state_path(self):
+        monitor = ManualMonitor()
+        monitor.request_fields = lambda: {
+            "activityStatePath": self.db_path + ".activity.json",
+            "activityMonitorId": "a" * 32,
+            "activityRuntimePid": 123,
+        }
+        calls = []
+        relay = self.make_relay(monitor, lambda request: calls.append(request) or {})
+        relay.call_adapter({"op": "scan", "driver": "qq"})
+        self.assertEqual(calls, [{"op": "scan", "driver": "qq",
+                                  "activityStatePath": self.db_path + ".activity.json",
+                                  "activityMonitorId": "a" * 32,
+                                  "activityRuntimePid": 123}])
+        relay.close()
 
     def event(self, ident):
         return {"externalId": ident, "conversationExternalId": "conversation-aaaaaaaa",
