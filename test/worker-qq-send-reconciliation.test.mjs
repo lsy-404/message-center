@@ -103,6 +103,31 @@ async function complete(command, sourceId = '9007199254740993', overrides = {}) 
   }), env, {});
 }
 
+async function assertGroupSelfReconciliation(order, suffix, sourceId) {
+  const groupBody = 'group outbound body';
+  const command = seedCommand(`group-${order}-${suffix}`, groupBody);
+  const externalId = qqIdentity(sourceId).externalId;
+  const event = selfEvent(sourceId, {
+    conversationType: 'group', trigger: 'background', body: groupBody,
+  });
+  if (order === 'receipt-first') {
+    assert.equal((await complete(command, sourceId)).status, 200);
+    assert.equal((await ingest([event])).status, 200);
+  } else {
+    assert.equal((await ingest([event])).status, 200);
+    assert.equal((await complete(command, sourceId)).status, 200);
+  }
+  const rows = database.prepare(`SELECT id, direction, delivery_state FROM messages
+    WHERE connector_id = ? AND external_id = ?`).all(connectorId, externalId);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].direction, 'outbound');
+  assert.equal(rows[0].delivery_state, 'delivered');
+  assert.equal(database.prepare('SELECT COUNT(*) AS n FROM agent_queue WHERE message_id = ?')
+    .get(rows[0].id).n, 0);
+  assert.equal(database.prepare('SELECT message_id, state FROM commands WHERE id = ?')
+    .get(command.commandId).message_id, rows[0].id);
+}
+
 function selfEvent(sourceId = '9007199254740993', options = {}) {
   const identity = qqIdentity(sourceId);
   return {
@@ -166,6 +191,9 @@ assert.equal(selfGroupBackup.status, 400);
 assert.equal((await selfGroupBackup.json()).error, 'self_message_requires_event_ingest');
 assert.equal(database.prepare('SELECT COUNT(*) AS n FROM group_text_backups WHERE connector_id = ? AND external_id = ?')
   .get(connectorId, selfGroupEvent.externalId).n, 0);
+
+await assertGroupSelfReconciliation('receipt-first', 'background', '9007199254741012');
+await assertGroupSelfReconciliation('event-first', 'background', '9007199254741013');
 
 const receiptFirst = seedCommand('receipt-first');
 const receiptFirstAck = await complete(receiptFirst);
