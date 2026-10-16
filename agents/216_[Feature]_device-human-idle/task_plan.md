@@ -1,9 +1,8 @@
 # Task plan
 
-- [x] Load agent-mode workflow and confirm the assigned isolated worktree.
-- [x] Implement the on-device idle monitor and durable lease protocol.
-- [x] Gate runtime UI work and preserve outbox delivery during human use.
-- [x] Signal cleanup on idle-resume, retaining a stable request token until explicit completion acknowledgement.
-- [x] Keep host runtime fixtures from starting the native monitor; close fixture monitors during teardown.
-- [x] Consume and strip the private cleanup acknowledgement at the wake schema boundary.
-- [x] Run focused runtime and monitor tests; commit the scoped change.
+Implement on-device human activity gating and resume without changing message cursors, send budgets, or outbox delivery.
+
+1. Consume verified HID HOME and digitizer events using the owned monitor.
+2. Persist a strict bounded activity lease and distinguish safety grace from required app cleanup.
+3. Gate runtime UI work and resume only after continuous idle, verified app state, and the existing wake budget.
+4. Test activity, restart, lease, and cleanup behavior; leave live device validation to the parent.

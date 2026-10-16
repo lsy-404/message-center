@@ -5,7 +5,9 @@ import json
 import math
 import os
 import platform
+import re
 import secrets
+import stat
 import tempfile
 import threading
 import time
@@ -22,6 +24,11 @@ CONSUMER_USAGE_PAGE = 0x0C
 HOME_USAGE = 0x40
 STATE_VERSION = 4
 HEARTBEAT_SECONDS = 2.0
+STATE_FIELDS = {
+    "version", "monitorId", "runtimePid", "generation", "publishedAt",
+    "healthy", "armed", "cleanupRequired", "lastActivityAt",
+    "homeSequence", "digitizerSequence",
+}
 
 
 class ActivityStateError(RuntimeError):
@@ -57,20 +64,59 @@ def _atomic_state_write(path: str, state: dict[str, Any]) -> None:
 
 def _load_saved_state(path: str) -> tuple[Optional[bool], Optional[bool]]:
     try:
-        with open(path, "r", encoding="utf-8") as stream:
-            encoded = stream.read(MAX_STATE_BYTES + 1)
-        if len(encoded.encode("utf-8")) > MAX_STATE_BYTES:
-            return None, None
-        raw = json.loads(encoded)
+        link_metadata = os.lstat(path)
     except FileNotFoundError:
         return None, None
     except Exception:
+        return None, True
+    if not stat.S_ISREG(link_metadata.st_mode):
+        return None, True
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            metadata = os.fstat(descriptor)
+            if (not stat.S_ISREG(metadata.st_mode) or
+                    (metadata.st_dev, metadata.st_ino) !=
+                    (link_metadata.st_dev, link_metadata.st_ino)):
+                return None, True
+            with os.fdopen(descriptor, "rb") as stream:
+                descriptor = -1
+                encoded = stream.read(MAX_STATE_BYTES + 1)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        if len(encoded) > MAX_STATE_BYTES:
+            return None, True
+        raw = json.loads(encoded.decode("utf-8"))
+    except FileNotFoundError:
         return None, None
-    if (not isinstance(raw, dict) or raw.get("version") != STATE_VERSION or
-            type(raw.get("armed")) is not bool):
-        return None, None
-    cleanup_required = raw.get("cleanupRequired")
-    return raw["armed"], cleanup_required if type(cleanup_required) is bool else None
+    except Exception:
+        return None, True
+    if not isinstance(raw, dict) or set(raw) != STATE_FIELDS:
+        return None, True
+    if (type(raw["version"]) is not int or raw["version"] != STATE_VERSION or
+            type(raw["monitorId"]) is not str or
+            not re.fullmatch(r"[0-9a-f]{32}", raw["monitorId"]) or
+            isinstance(raw["runtimePid"], bool) or
+            not isinstance(raw["runtimePid"], int) or raw["runtimePid"] <= 1 or
+            isinstance(raw["generation"], bool) or
+            not isinstance(raw["generation"], int) or raw["generation"] < 1 or
+            type(raw["healthy"]) is not bool or type(raw["armed"]) is not bool or
+            type(raw["cleanupRequired"]) is not bool):
+        return None, True
+    for key in ("publishedAt", "lastActivityAt"):
+        value = raw[key]
+        if (value is not None and
+                (isinstance(value, bool) or not isinstance(value, (int, float)) or
+                 not math.isfinite(float(value)))):
+            return None, True
+    if raw["publishedAt"] is None:
+        return None, True
+    for key in ("homeSequence", "digitizerSequence"):
+        value = raw[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None, True
+    return raw["armed"], raw["cleanupRequired"]
 
 
 class ActivityPolicy:
@@ -143,12 +189,11 @@ class ActivityPolicy:
     def start_grace(self) -> bool:
         now = self.clock()
         saved_armed, saved_cleanup = _load_saved_state(self.state_path)
-        state_exists = os.path.exists(self.state_path)
         with self._lock:
             self._armed = True
             self._cleanup_required = (
                 saved_cleanup if saved_cleanup is not None else
-                saved_armed is True or (saved_armed is None and state_exists))
+                saved_armed is True)
             self._last_activity_at = now
             self._home_sequence = 0
             self._healthy = False

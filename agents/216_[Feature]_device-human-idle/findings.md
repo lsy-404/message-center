@@ -1,6 +1,7 @@
 # Findings
 
-- The monitor publishes a bounded wall-clock lease with runtime PID and monitor identity. Cross-process monotonic timestamps are not comparable on this device build.
-- Activity pauses scan, command polling, and auto-wake while outbox delivery continues; heartbeat reports offline until a fresh read.
-- The relay carries `activityResumeCleanup` with a stable resume token and retains it across adapter errors until the private adapter acknowledges that exact token. The private adapter owns safe SpringBoard cleanup and QQ return.
-- The private adapter returns completion metadata outside the public wake schema. The relay validates the exact token, clears its pending flag, then strips those fields before normal wake-response validation.
+- Activity state is version 4 and is accepted on restart only when it is a bounded regular non-symlink file with the complete typed schema.
+- Missing, malformed, oversized, stale, or invalid state fails closed and requires the 180-second safety grace plus cleanup.
+- Only an exact FileNotFoundError is treated as a first-run missing state; symlinks (including dangling links), non-regular files, and lookup/read errors preserve cleanup-required fail-closed behavior.
+- A strict healthy/idle state with cleanupRequired false can restart through safety grace without consuming app-card cleanup budget.
+- Actual physical HOME/touch and SpringBoard cleanup validation remain parent-owned.
