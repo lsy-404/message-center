@@ -283,6 +283,25 @@ database.prepare(`
 
 const r2Objects = new Map();
 const deletedR2Keys = [];
+const fixedLengthInboundStreams = new WeakMap();
+globalThis.FixedLengthStream = class TestFixedLengthStream {
+  constructor(expectedBytes) {
+    let receivedBytes = 0;
+    const stream = new TransformStream({
+      transform(chunk, controller) {
+        receivedBytes += chunk.byteLength;
+        if (receivedBytes > expectedBytes) throw new Error('fixed_length_stream_overflow');
+        controller.enqueue(chunk);
+      },
+      flush() {
+        if (receivedBytes !== expectedBytes) throw new Error('fixed_length_stream_underflow');
+      },
+    });
+    this.readable = stream.readable;
+    this.writable = stream.writable;
+    fixedLengthInboundStreams.set(this.readable, expectedBytes);
+  }
+};
 const r2Faults = {
   throwAfterWriteKeys: new Set(),
   wrongPutResultKeys: new Set(),
@@ -292,7 +311,15 @@ const r2Faults = {
 let paginatedInboundSweep = false;
 const r2 = {
   async put(key, body, options = {}) {
+    if (key.startsWith('inbound/')) {
+      assert.equal(Number.isSafeInteger(fixedLengthInboundStreams.get(body)), true,
+        'R2 inbound objects must receive a known-length stream');
+    }
     const bytes = new Uint8Array(await new Response(body).arrayBuffer());
+    if (key.startsWith('inbound/')) {
+      assert.equal(fixedLengthInboundStreams.get(body), bytes.byteLength,
+        'fixed-length stream metadata matches the bytes delivered to R2');
+    }
     const checksum = createHash('sha256').update(bytes).digest();
     if (options.sha256 && checksum.toString('hex') !== options.sha256) throw new Error('r2_checksum_mismatch');
     const checksumArrayBuffer = checksum.buffer.slice(checksum.byteOffset, checksum.byteOffset + checksum.byteLength);
@@ -316,7 +343,8 @@ const r2 = {
   async get(key) {
     const value = r2Objects.get(key);
     if (!value) return null;
-    return { body: value.bytes, size: value.bytes.byteLength, httpMetadata: value.options.httpMetadata,
+    return { body: new Response(value.bytes).body, size: value.bytes.byteLength,
+      checksums: { sha256: value.checksum }, httpMetadata: value.options.httpMetadata,
       httpEtag: `etag-${key}` };
   },
   async list({ prefix = '', cursor } = {}) {
@@ -806,8 +834,13 @@ assert.equal(r2Objects.size, 1);
 const mismatchedInboundLength = await putInboundFile('file-size-mismatch', 'external-size-mismatch',
   inboundBytes, 'conversation-file-test', 'application/octet-stream', inboundBytes.byteLength - 1);
 assert.equal(mismatchedInboundLength.status, 400);
-assert.equal((await mismatchedInboundLength.json()).error, 'uploaded_file_integrity_mismatch');
+assert.equal((await mismatchedInboundLength.json()).error, 'fixed_length_stream_overflow');
 assert.equal(r2Objects.size, 1, 'object with actual bytes that disagree with declared length is removed');
+const shortInboundLength = await putInboundFile('file-size-underflow', 'external-size-underflow', inboundBytes,
+  'conversation-file-test', 'application/octet-stream', inboundBytes.byteLength + 1);
+assert.equal(shortInboundLength.status, 400);
+assert.equal((await shortInboundLength.json()).error, 'fixed_length_stream_underflow');
+assert.equal(r2Objects.size, 1, 'short stream does not create an inbound object');
 const overLimitInboundLength = await putInboundFile('file-size-over-limit', 'external-size-over-limit',
   inboundBytes, 'conversation-file-test', 'application/octet-stream', 50 * 1024 * 1024 + 1);
 assert.equal(overLimitInboundLength.status, 400);

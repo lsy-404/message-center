@@ -8,6 +8,7 @@
 - QQ UI fixture capabilities remain `receive_text` only, and the attachment composer stays disabled. No public sticker-send contract is supported by verified native evidence.
 - The private counterpart confirms the current native source still does not emit an image-bearing sticker discriminator. UI and public contract behavior are validated synthetically; actual native sticker discovery/rendering still needs device evidence.
 - Cloudflare R2 Worker API docs confirm `put()` returns an R2 object with `size` and SHA-256 checksums, and `head()` exposes the same checksum data. The fake R2 test implements that contract.
+- A production upload exposed a runtime constraint not represented by the previous mock: R2 rejects arbitrary transformed ReadableStreams because they do not carry a known length. Cloudflare's official `FixedLengthStream` API supplies a declared length and errors when too few or too many bytes flow through it. The existing pre-upload 50 MiB metadata gate bounds that length.
 # Canonical R2 repair follow-up
 
 - A concurrent insert can leave the request with a temporary upload object and a canonical database row bound to the same connector, external ID, conversation, filename, MIME type, byte length, and SHA-256.
