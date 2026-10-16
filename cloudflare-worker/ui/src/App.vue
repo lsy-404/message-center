@@ -13,10 +13,13 @@ import {
   CONVERSATION_PAGE_SIZE,
   conversationPageCount,
   filterConversations,
+  filterQQGroupAssistantConversations,
   normalizeChannelLabel,
   nextConversationPage,
   pageConversations,
   previousConversationPage,
+  resolveConversationSelection,
+  resolveQQGroupAssistantInboxSelection,
 } from './conversation-list.mjs'
 import {
   avatarTone,
@@ -138,6 +141,7 @@ const snapshot = ref<Snapshot>(emptySnapshot())
 const selectedId = ref('')
 const activeFilter = ref('all')
 const activeConnectorId = ref('')
+const showQQGroupAssistant = ref(false)
 const conversationSearch = ref('')
 const unreadOnly = ref(false)
 const manualRefreshing = ref(false)
@@ -176,6 +180,7 @@ const selectedConversationConnector = computed(() =>
 const filters = computed(() => {
   const labels = new Map<string, string>()
   for (const conversation of snapshot.value.conversations) {
+    if (conversation.connectorKind === 'qq') continue
     const label = channelLabel(conversation)
     labels.set(label, label)
   }
@@ -183,8 +188,12 @@ const filters = computed(() => {
     count: items.length,
     unread: items.reduce((total, item) => total + Math.max(0, Number(item.unreadCount) || 0), 0),
   })
+  const qqConversations = snapshot.value.conversations.filter((item) => item.connectorKind === 'qq')
   return [
     { id: 'all', label: '全部', channel: '', ...summarize(snapshot.value.conversations) },
+    ...(qqConversations.length ? [{
+      id: 'protocol:qq', label: 'QQ', channel: 'QQ', ...summarize(qqConversations),
+    }] : []),
     ...[...labels.values()].map((label) => ({
       id: `channel:${label}`,
       label,
@@ -196,33 +205,50 @@ const filters = computed(() => {
 const totalUnread = computed(() => filters.value[0]?.unread ?? 0)
 const onlineConnectorCount = computed(() => snapshot.value.connectors.filter((item) => item.state === 'online').length)
 const activeFilterLabel = computed(() => {
+  if (showQQGroupAssistant.value) return '群助手'
+  if (activeFilter.value === 'protocol:qq') return 'QQ'
   if (activeConnectorId.value) {
     const connector = snapshot.value.connectors.find((item) => item.id === activeConnectorId.value)
     if (connector) return connector.accountLabel
   }
   return activeFilter.value === 'all' ? '收件箱' : activeFilter.value.slice('channel:'.length)
 })
-const filteredUnread = computed(() => filteredConversations.value
-  .reduce((total, item) => total + Math.max(0, Number(item.unreadCount) || 0), 0))
-
 const filteredConversations = computed(() => filterConversations(snapshot.value.conversations, {
+  connectorKind: activeFilter.value === 'protocol:qq' ? 'qq' : undefined,
   connectorId: activeConnectorId.value,
-  channelLabel: activeFilter.value === 'all' ? '' : activeFilter.value.slice('channel:'.length),
+  channelLabel: activeFilter.value === 'all' || activeFilter.value === 'protocol:qq'
+    ? '' : activeFilter.value.slice('channel:'.length),
   query: conversationSearch.value,
   unreadOnly: unreadOnly.value,
   getChannelLabel: channelLabel,
 }))
+const qqGroupAssistantConversations = computed(() =>
+  filterQQGroupAssistantConversations(snapshot.value.conversations),
+)
+const filteredQQGroupAssistantConversations = computed(() => filterQQGroupAssistantConversations(
+  filterConversations(snapshot.value.conversations, {
+    query: conversationSearch.value,
+    unreadOnly: unreadOnly.value,
+    getChannelLabel: channelLabel,
+  }),
+))
+const displayedConversations = computed(() => showQQGroupAssistant.value
+  ? filteredQQGroupAssistantConversations.value : filteredConversations.value)
+const displayedUnread = computed(() => displayedConversations.value
+  .reduce((total, item) => total + Math.max(0, Number(item.unreadCount) || 0), 0))
+const qqGroupAssistantUnread = computed(() => qqGroupAssistantConversations.value
+  .reduce((total, item) => total + Math.max(0, Number(item.unreadCount) || 0), 0))
 const visibleConversations = computed(() => pageConversations(
-  filteredConversations.value,
+  displayedConversations.value,
   conversationPage.value,
   CONVERSATION_PAGE_SIZE,
 ))
-const totalConversationPages = computed(() => conversationPageCount(filteredConversations.value.length))
-const conversationRangeStart = computed(() => filteredConversations.value.length
+const totalConversationPages = computed(() => conversationPageCount(displayedConversations.value.length))
+const conversationRangeStart = computed(() => displayedConversations.value.length
   ? conversationPage.value * CONVERSATION_PAGE_SIZE + 1 : 0)
 const conversationRangeEnd = computed(() => Math.min(
   (conversationPage.value + 1) * CONVERSATION_PAGE_SIZE,
-  filteredConversations.value.length,
+  displayedConversations.value.length,
 ))
 const conversationRows = computed<ConversationListItem[]>(() => visibleConversations.value.map((conversation) => ({
   id: conversation.id,
@@ -238,10 +264,13 @@ const conversationRows = computed<ConversationListItem[]>(() => visibleConversat
   channel: channelLabel(conversation),
 })))
 
-watch([activeFilter, activeConnectorId, conversationSearch, unreadOnly], async () => {
+watch([activeFilter, activeConnectorId, conversationSearch, unreadOnly, showQQGroupAssistant], async () => {
   conversationPage.value = 0
   await nextTick()
   conversationListElement.value?.scrollTo(0, 0)
+  if (showQQGroupAssistant.value) {
+    applyConversationSelection(filteredQQGroupAssistantConversations.value)
+  }
 })
 
 const threadEntries = computed(() => buildThreadEntries(snapshot.value.messages, nowTick.value))
@@ -683,6 +712,19 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
   try {
     const body = await api<Snapshot & { ok: boolean }>(`/api/inbox?${query}`, { signal: request.controller.signal })
     if (!inboxReads.isCurrent(request, selectedId.value)) return
+    let reloadConversationId = ''
+    if (showQQGroupAssistant.value) {
+      const selection = resolveQQGroupAssistantInboxSelection(
+        body.conversations,
+        selectedId.value,
+        request.conversationId,
+        conversationSearch.value,
+        unreadOnly.value,
+      )
+      body.selectedConversationId = selection.selectedConversationId
+      reloadConversationId = selection.reloadConversationId
+      if (reloadConversationId || !selection.selectedConversationId) body.messages = []
+    }
     const priorThread = document.querySelector<HTMLElement>('.message-scroll')
     const priorSelectedId = selectedId.value
     const scrollState = priorThread ? captureMessageScroll(priorThread) : null
@@ -701,10 +743,17 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
     }
     advanceAvatarRetries(body.conversations, body.messages)
     body.connectors = mergeConnectorLayoutControls(body.connectors)
-    if (sameInbox(snapshot.value, body)) return
+    if (sameInbox(snapshot.value, body)) {
+      if (reloadConversationId) void load(reloadConversationId, true)
+      return
+    }
     snapshot.value = body
     await nextTick()
     if (!inboxReads.isActive(request)) return
+    if (reloadConversationId) {
+      void load(reloadConversationId, true)
+      return
+    }
     const thread = document.querySelector<HTMLElement>('.message-scroll')
     const shouldForceScroll = forceScrollToBottom || pendingScrollToBottomId === nextSelectedId
     if (thread) {
@@ -767,7 +816,7 @@ async function refreshNow() {
 }
 
 function showNextConversationPage() {
-  conversationPage.value = nextConversationPage(conversationPage.value, filteredConversations.value.length)
+  conversationPage.value = nextConversationPage(conversationPage.value, displayedConversations.value.length)
 }
 
 function showPreviousConversationPage() {
@@ -780,23 +829,35 @@ function selectConversationById(conversationId: string) {
 }
 
 function selectFilter(id: string, connectorId = '') {
+  showQQGroupAssistant.value = false
   activeFilter.value = id
   activeConnectorId.value = connectorId
   showInstances.value = false
   mobileThread.value = false
-  if (!filteredConversations.value.some((conversation) => conversation.id === selectedId.value)) {
-    const nextConversation = filteredConversations.value[0]
-    if (nextConversation) {
-      void selectConversation(nextConversation, false)
-    } else {
-      storeComposer()
-      pendingScrollToBottomId = null
-      cancelInboxRead()
-      selectedId.value = ''
-      restoreComposer('')
-      snapshot.value.messages = []
-      detailLoading.value = false
-    }
+  applyConversationSelection(filteredConversations.value)
+}
+
+function showQQGroups() {
+  showQQGroupAssistant.value = true
+  activeFilter.value = 'protocol:qq'
+  activeConnectorId.value = ''
+  showInstances.value = false
+  mobileThread.value = false
+  applyConversationSelection(filteredQQGroupAssistantConversations.value)
+}
+
+function applyConversationSelection(conversations: Conversation[]) {
+  const selection = resolveConversationSelection(conversations, selectedId.value)
+  if (selection.action === 'select' && selection.conversation) {
+    void selectConversation(selection.conversation, false)
+  } else if (selection.action === 'clear') {
+    storeComposer()
+    pendingScrollToBottomId = null
+    cancelInboxRead()
+    selectedId.value = ''
+    restoreComposer('')
+    snapshot.value.messages = []
+    detailLoading.value = false
   }
 }
 
@@ -1108,10 +1169,10 @@ onUnmounted(() => {
             v-for="filter in filters"
             :key="filter.id"
             class="nav-item"
-            :class="{ active: activeFilter === filter.id && !showInstances }"
+            :class="{ active: activeFilter === filter.id && !showInstances && !showQQGroupAssistant }"
             type="button"
             :title="filter.label"
-            :aria-current="activeFilter === filter.id && !showInstances ? 'page' : undefined"
+            :aria-current="activeFilter === filter.id && !showInstances && !showQQGroupAssistant ? 'page' : undefined"
             :data-channel="filter.channel || undefined"
             :data-unread-count="filter.unread"
             @click="selectFilter(filter.id)"
@@ -1129,6 +1190,24 @@ onUnmounted(() => {
             <span v-if="filter.unread" class="nav-count is-unread" aria-hidden="true">{{ filter.unread > 99 ? '99+' : filter.unread }}</span>
             <span v-else class="nav-count" aria-hidden="true">{{ filter.count }}</span>
             <span class="sr-only">，{{ filter.count }} 个会话，{{ filter.unread }} 条未读</span>
+          </button>
+          <button
+            v-if="qqGroupAssistantConversations.length"
+            class="nav-item"
+            :class="{ active: showQQGroupAssistant && !showInstances }"
+            type="button"
+            title="群助手"
+            :aria-current="showQQGroupAssistant && !showInstances ? 'page' : undefined"
+            :data-unread-count="qqGroupAssistantUnread"
+            @click="showQQGroups"
+          >
+            <span class="nav-glyph is-system" :data-unread="qqGroupAssistantUnread > 0 || undefined" aria-hidden="true">
+              <AppIcon name="group" :size="16" />
+            </span>
+            <span class="nav-copy">群助手</span>
+            <span v-if="qqGroupAssistantUnread" class="nav-count is-unread" aria-hidden="true">{{ qqGroupAssistantUnread > 99 ? '99+' : qqGroupAssistantUnread }}</span>
+            <span v-else class="nav-count" aria-hidden="true">{{ qqGroupAssistantConversations.length }}</span>
+            <span class="sr-only">，{{ qqGroupAssistantConversations.length }} 个群，{{ qqGroupAssistantUnread }} 条未读</span>
           </button>
         </div>
 
@@ -1171,9 +1250,16 @@ onUnmounted(() => {
         <div class="pane-title">
           <h1>{{ activeFilterLabel }}</h1>
           <p aria-live="polite">
-            {{ filteredConversations.length }} 个会话<template v-if="filteredUnread"> · <strong>{{ filteredUnread }}</strong> 条未读</template>
+            {{ displayedConversations.length }} 个会话<template v-if="displayedUnread"> · <strong>{{ displayedUnread }}</strong> 条未读</template>
           </p>
         </div>
+        <FluentButton
+          v-if="showQQGroupAssistant"
+          class="quiet-button"
+          type="button"
+          aria-label="返回 QQ 总列表"
+          @click="selectFilter('protocol:qq')"
+        >返回 QQ 总列表</FluentButton>
         <FluentButton
           class="quiet-button refresh-button"
           :class="{ spinning: manualRefreshing }"
@@ -1277,14 +1363,14 @@ onUnmounted(() => {
 
         <div v-if="totalConversationPages > 1" class="conversation-pager">
           <FluentButton type="button" :disabled="conversationPage === 0" @click="showPreviousConversationPage">上一页</FluentButton>
-          <span>{{ conversationRangeStart }}–{{ conversationRangeEnd }} / {{ filteredConversations.length }}</span>
+          <span>{{ conversationRangeStart }}–{{ conversationRangeEnd }} / {{ displayedConversations.length }}</span>
           <FluentButton
             type="button"
             :disabled="conversationPage >= totalConversationPages - 1"
             @click="showNextConversationPage"
           >下一页</FluentButton>
         </div>
-        <div v-if="!filteredConversations.length && !loading" class="empty-state">
+        <div v-if="!displayedConversations.length && !loading" class="empty-state">
           <span class="empty-glyph"><AppIcon :name="unreadOnly ? 'unread' : 'chat'" :size="22" /></span>
           <p>{{ conversationSearch.trim() ? '没有匹配的会话' : unreadOnly ? '没有未读会话' : '暂无会话' }}</p>
         </div>

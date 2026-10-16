@@ -8,7 +8,43 @@ export function normalizeChannelLabel(value) {
   return label
 }
 
+export function isQQGroupAssistantConversation(conversation) {
+  return conversation.connectorKind === 'qq'
+    && conversation.conversationType === 'group'
+    && (conversation.placement === 'folded' || conversation.placement === 'message_box')
+}
+
+export function filterQQGroupAssistantConversations(conversations) {
+  return conversations.filter(isQQGroupAssistantConversation)
+}
+
+export function resolveConversationSelection(conversations, selectedId) {
+  if (conversations.some((conversation) => conversation.id === selectedId)) {
+    return { action: 'keep', conversation: null }
+  }
+  const conversation = conversations[0]
+  return conversation
+    ? { action: 'select', conversation }
+    : { action: 'clear', conversation: null }
+}
+
+export function resolveQQGroupAssistantInboxSelection(
+  conversations, selectedId, requestedId, query = '', unreadOnly = false,
+) {
+  const candidates = filterQQGroupAssistantConversations(filterConversations(conversations, { query, unreadOnly }))
+  const selection = resolveConversationSelection(candidates, selectedId)
+  const selectedConversationId = selection.action === 'keep'
+    ? selectedId
+    : selection.action === 'select' ? selection.conversation.id : ''
+  return {
+    selectedConversationId,
+    reloadConversationId: selectedConversationId && selectedConversationId !== requestedId
+      ? selectedConversationId : '',
+  }
+}
+
 export function filterConversations(conversations, options = {}) {
+  const connectorKind = String(options.connectorKind || '')
   const connectorId = String(options.connectorId || '')
   const channelLabel = normalizeChannelLabel(options.channelLabel || '')
   const query = String(options.query || '').trim().toLowerCase()
@@ -16,6 +52,7 @@ export function filterConversations(conversations, options = {}) {
   const unreadOnly = Boolean(options.unreadOnly)
 
   return conversations.filter((conversation) => {
+    if (connectorKind && conversation.connectorKind !== connectorKind) return false
     if (connectorId && conversation.connectorId !== connectorId) return false
     if (unreadOnly && !(Number(conversation.unreadCount) > 0)) return false
     if (channelLabel) {
