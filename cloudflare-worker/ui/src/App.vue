@@ -1255,11 +1255,12 @@ onUnmounted(() => {
         </div>
         <FluentButton
           v-if="showQQGroupAssistant"
-          class="quiet-button"
+          class="quiet-button group-helper-back-button"
           type="button"
           aria-label="返回 QQ 总列表"
+          title="返回 QQ 总列表"
           @click="selectFilter('protocol:qq')"
-        >返回 QQ 总列表</FluentButton>
+        ><AppIcon name="back" :size="14" />返回 QQ</FluentButton>
         <FluentButton
           class="quiet-button refresh-button"
           :class="{ spinning: manualRefreshing }"
