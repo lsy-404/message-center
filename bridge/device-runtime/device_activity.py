@@ -60,7 +60,7 @@ def _load_saved_state(path: str) -> tuple[Optional[bool], Optional[bool]]:
         with open(path, "r", encoding="utf-8") as stream:
             encoded = stream.read(MAX_STATE_BYTES + 1)
         if len(encoded.encode("utf-8")) > MAX_STATE_BYTES:
-            return None
+            return None, None
         raw = json.loads(encoded)
     except FileNotFoundError:
         return None, None

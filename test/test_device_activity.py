@@ -204,6 +204,14 @@ class DeviceActivityPolicyTests(unittest.TestCase):
         self.assertTrue(unknown.snapshot()["shouldPause"])
         self.assertTrue(unknown.snapshot()["cleanupRequired"])
 
+        with open(self.state_path, "w", encoding="utf-8") as state_file:
+            state_file.write(" " * (device_activity.MAX_STATE_BYTES + 1))
+        oversized = device_activity.ActivityPolicy(self.state_path, clock=self.clock)
+        self.assertTrue(oversized.start_grace())
+        oversized.mark_ready()
+        self.assertTrue(oversized.snapshot()["shouldPause"])
+        self.assertTrue(oversized.snapshot()["cleanupRequired"])
+
     def test_high_rate_activity_stays_in_memory_without_per_event_disk_writes(self):
         self.clock.value += 180
         self.assertFalse(self.policy.snapshot()["shouldPause"])
