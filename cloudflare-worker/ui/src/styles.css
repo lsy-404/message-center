@@ -651,6 +651,12 @@ button { color: inherit; }
   font-size: 12px;
 }
 
+.system-notice[data-block="system"] {
+  overflow-wrap: anywhere;
+  text-align: center;
+  white-space: pre-wrap;
+}
+
 .block-text { margin: 0; font-size: 14px; line-height: 1.55; overflow-wrap: anywhere; white-space: pre-wrap; }
 
 /* Quoted replies, app cards, transfers and media placeholders parsed from QQ/WeChat text. */

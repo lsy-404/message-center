@@ -160,9 +160,17 @@ function normalizeCapabilities(value) {
   return [...new Set(value.map(String).filter((item) => CAPABILITIES.has(item)))].slice(0, 32);
 }
 
-function normalizeInboundEvent(item) {
+function normalizeInboundEvent(item, connectorKind) {
   if (item?.isSelf !== undefined && typeof item.isSelf !== "boolean") throw new Error("invalid_message_self_flag");
   const isSelf = item?.isSelf === true;
+  if (item?.presentation !== undefined && item.presentation !== "system") {
+    throw new Error("invalid_message_presentation");
+  }
+  if (item?.presentation === "system" &&
+      (connectorKind !== "qq" || item.isSelf !== false)) {
+    throw new Error("invalid_message_presentation");
+  }
+  const presentation = item?.presentation === "system" ? "system" : null;
   const conversationType = item?.conversationType === "group" ? "group" : "direct";
   const allowedTriggers = conversationType === "group"
     ? new Set(["mention", "explicit_request", "background"])
@@ -195,7 +203,8 @@ function normalizeInboundEvent(item) {
     observedAt: observedAtText ? new Date(observedAtText).toISOString() : null,
     context: trigger === "mention" || trigger === "explicit_request" ? context : [],
     isSelf,
-    suppress: !isSelf && conversationType === "group" && trigger === "background",
+    presentation,
+    suppress: !isSelf && conversationType === "group" && trigger === "background" && presentation !== "system",
   };
 }
 
@@ -1226,7 +1235,7 @@ async function ensureImmediateMessageState(env, input) {
   // Do not expose the message to agents until every attachment has been
   // durably linked. A failed/competing cleanup can then be retried without an
   // agent observing a message whose attachment object is unavailable.
-  if (!input.isSelf) {
+  if (!input.isSelf && input.enqueueForAgents !== false) {
     await env.DB.prepare("INSERT OR IGNORE INTO agent_queue (message_id, state, created_at) VALUES (?, 'pending', ?)")
       .bind(input.messageId, input.stamp).run();
   }
@@ -1316,12 +1325,18 @@ async function ingestEvents(request, env) {
   for (const item of body.messages) {
     if (!validShort(item?.externalId) || !item?.conversationExternalId || !item?.conversationTitle || !item?.senderName ||
         !Number.isFinite(Date.parse(item?.occurredAt))) throw new Error("invalid_normalized_message");
-    const event = normalizeInboundEvent(item);
+    const event = normalizeInboundEvent(item, connector.kind);
     if (event.suppress) {
       suppressed += 1;
       continue;
     }
     const attachments = Array.isArray(item.attachments) ? item.attachments.slice(0, 20) : [];
+    const incomingBody = String(item.body || "").slice(0, 20_000);
+    const incomingContentType = String(item.contentType || (attachments.length ? "mixed" : "text")).slice(0, 50);
+    if (event.presentation === "system" &&
+        (attachments.length !== 0 || !incomingBody.trim() || incomingContentType !== "text")) {
+      throw new Error("invalid_message_presentation");
+    }
     if (text(item.body) && !capabilities.has("receive_text")) throw new Error("receive_text_not_supported");
     if (attachments.some((attachment) => !canReceiveAttachment(capabilities, attachment?.mimeType))) {
       throw new Error("receive_files_not_supported");
@@ -1333,10 +1348,13 @@ async function ingestEvents(request, env) {
       sizeBytes: Math.max(0, Math.min(Number(attachment?.sizeBytes || 0), 100 * 1024 * 1024)),
       sha256: /^[a-f0-9]{64}$/.test(String(attachment?.sha256 || "")) ? attachment.sha256 : "",
     })).filter((attachment) => attachment.externalId);
-    let metadata = JSON.stringify({ ...(item.metadata && typeof item.metadata === "object" ? item.metadata : {}),
+    const suppliedMetadata = item.metadata && typeof item.metadata === "object" ? { ...item.metadata } : {};
+    delete suppliedMetadata.presentation;
+    let metadata = JSON.stringify({ ...suppliedMetadata,
       conversationType: event.conversationType, trigger: event.trigger, mentioned: event.mentioned,
       placement: event.placement, context: event.context, attachments: attachmentMetadata,
-      observedAt: event.observedAt, isSelf: event.isSelf });
+      observedAt: event.observedAt, isSelf: event.isSelf,
+      ...(event.presentation ? { presentation: event.presentation } : {}) });
     const conversationExternalId = String(item.conversationExternalId).slice(0, 500);
     let conversation = await env.DB.prepare(`
       SELECT id, title, avatar_label FROM conversations WHERE connector_id = ? AND external_id = ?
@@ -1366,11 +1384,11 @@ async function ingestEvents(request, env) {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'immediate', ?, ?, NULL, ?)
     `).bind(messageId, conversation.id, connectorId, item.externalId, event.isSelf ? "outbound" : "inbound",
       item.senderId || null,
-      String(item.senderName).slice(0, 200), String(item.body || "").slice(0, 20_000),
-      String(item.contentType || (attachments.length ? "mixed" : "text")).slice(0, 50),
+      String(item.senderName).slice(0, 200), incomingBody,
+      incomingContentType,
       event.isSelf ? "delivered" : "received",
       metadata, event.occurredAt, stamp).run();
-    const upgradedBody = String(item.body || "").slice(0, 20_000);
+    const upgradedBody = incomingBody;
     let canonicalMessageId = messageId;
     let canonicalBody = upgradedBody;
     let canonicalOccurredAt = event.occurredAt;
@@ -1379,7 +1397,8 @@ async function ingestEvents(request, env) {
     let canonicalAvatarLabel = String(item.avatarLabel || item.conversationTitle[0] || "?").slice(0, 2);
     if (!count(result.meta?.changes)) {
       const existing = await env.DB.prepare(`
-        SELECT id, conversation_id, queue_class, direction, body, occurred_at, metadata_json
+        SELECT id, conversation_id, queue_class, direction, body, content_type, occurred_at, metadata_json,
+          (SELECT COUNT(*) FROM attachments a WHERE a.message_id = messages.id) AS attachment_count
         FROM messages WHERE connector_id = ? AND external_id = ?
       `).bind(connectorId, item.externalId).first();
       if (!existing) throw new Error("message_not_found");
@@ -1395,13 +1414,18 @@ async function ingestEvents(request, env) {
       canonicalBody = String(existing.body || "").slice(0, 20_000);
       canonicalOccurredAt = String(existing.occurred_at || event.occurredAt);
       const existingMetadata = safeJson(existing.metadata_json, {});
-      if (existing.queue_class !== "background" && canonicalBody !== upgradedBody &&
+      const previousAttachments = Array.isArray(existingMetadata.attachments)
+        ? existingMetadata.attachments.slice(0, 20) : [];
+      const exactGraytipPlaceholder = connector.kind === "qq" && event.presentation === "system" &&
+        event.isSelf === false && attachments.length === 0 && attachmentMetadata.length === 0 &&
+        existing.direction === "inbound" && existing.content_type === "text" &&
+        canonicalBody === "[类型:8]" && existing.attachment_count === 0 && previousAttachments.length === 0 &&
+        upgradedBody.trim().length > 0 && upgradedBody !== "[类型:8]";
+      if (!exactGraytipPlaceholder && existing.queue_class !== "background" && canonicalBody !== upgradedBody &&
           !(canonicalBody === "[file:asset]" && semanticCardBody(upgradedBody))) {
         await deleteRequestCreatedEmptyConversation(env, requestCreatedConversationId);
         throw new Error("message_external_id_conflict");
       }
-      const previousAttachments = Array.isArray(existingMetadata.attachments)
-        ? existingMetadata.attachments.slice(0, 20) : [];
       canonicalAttachments = mergeAttachmentMetadata(previousAttachments, attachmentMetadata);
       const previousIds = new Set(previousAttachments.map((attachment) => String(attachment?.externalId || "")));
       const supplementalAttachments = canonicalAttachments.filter((attachment) => !previousIds.has(attachment.externalId));
@@ -1414,7 +1438,37 @@ async function ingestEvents(request, env) {
         attachments: canonicalAttachments });
       canonicalConversationTitle = String(conversation.title || item.conversationTitle).slice(0, 200);
       canonicalAvatarLabel = String(conversation.avatar_label || item.avatarLabel || item.conversationTitle[0] || "?").slice(0, 2);
-      if (existing?.queue_class === "background") {
+      if (exactGraytipPlaceholder) {
+        const graytipUpgrade = await env.DB.prepare(`
+          UPDATE messages SET body = ?, content_type = 'text', metadata_json = ?
+          WHERE id = ? AND connector_id = ? AND external_id = ? AND conversation_id = ?
+            AND direction = 'inbound' AND content_type = 'text' AND body = '[类型:8]'
+            AND NOT EXISTS (SELECT 1 FROM attachments a WHERE a.message_id = messages.id)
+        `).bind(upgradedBody, metadata, existing.id, connectorId, item.externalId, conversation.id).run();
+        if (count(graytipUpgrade.meta?.changes)) {
+          upgraded += 1;
+          canonicalBody = upgradedBody;
+          canonicalAttachments = [];
+        } else {
+          const winner = await env.DB.prepare(`
+            SELECT id, conversation_id, direction, body, content_type, occurred_at, metadata_json,
+              (SELECT COUNT(*) FROM attachments a WHERE a.message_id = messages.id) AS attachment_count
+            FROM messages WHERE connector_id = ? AND external_id = ?
+          `).bind(connectorId, item.externalId).first();
+          const winnerMetadata = safeJson(winner?.metadata_json, {});
+          if (!winner || winner.id !== existing.id || winner.conversation_id !== conversation.id ||
+              winner.direction !== "inbound" || winner.content_type !== "text" ||
+              winner.body !== upgradedBody || winnerMetadata.presentation !== "system" ||
+              winner.attachment_count !== 0 ||
+              (Array.isArray(winnerMetadata.attachments) && winnerMetadata.attachments.length > 0)) {
+            await deleteRequestCreatedEmptyConversation(env, requestCreatedConversationId);
+            throw new Error("message_external_id_conflict");
+          }
+          canonicalBody = winner.body;
+          canonicalOccurredAt = String(winner.occurred_at || canonicalOccurredAt);
+          canonicalAttachments = [];
+        }
+      } else if (existing?.queue_class === "background") {
         const promotion = await env.DB.prepare(`
           UPDATE messages SET sender_id = ?, sender_name = ?,
             body = CASE WHEN length(?) > 0 THEN ? ELSE body END,
@@ -1468,6 +1522,7 @@ async function ingestEvents(request, env) {
       attachments: canonicalAttachments,
       stamp,
       isSelf: event.isSelf,
+      enqueueForAgents: event.presentation !== "system",
     });
   }
   await reconcileConnectorSummaries(env, connectorId, stamp);
@@ -1868,12 +1923,14 @@ async function readInbox(env, selectedConversationId) {
   let messages = [];
   if (selected) {
     const messageResult = await env.DB.prepare(`
-      SELECT m.*, a.sha256 AS sender_avatar_sha256, q.state AS agent_state FROM (
+        SELECT m.*, a.sha256 AS sender_avatar_sha256, q.state AS agent_state,
+          k.kind AS connector_kind FROM (
         SELECT * FROM messages WHERE conversation_id = ?
         ORDER BY occurred_at DESC, created_at DESC LIMIT 300
       ) m LEFT JOIN sender_avatars a
         ON a.connector_id = m.connector_id AND a.sender_id = m.sender_id
       LEFT JOIN agent_queue q ON q.message_id = m.id
+      LEFT JOIN connector_instances k ON k.id = m.connector_id
       ORDER BY m.occurred_at ASC, m.created_at ASC
     `).bind(selected).all();
     const ids = (messageResult.results || []).map((row) => row.id);
@@ -1895,17 +1952,24 @@ async function readInbox(env, selectedConversationId) {
         attachmentMap.set(row.message_id, list);
       }
     }
-    messages = (messageResult.results || []).map((row) => ({
-      id: row.id, conversationId: row.conversation_id, direction: row.direction,
-      senderName: row.sender_name, body: row.body, contentType: row.content_type,
-      senderAvatarPath: row.sender_avatar_sha256
-        ? `/api/sender-avatars/${row.connector_id}/${row.sender_id}?v=${encodeURIComponent(row.sender_avatar_sha256)}` : null,
-      deliveryState: row.delivery_state, queueClass: row.queue_class, occurredAt: row.occurred_at,
-      authorRole: row.direction !== "outbound" ? "contact"
-        : String(row.created_by || "").startsWith("agent:") ? "agent" : "owner",
-      agentRead: row.agent_state ? row.agent_state !== "pending" : null,
-      attachments: attachmentMap.get(row.id) || [],
-    }));
+    messages = (messageResult.results || []).map((row) => {
+      const attachments = attachmentMap.get(row.id) || [];
+      const metadata = safeJson(row.metadata_json, {});
+      const verifiedSystemPresentation = row.connector_kind === "qq" && row.direction === "inbound" &&
+        metadata.presentation === "system" && attachments.length === 0;
+      return {
+        id: row.id, conversationId: row.conversation_id, direction: row.direction,
+        senderName: row.sender_name, body: row.body, contentType: row.content_type,
+        senderAvatarPath: row.sender_avatar_sha256
+          ? `/api/sender-avatars/${row.connector_id}/${row.sender_id}?v=${encodeURIComponent(row.sender_avatar_sha256)}` : null,
+        deliveryState: row.delivery_state, queueClass: row.queue_class, occurredAt: row.occurred_at,
+        authorRole: row.direction !== "outbound" ? "contact"
+          : String(row.created_by || "").startsWith("agent:") ? "agent" : "owner",
+        agentRead: row.agent_state ? row.agent_state !== "pending" : null,
+        attachments,
+        ...(verifiedSystemPresentation ? { presentation: "system" } : {}),
+      };
+    });
   }
   return { connectors, conversations, messages, selectedConversationId: selected };
 }
@@ -2773,6 +2837,7 @@ async function listenAgentMessages(env, filters, requestedLimit) {
     JOIN conversations c ON c.id = m.conversation_id
     WHERE m.queue_class = 'immediate'
       AND (q.state = 'pending' OR (q.state = 'leased' AND q.lease_expires_at < ?))
+      AND COALESCE(json_extract(m.metadata_json, '$.presentation'), '') != 'system'
       AND COALESCE(json_extract(m.metadata_json, '$.trigger'), 'direct') IN (${triggerSlots})
       AND COALESCE(json_extract(m.metadata_json, '$.conversationType'), 'direct') IN (${conversationTypeSlots})
     ORDER BY m.occurred_at ASC LIMIT ?
@@ -2855,7 +2920,8 @@ async function claimSpecificAgentMessage(env, consumerId, messageId) {
   const leased = await env.DB.prepare(`
     UPDATE agent_queue SET state = 'leased', lease_token = ?, lease_expires_at = ?, leased_by = ?
     WHERE message_id = ? AND (state = 'pending' OR (state = 'leased' AND lease_expires_at < ?))
-      AND EXISTS (SELECT 1 FROM messages m WHERE m.id = agent_queue.message_id AND m.queue_class = 'immediate')
+      AND EXISTS (SELECT 1 FROM messages m WHERE m.id = agent_queue.message_id AND m.queue_class = 'immediate'
+        AND COALESCE(json_extract(m.metadata_json, '$.presentation'), '') != 'system')
     RETURNING message_id
   `).bind(leaseToken, leaseExpiresAt, consumerId, messageId, stamp).first();
   if (!leased) return { acquired: false, race: await agentQueueRace(env, messageId, consumerId) };
@@ -2874,6 +2940,7 @@ async function claimAgentMessage(env, consumerId, filters) {
       SELECT q.message_id FROM agent_queue q JOIN messages m ON m.id = q.message_id
       WHERE (q.state = 'pending' OR (q.state = 'leased' AND q.lease_expires_at < ?))
       AND m.queue_class = 'immediate'
+      AND COALESCE(json_extract(m.metadata_json, '$.presentation'), '') != 'system'
       AND COALESCE(json_extract(m.metadata_json, '$.trigger'), 'direct') IN (${triggerSlots})
       AND COALESCE(json_extract(m.metadata_json, '$.conversationType'), 'direct') IN (${conversationTypeSlots})
       ORDER BY m.occurred_at ASC LIMIT 1
