@@ -95,6 +95,13 @@ type Attachment = {
   mimeType?: string | null
   sizeBytes?: number | null
   downloadable?: boolean
+  presentation?: 'sticker'
+}
+
+type ReplyPreview = {
+  sourceText: string
+  sourceTextTruncated: boolean
+  sourceExpired: boolean
 }
 
 type Message = {
@@ -103,6 +110,7 @@ type Message = {
   senderName: string
   senderAvatarPath?: string | null
   body: string
+  reply?: ReplyPreview | null
   presentation?: 'system'
   contentType: string
   occurredAt: string
@@ -280,7 +288,9 @@ const aiUnreadCount = computed(() => snapshot.value.messages
 
 const threadRows = computed(() => threadEntries.value.map((entry) => {
   if (entry.kind === 'day') return entry
-  const blocks = parseMessageBody(messageBody(entry.message))
+  const blocks = parseMessageBody(messageBody(entry.message)).filter((block) =>
+    !entry.message.reply || block.type !== 'quote' || block.author || block.text,
+  )
   const solo = blocks.length === 1 && !entry.message.attachments.length ? blocks[0] : null
   const explicitSystemText = entry.message.presentation === 'system' && entry.message.direction === 'inbound'
       && entry.message.attachments.length === 0 && entry.message.body.trim()
@@ -495,18 +505,29 @@ function isImage(file: Attachment) {
   return Boolean(file.downloadable && file.mimeType?.startsWith('image/'))
 }
 
+function isSticker(file: Attachment) {
+  return isImage(file) && file.presentation === 'sticker'
+}
+
 function isVideo(file: Attachment) {
   return Boolean(file.downloadable && file.mimeType?.startsWith('video/'))
 }
 
 function messageBody(message: Message) {
-  let loadedCount = message.attachments.filter((file) =>
-    isImage(file) && loadedAttachmentImages.value.has(`${message.id}:${file.id}`),
+  let loadedPhotoCount = message.attachments.filter((file) =>
+    isImage(file) && !isSticker(file) && loadedAttachmentImages.value.has(`${message.id}:${file.id}`),
   ).length
-  if (!loadedCount) return message.body || ''
+  let loadedStickerCount = message.attachments.filter((file) =>
+    isSticker(file) && loadedAttachmentImages.value.has(`${message.id}:${file.id}`),
+  ).length
+  if (!loadedPhotoCount && !loadedStickerCount) return message.body || ''
   return (message.body || '').split(/\r?\n/).filter((line) => {
-    if (loadedCount > 0 && /^[ \t]*\[图片\][ \t]*$/.test(line)) {
-      loadedCount -= 1
+    if (loadedPhotoCount > 0 && /^[ \t]*\[图片\][ \t]*$/.test(line)) {
+      loadedPhotoCount -= 1
+      return false
+    }
+    if (loadedStickerCount > 0 && /^[ \t]*\[表情\][ \t]*$/.test(line)) {
+      loadedStickerCount -= 1
       return false
     }
     return true
@@ -680,13 +701,17 @@ function sameInbox(left: Snapshot, right: Snapshot) {
         || a.body !== b.body || a.contentType !== b.contentType || a.occurredAt !== b.occurredAt
         || a.deliveryState !== b.deliveryState || a.queueClass !== b.queueClass
         || a.authorRole !== b.authorRole || a.agentRead !== b.agentRead
+        || a.reply?.sourceText !== b.reply?.sourceText
+        || a.reply?.sourceTextTruncated !== b.reply?.sourceTextTruncated
+        || a.reply?.sourceExpired !== b.reply?.sourceExpired
         || a.attachments.length !== b.attachments.length) return false
     for (let attachmentIndex = 0; attachmentIndex < a.attachments.length; attachmentIndex += 1) {
       const file = a.attachments[attachmentIndex]
       const nextFile = b.attachments[attachmentIndex]
       if (file.id !== nextFile.id || file.fileName !== nextFile.fileName
           || file.mimeType !== nextFile.mimeType || file.sizeBytes !== nextFile.sizeBytes
-          || file.downloadable !== nextFile.downloadable) return false
+          || file.downloadable !== nextFile.downloadable
+          || file.presentation !== nextFile.presentation) return false
     }
   }
   return true
@@ -1480,6 +1505,18 @@ onUnmounted(() => {
                   :class="{ bare: entry.bare }"
                   :title="entry.continuation ? formatFullStamp(entry.message.occurredAt) : undefined"
                 >
+                  <blockquote v-if="entry.message.reply" class="block-quote" data-block="reply-quote">
+                    <AppIcon class="quote-icon" name="quote" :size="14" />
+                    <span class="quote-copy">
+                      <span class="quote-author">引用内容</span>
+                      <span class="quote-text">
+                        <template v-if="entry.message.reply.sourceExpired">原消息内容已失效</template>
+                        <template v-else>
+                          {{ entry.message.reply.sourceText || '引用了一条消息' }}<template v-if="entry.message.reply.sourceTextTruncated">…</template>
+                        </template>
+                      </span>
+                    </span>
+                  </blockquote>
                   <template v-for="(block, blockIndex) in entry.blocks" :key="blockIndex">
                     <p v-if="block.type === 'text'" class="block-text">{{ block.text }}</p>
                     <blockquote v-else-if="block.type === 'quote'" class="block-quote" data-block="quote">
@@ -1512,8 +1549,9 @@ onUnmounted(() => {
                     <img
                       v-if="isImage(file)"
                       class="attachment-image"
+                      :class="{ 'attachment-image-sticker': isSticker(file) }"
                       :src="filePath(file)"
-                      :alt="file.fileName"
+                      :alt="isSticker(file) ? 'QQ 表情' : file.fileName"
                       loading="lazy"
                       @load="setAttachmentImageLoaded(entry.message, file, true)"
                       @error="setAttachmentImageLoaded(entry.message, file, false)"
@@ -1526,7 +1564,7 @@ onUnmounted(() => {
                     </a>
                     <span v-else class="attachment-link pending">
                       <span class="file-icon"><AppIcon name="document" :size="18" /></span>
-                      <span class="file-copy"><strong>{{ file.fileName }}</strong><small>等待上传</small></span>
+                      <span class="file-copy"><strong>{{ file.presentation === 'sticker' ? 'QQ 表情' : file.fileName }}</strong><small>等待上传</small></span>
                     </span>
                   </div>
                 </div>

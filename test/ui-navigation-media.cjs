@@ -34,7 +34,7 @@ async function main() {
       messages: [
         { id: 'image-message', direction: 'inbound', senderName: '林女士', senderAvatarPath: '/avatars/lin-v1.svg', body: '描述\n[图片]\n后续文字\n[图片]\n教程里写[图片]作为占位', contentType: 'text', occurredAt: new Date().toISOString(), attachments: [
           { id: 'image-loaded', fileName: 'image-loaded.gif', mimeType: 'image/gif', downloadable: true },
-          { id: 'image-failed', fileName: 'image-failed.gif', mimeType: 'image/gif', downloadable: true },
+          { id: 'image-failed', fileName: 'sticker-name.png', mimeType: 'image/gif', downloadable: true },
         ] },
         { id: 'text-message', direction: 'inbound', senderName: '张三', senderAvatarPath: null, body: '[图片]', contentType: 'text', occurredAt: new Date().toISOString(), attachments: [] },
         { id: 'pending-message', direction: 'outbound', senderName: 'Bob Lee', senderAvatarPath: '/avatars/bob.svg', body: '[图片]', contentType: 'text', occurredAt: new Date().toISOString(), deliveryState: 'queued', attachments: [{ id: 'pending-1', fileName: 'pending.png', mimeType: 'image/png', downloadable: false }] },
@@ -47,6 +47,10 @@ async function main() {
         { id: 'qq-system-message', direction: 'inbound', senderName: 'hidden member alias', senderAvatarPath: '/avatars/hidden.svg', body: '一位新成员加入了群聊', presentation: 'system', contentType: 'text', occurredAt: new Date().toISOString(), attachments: [] },
         { id: 'unmarked-system-looking-message', direction: 'inbound', senderName: '普通成员', body: '这是一条普通消息', contentType: 'text', occurredAt: new Date().toISOString(), attachments: [] },
         { id: 'unmarked-placeholder-message', direction: 'inbound', senderName: '普通成员', body: '[类型:8]', contentType: 'text', occurredAt: new Date().toISOString(), attachments: [] },
+        { id: 'sticker-message', direction: 'inbound', senderName: '张三', body: '[表情]', contentType: 'mixed', occurredAt: new Date(Date.now() + 1000).toISOString(), reply: { sourceText: 'quoted source text', sourceTextTruncated: true, sourceExpired: false }, attachments: [
+          { id: 'sticker-image', fileName: 'private-sticker-name.gif', mimeType: 'image/gif', sizeBytes: 40 * 1024 * 1024, downloadable: true, presentation: 'sticker' },
+        ] },
+        { id: 'expired-reply-message', direction: 'inbound', senderName: '张三', body: '回复正文', contentType: 'text', occurredAt: new Date(Date.now() + 2000).toISOString(), reply: { sourceText: 'stale private quote', sourceTextTruncated: false, sourceExpired: true }, attachments: [] },
       ],
     }
     let inboxRequestCount = 0
@@ -65,6 +69,11 @@ async function main() {
       body: '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><rect width="24" height="24" fill="#57a8d9"/></svg>',
     }))
     await page.route('**/api/files/image-failed', (route) => route.fulfill({ status: 404, body: 'missing' }))
+    await page.route('**/api/files/sticker-image', (route) => route.fulfill({
+      status: 200,
+      contentType: 'image/svg+xml',
+      body: '<svg xmlns="http://www.w3.org/2000/svg" width="480" height="360"><rect width="480" height="360" fill="rgb(87 168 217)"/></svg>',
+    }))
     await page.route('**/avatars/**', (route) => route.fulfill({
       status: 200,
       contentType: 'image/svg+xml',
@@ -156,9 +165,29 @@ async function main() {
       return image?.complete && image.naturalWidth > 0
     })
     await page.waitForFunction(() => {
-      const image = Array.from(document.querySelectorAll('img.attachment-image')).find((item) => item.alt === 'image-failed.gif')
+      const image = Array.from(document.querySelectorAll('img.attachment-image')).find((item) => item.alt === 'sticker-name.png')
       return image?.complete && image.naturalWidth === 0
     })
+    assert.equal(await page.locator('img[alt="sticker-name.png"]').evaluate((image) => image.classList.contains('attachment-image-sticker')), false, 'file names never classify ordinary images as stickers')
+    await page.waitForFunction(() => {
+      const image = document.querySelector('img.attachment-image-sticker')
+      return image?.complete && image.naturalWidth === 480
+    })
+    const stickerRow = page.locator('.message-row[data-message-id="sticker-message"]')
+    const stickerImage = stickerRow.locator('.attachment-image-sticker')
+    assert.equal(await stickerImage.getAttribute('alt'), 'QQ 表情', 'sticker image hides the native asset label')
+    assert.equal(await stickerImage.evaluate((image) => getComputedStyle(image).maxWidth), '160px', 'sticker display size is capped independently of its 40 MiB byte size')
+    assert.equal(await stickerImage.evaluate((image) => image.getBoundingClientRect().height <= 160), true)
+    assert.equal(await stickerRow.locator('.attachment').textContent().then((text) => text.includes('private-sticker-name')), false)
+    assert.equal(await stickerRow.locator('.block-media').count(), 0, 'loaded sticker does not leak a duplicate media label')
+    assert.equal(await page.locator('.message-row[data-message-id="expired-reply-message"] [data-block="reply-quote"]').count(), 1)
+    const explicitReply = stickerRow.locator('[data-block="reply-quote"]')
+    assert.equal(await explicitReply.locator('.quote-author').textContent(), '引用内容')
+    assert.equal(await explicitReply.locator('.quote-text').textContent(), 'quoted source text…')
+    const expiredReply = page.locator('.message-row[data-message-id="expired-reply-message"] [data-block="reply-quote"]')
+    assert.equal(await expiredReply.locator('.quote-text').textContent(), '原消息内容已失效')
+    assert.equal(await expiredReply.textContent().then((text) => text.includes('stale private quote')), false)
+    assert.equal(await page.locator('.attachment-button input').isDisabled(), true, 'text-only QQ capability keeps file sending disabled')
     const bodyBlocks = (row) => row.locator('.message-bubble > :not(.attachment)').evaluateAll((items) => items.map((item) =>
       item.classList.contains('block-media') ? `[media:${item.textContent}]` : item.textContent))
     assert.deepEqual(await bodyBlocks(aliceRow), ['描述\n后续文字', '[media:图片]', '教程里写[图片]作为占位'], 'hide one standalone marker only after one image loads; keep the failed and literal markers')

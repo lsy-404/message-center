@@ -287,13 +287,18 @@ let paginatedInboundSweep = false;
 const r2 = {
   async put(key, body, options = {}) {
     const bytes = new Uint8Array(await new Response(body).arrayBuffer());
-    r2Objects.set(key, { bytes, options, uploaded: new Date() });
+    const checksum = createHash('sha256').update(bytes).digest();
+    if (options.sha256 && checksum.toString('hex') !== options.sha256) throw new Error('r2_checksum_mismatch');
+    const checksumArrayBuffer = checksum.buffer.slice(checksum.byteOffset, checksum.byteOffset + checksum.byteLength);
+    const value = { bytes, options, uploaded: new Date(), checksum: checksumArrayBuffer };
+    r2Objects.set(key, value);
+    return { size: bytes.byteLength, checksums: { sha256: checksumArrayBuffer } };
   },
   async delete(key) { deletedR2Keys.push(key); r2Objects.delete(key); },
   async head(key) {
     const value = r2Objects.get(key);
     if (!value) return null;
-    return { size: value.bytes.byteLength, customMetadata: value.options.customMetadata,
+    return { size: value.bytes.byteLength, checksums: { sha256: value.checksum }, customMetadata: value.options.customMetadata,
       httpMetadata: value.options.httpMetadata, uploaded: value.uploaded };
   },
   async get(key) {
@@ -763,14 +768,14 @@ database.prepare(`
   UPDATE conversations SET trust_tier = 'untrusted', agent_policy_json = '{}' WHERE id = 'conversation-row'
 `).run();
 
-async function putInboundFile(fileId, externalId, bytes, conversationExternalId = 'conversation-file-test', mimeType = 'application/octet-stream') {
+async function putInboundFile(fileId, externalId, bytes, conversationExternalId = 'conversation-file-test', mimeType = 'application/octet-stream', announcedSize = bytes.byteLength) {
   const sha256 = createHash('sha256').update(bytes).digest('hex');
   return worker.fetch(new Request(`https://message.example.com/api/connectors/files/${fileId}`, {
     method: 'PUT',
     headers: {
       authorization: `Bearer ${connectorToken}`,
       'content-type': mimeType,
-      'content-length': String(bytes.byteLength),
+      'content-length': String(announcedSize),
       'x-connector-id': connectorId,
       'x-conversation-id': conversationExternalId,
       'x-file-external-id': externalId,
@@ -786,6 +791,16 @@ const firstInboundFile = await putInboundFile('file-upload-one', 'external-file-
 assert.equal(firstInboundFile.status, 201);
 assert.equal((await firstInboundFile.json()).reused, false);
 assert.equal(r2Objects.size, 1);
+const mismatchedInboundLength = await putInboundFile('file-size-mismatch', 'external-size-mismatch',
+  inboundBytes, 'conversation-file-test', 'application/octet-stream', inboundBytes.byteLength - 1);
+assert.equal(mismatchedInboundLength.status, 400);
+assert.equal((await mismatchedInboundLength.json()).error, 'uploaded_file_integrity_mismatch');
+assert.equal(r2Objects.size, 1, 'object with actual bytes that disagree with declared length is removed');
+const overLimitInboundLength = await putInboundFile('file-size-over-limit', 'external-size-over-limit',
+  inboundBytes, 'conversation-file-test', 'application/octet-stream', 50 * 1024 * 1024 + 1);
+assert.equal(overLimitInboundLength.status, 400);
+assert.equal((await overLimitInboundLength.json()).error, 'invalid_file_metadata');
+assert.equal(r2Objects.size, 1, 'declared bytes above the existing upload budget never reach R2');
 const repeatedInboundFile = await putInboundFile('file-upload-two', 'external-file-one', inboundBytes);
 assert.equal(repeatedInboundFile.status, 200);
 assert.deepEqual(await repeatedInboundFile.json(), {
@@ -805,6 +820,36 @@ const crossConversationInbound = await putInboundFile(
 );
 assert.equal(crossConversationInbound.status, 400);
 assert.equal((await crossConversationInbound.json()).error, 'file_external_id_conflict');
+
+const invalidAttachmentMetadata = await requestEvents([{
+  externalId: 'message-size-over-limit', conversationExternalId: 'conversation-size-over-limit',
+  conversationTitle: 'Attachment size check', senderName: 'Member', body: '[图片]', contentType: 'mixed',
+  occurredAt: stamp, conversationType: 'direct', trigger: 'direct', attachments: [{
+    externalId: 'file-size-over-limit-event', fileName: 'oversized.png', mimeType: 'image/png',
+    sizeBytes: 50 * 1024 * 1024 + 1, sha256: 'a'.repeat(64),
+  }],
+}]);
+assert.equal(invalidAttachmentMetadata.status, 400);
+assert.equal((await invalidAttachmentMetadata.json()).error, 'invalid_attachment_metadata');
+const invalidStickerPresentation = await requestEvents([{
+  externalId: 'message-invalid-sticker-presentation', conversationExternalId: 'conversation-invalid-sticker-presentation',
+  conversationTitle: 'Sticker marker check', senderName: 'Member', body: 'image', contentType: 'mixed',
+  occurredAt: stamp, conversationType: 'direct', trigger: 'direct', attachments: [{
+    externalId: 'file-invalid-sticker-presentation', fileName: 'asset.png', mimeType: 'image/png',
+    sizeBytes: inboundBytes.byteLength, sha256: createHash('sha256').update(inboundBytes).digest('hex'),
+    presentation: 'emoji',
+  }],
+}]);
+assert.equal(invalidStickerPresentation.status, 400);
+assert.equal((await invalidStickerPresentation.json()).error, 'invalid_attachment_presentation');
+const staleReplyText = await requestEvents([{
+  externalId: 'message-stale-reply', conversationExternalId: 'conversation-stale-reply',
+  conversationTitle: 'Reply check', senderName: 'Member', body: 'response',
+  occurredAt: stamp, conversationType: 'direct', trigger: 'direct', attachments: [],
+  reply: { sourceText: 'must be suppressed', sourceTextTruncated: false, sourceExpired: true },
+}]);
+assert.equal(staleReplyText.status, 400);
+assert.equal((await staleReplyText.json()).error, 'invalid_reply_preview');
 
 const originalPrepare = d1.prepare;
 let failInboundInsertAfterCommit = true;
@@ -1381,6 +1426,43 @@ async function postEvents(messages) {
   assert.equal(response.status, 200);
   return response.json();
 }
+
+const stickerBytes = new Uint8Array([21, 22, 23, 24]);
+const stickerConversationExternalId = 'conversation-sticker-contract';
+const stickerFileExternalId = 'file-sticker-contract';
+const stickerDigest = createHash('sha256').update(stickerBytes).digest('hex');
+const stickerUpload = await putInboundFile('file-sticker-contract', stickerFileExternalId, stickerBytes,
+  stickerConversationExternalId, 'image/png');
+assert.equal(stickerUpload.status, 201);
+await postEvents([{
+  externalId: 'message-sticker-contract', conversationExternalId: stickerConversationExternalId,
+  conversationTitle: 'Sticker contract', senderName: 'Member', body: '[表情]', contentType: 'mixed',
+  occurredAt: stamp, conversationType: 'direct', trigger: 'direct', reply: {
+    sourceText: 'quoted source text', sourceTextTruncated: true, sourceExpired: false,
+  }, attachments: [{ externalId: stickerFileExternalId, fileName: 'fixture.bin', mimeType: 'image/png',
+    sizeBytes: stickerBytes.byteLength, sha256: stickerDigest, presentation: 'sticker' }],
+}]);
+const stickerConversationId = database.prepare(`
+  SELECT id FROM conversations WHERE connector_id = ? AND external_id = ?
+`).get(connectorId, stickerConversationExternalId).id;
+const stickerInboxResponse = await worker.fetch(new Request(
+  `https://message.example.com/api/inbox?conversationId=${encodeURIComponent(stickerConversationId)}`,
+  { headers: { ...auth.headers } },
+), workerEnv, {});
+assert.equal(stickerInboxResponse.status, 200);
+const stickerInbox = await stickerInboxResponse.json();
+const stickerMessageId = database.prepare(`
+  SELECT id FROM messages WHERE connector_id = ? AND external_id = 'message-sticker-contract'
+`).get(connectorId).id;
+const stickerMessage = stickerInbox.messages.find((message) => message.id === stickerMessageId);
+assert.deepEqual(stickerMessage.attachments[0], {
+  id: 'file-sticker-contract', fileName: 'fixture.bin', mimeType: 'image/png', sizeBytes: stickerBytes.byteLength,
+  sha256: stickerDigest, state: 'received', downloadable: true, presentation: 'sticker',
+});
+assert.equal(Object.hasOwn(stickerMessage.attachments[0], 'externalId'), false);
+assert.deepEqual(stickerMessage.reply, {
+  sourceText: 'quoted source text', sourceTextTruncated: true, sourceExpired: false,
+});
 
 await postEvents([{
   externalId: 'message-no-watermark', conversationExternalId: 'profile-no-watermark',
