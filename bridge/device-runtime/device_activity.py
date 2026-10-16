@@ -5,7 +5,9 @@ import json
 import math
 import os
 import platform
+import re
 import secrets
+import stat
 import tempfile
 import threading
 import time
@@ -22,6 +24,11 @@ CONSUMER_USAGE_PAGE = 0x0C
 HOME_USAGE = 0x40
 STATE_VERSION = 4
 HEARTBEAT_SECONDS = 2.0
+STATE_FIELDS = {
+    "version", "monitorId", "runtimePid", "generation", "publishedAt",
+    "healthy", "armed", "cleanupRequired", "lastActivityAt",
+    "homeSequence", "digitizerSequence",
+}
 
 
 class ActivityStateError(RuntimeError):
@@ -57,20 +64,52 @@ def _atomic_state_write(path: str, state: dict[str, Any]) -> None:
 
 def _load_saved_state(path: str) -> tuple[Optional[bool], Optional[bool]]:
     try:
-        with open(path, "r", encoding="utf-8") as stream:
-            encoded = stream.read(MAX_STATE_BYTES + 1)
-        if len(encoded.encode("utf-8")) > MAX_STATE_BYTES:
+        link_metadata = os.lstat(path)
+        if not stat.S_ISREG(link_metadata.st_mode):
             return None, None
-        raw = json.loads(encoded)
-    except FileNotFoundError:
-        return None, None
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            metadata = os.fstat(descriptor)
+            if (not stat.S_ISREG(metadata.st_mode) or
+                    (metadata.st_dev, metadata.st_ino) !=
+                    (link_metadata.st_dev, link_metadata.st_ino)):
+                return None, None
+            with os.fdopen(descriptor, "rb") as stream:
+                descriptor = -1
+                encoded = stream.read(MAX_STATE_BYTES + 1)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        if len(encoded) > MAX_STATE_BYTES:
+            return None, None
+        raw = json.loads(encoded.decode("utf-8"))
     except Exception:
         return None, None
-    if (not isinstance(raw, dict) or raw.get("version") != STATE_VERSION or
-            type(raw.get("armed")) is not bool):
+    if not isinstance(raw, dict) or set(raw) != STATE_FIELDS:
         return None, None
-    cleanup_required = raw.get("cleanupRequired")
-    return raw["armed"], cleanup_required if type(cleanup_required) is bool else None
+    if (type(raw["version"]) is not int or raw["version"] != STATE_VERSION or
+            type(raw["monitorId"]) is not str or
+            not re.fullmatch(r"[0-9a-f]{32}", raw["monitorId"]) or
+            isinstance(raw["runtimePid"], bool) or
+            not isinstance(raw["runtimePid"], int) or raw["runtimePid"] <= 1 or
+            isinstance(raw["generation"], bool) or
+            not isinstance(raw["generation"], int) or raw["generation"] < 1 or
+            type(raw["healthy"]) is not bool or type(raw["armed"]) is not bool or
+            type(raw["cleanupRequired"]) is not bool):
+        return None, None
+    for key in ("publishedAt", "lastActivityAt"):
+        value = raw[key]
+        if (value is not None and
+                (isinstance(value, bool) or not isinstance(value, (int, float)) or
+                 not math.isfinite(float(value)))):
+            return None, None
+    if raw["publishedAt"] is None:
+        return None, None
+    for key in ("homeSequence", "digitizerSequence"):
+        value = raw[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None, None
+    return raw["armed"], raw["cleanupRequired"]
 
 
 class ActivityPolicy:
