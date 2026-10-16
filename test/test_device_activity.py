@@ -148,7 +148,7 @@ class DeviceActivityPolicyTests(unittest.TestCase):
                 with open(self.state_path, "w", encoding="utf-8") as stream:
                     json.dump(state, stream)
                 self.assertEqual(
-                    device_activity._load_saved_state(self.state_path), (None, None))
+                    device_activity._load_saved_state(self.state_path), (None, True))
                 unknown = device_activity.ActivityPolicy(self.state_path, clock=self.clock)
                 self.assertTrue(unknown.start_grace())
                 self.assertTrue(unknown.snapshot()["cleanupRequired"])
@@ -159,14 +159,32 @@ class DeviceActivityPolicyTests(unittest.TestCase):
 
         nonregular = os.path.join(self.temp.name, "not-a-file.activity.json")
         os.mkdir(nonregular)
-        self.assertEqual(device_activity._load_saved_state(nonregular), (None, None))
+        self.assertEqual(device_activity._load_saved_state(nonregular), (None, True))
 
         link_path = os.path.join(self.temp.name, "linked.activity.json")
         try:
             os.symlink(self.state_path, link_path)
         except (OSError, NotImplementedError):
             self.skipTest("symlink creation is unavailable on this host")
-        self.assertEqual(device_activity._load_saved_state(link_path), (None, None))
+        self.assertEqual(device_activity._load_saved_state(link_path), (None, True))
+        dangling_path = os.path.join(self.temp.name, "dangling.activity.json")
+        try:
+            os.symlink(os.path.join(self.temp.name, "absent.json"), dangling_path)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation is unavailable on this host")
+        self.assertEqual(device_activity._load_saved_state(dangling_path), (None, True))
+
+    def test_state_lookup_and_read_errors_require_cleanup(self):
+        with patch.object(device_activity.os, "lstat", side_effect=PermissionError):
+            self.assertEqual(device_activity._load_saved_state(self.state_path), (None, True))
+        with patch.object(device_activity.os, "open", side_effect=PermissionError):
+            self.assertEqual(device_activity._load_saved_state(self.state_path), (None, True))
+
+        missing_path = os.path.join(self.temp.name, "new.activity.json")
+        self.assertEqual(device_activity._load_saved_state(missing_path), (None, None))
+        missing = device_activity.ActivityPolicy(missing_path, clock=self.clock)
+        self.assertTrue(missing.start_grace())
+        self.assertFalse(missing.snapshot()["cleanupRequired"])
 
     def test_human_pause_survives_restart_and_cleanup_ack_is_persisted(self):
         self.policy.record_activity("home")
