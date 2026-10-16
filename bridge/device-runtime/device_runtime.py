@@ -68,7 +68,8 @@ def explicit_native_attach_failure(value):
 def _event_route(message):
     default_trigger = "background" if message.get("conversationType") == "group" else "direct"
     background_group = (message.get("conversationType") == "group" and
-                        message.get("trigger", default_trigger) == "background")
+                        message.get("trigger", default_trigger) == "background" and
+                        message.get("isSelf") is not True)
     return "/api/connectors/group-text-backups" if background_group else "/api/connectors/events"
 
 
@@ -677,6 +678,8 @@ class Relay:
                 raise RuntimeError("invalid_event")
             if trigger not in (("mention", "explicit_request", "background") if conversation_type == "group" else ("direct",)):
                 raise RuntimeError("invalid_event")
+            if "isSelf" in message and type(message["isSelf"]) is not bool:
+                raise RuntimeError("invalid_event")
             attachments = message.get("attachments", [])
             if attachments is None:
                 attachments = []
@@ -685,7 +688,7 @@ class Relay:
             normalized_attachments = []
             for attachment in attachments:
                 normalized_attachments.append(self.validate_staged_attachment(attachment))
-            if conversation_type == "group" and trigger == "background":
+            if conversation_type == "group" and trigger == "background" and message.get("isSelf") is not True:
                 body = message.get("body", "")
                 if not body.strip() and normalized_attachments:
                     message["body"] = "[图片]"

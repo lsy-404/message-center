@@ -1118,20 +1118,60 @@ class DeviceRuntimeTests(unittest.TestCase):
     def test_background_group_text_uses_backup_route_and_other_events_use_ingest_route(self):
         group = dict(self.event("group-background"), conversationType="group")
         direct = self.event("direct-event")
+        self_group = dict(self.event("self-group-background"), conversationType="group",
+                          trigger="background", isSelf=True)
         for message in (group, direct):
             self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,1)",
                             ("connector-a", "primary", message["externalId"], runtime.compact(message)))
+        self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,1)",
+                        ("connector-a", "primary", self_group["externalId"], runtime.compact(self_group)))
         self.db.commit()
         calls = []
+        uploaded = []
         relay = runtime.Relay(
             self.config, self.db, lambda request: {},
             lambda method, path, payload=None: calls.append((path, payload)) or
                 (self.backup_ack(len(payload["messages"])) if path.endswith("group-text-backups") else
                  self.event_ack(len(payload["messages"]))))
+        relay.upload_attachment = lambda message, attachment: uploaded.append(message["externalId"])
         self.assertTrue(relay.flush_one())
         self.assertTrue(relay.flush_one())
         self.assertEqual([path for path, _ in calls], [
             "/api/connectors/group-text-backups", "/api/connectors/events"])
+        self.assertEqual([message["externalId"] for message in calls[1][1]["messages"]],
+                         ["direct-event", "self-group-background"])
+        self.assertEqual(uploaded, [])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+
+    def test_self_group_with_attachment_uses_normal_event_route_and_skips_backup_text_guard(self):
+        media_root = os.path.join(self.temp.name, "media")
+        media_dir = os.path.join(media_root, "connector-a")
+        os.makedirs(media_dir)
+        payload = b"self-group-image"
+        with open(os.path.join(media_dir, "self-group-image.bin"), "wb") as staged:
+            staged.write(payload)
+        message = dict(self.event("self-group-media"), conversationType="group", trigger="background",
+                       isSelf=True, body="", contentType="mixed", attachments=[{
+                           "externalId": "file-self-group", "stagingKey": "self-group-image.bin",
+                           "fileName": "photo.png", "mimeType": "image/png", "sizeBytes": len(payload),
+                           "sha256": runtime.hashlib.sha256(payload).hexdigest(),
+                       }])
+        relay = runtime.Relay(self.config, self.db, lambda request: {
+            "ok": True, "sourceReadOk": True, "health": "online", "cursor": {"next": "next"},
+            "messages": [message],
+        }, lambda *args: {"ok": True})
+        relay.media_directory = media_root
+        uploaded = []
+        relay.upload_attachment = lambda event, attachment: uploaded.append(
+            (event["externalId"], attachment["externalId"]))
+        delivered = []
+        relay.http_call = lambda method, path, payload=None: delivered.append((path, payload)) or self.event_ack(1)
+        self.assertTrue(relay.scan_profile("primary"))
+        self.assertTrue(relay.flush_one())
+        self.assertEqual([path for path, _ in delivered], ["/api/connectors/events"])
+        self.assertEqual(delivered[0][1]["messages"][0]["isSelf"], True)
+        self.assertEqual(delivered[0][1]["messages"][0]["contentType"], "mixed")
+        self.assertEqual(uploaded, [("self-group-media", "file-self-group")])
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
 
     def test_suppressed_ingest_response_keeps_outbox_and_backs_off(self):

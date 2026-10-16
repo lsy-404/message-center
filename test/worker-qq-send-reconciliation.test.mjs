@@ -15,7 +15,7 @@ const database = new DatabaseSync(':memory:');
 database.exec(readFileSync(new URL('../cloudflare-worker/worker/schema.sql', import.meta.url), 'utf8'));
 database.prepare(`INSERT INTO connector_instances
   (id, kind, account_label, display_name, mode, capabilities_json, created_at, updated_at)
-  VALUES (?, 'qq', 'primary', 'QQ', 'device_relay', '["receive_text","send_text"]', ?, ?)`)
+  VALUES (?, 'qq', 'primary', 'QQ', 'device_relay', '["receive_text","receive_images","send_text"]', ?, ?)`)
   .run(connectorId, stamp, stamp);
 database.prepare(`INSERT INTO connector_instances
   (id, kind, account_label, display_name, mode, capabilities_json, created_at, updated_at)
@@ -111,12 +111,12 @@ function selfEvent(sourceId = '9007199254740993', options = {}) {
     conversationTitle: 'Test QQ',
     senderName: 'Me',
     occurredAt: stamp,
-    body: options.body || 'same outbound body',
-    contentType: 'text',
+    body: options.body ?? 'same outbound body',
+    contentType: options.contentType || 'text',
     conversationType: options.conversationType || 'direct',
     trigger: options.trigger || 'direct',
     isSelf: options.isSelf ?? true,
-    attachments: [],
+    attachments: options.attachments || [],
   };
 }
 
@@ -125,6 +125,47 @@ async function ingest(messages) {
     method: 'POST', headers, body: JSON.stringify({ connectorId, messages }),
   }), env, {});
 }
+
+async function ingestBackups(messages) {
+  return worker.fetch(new Request('https://message.example.com/api/connectors/group-text-backups', {
+    method: 'POST', headers, body: JSON.stringify({ connectorId, messages }),
+  }), env, {});
+}
+
+const selfGroupAttachment = {
+  externalId: 'file-self-group', fileName: 'photo.png', mimeType: 'image/png',
+  sizeBytes: 4, sha256: 'a'.repeat(64),
+};
+database.prepare(`INSERT INTO attachments
+  (id, connector_id, external_id, conversation_external_id, object_key, file_name, mime_type,
+   size_bytes, sha256, state, created_at)
+  VALUES ('attachment-self-group', ?, ?, ?, 'inbound/self-group', ?, ?, ?, ?, 'uploaded_inbound', ?)`)
+  .run(connectorId, selfGroupAttachment.externalId, conversationExternalId,
+    selfGroupAttachment.fileName, selfGroupAttachment.mimeType, selfGroupAttachment.sizeBytes,
+    selfGroupAttachment.sha256, stamp);
+const selfGroupEvent = selfEvent('9007199254741011', {
+  conversationType: 'group', trigger: 'background', body: '', contentType: 'mixed',
+  attachments: [selfGroupAttachment],
+});
+const selfGroupIngest = await ingest([selfGroupEvent]);
+assert.equal(selfGroupIngest.status, 200);
+const selfGroupMessage = database.prepare(`SELECT id, direction, delivery_state, content_type, metadata_json
+  FROM messages WHERE connector_id = ? AND external_id = ?`).get(connectorId, selfGroupEvent.externalId);
+assert.equal(selfGroupMessage.direction, 'outbound');
+assert.equal(selfGroupMessage.delivery_state, 'delivered');
+assert.equal(selfGroupMessage.content_type, 'mixed');
+assert.equal(JSON.parse(selfGroupMessage.metadata_json).isSelf, true);
+assert.equal(database.prepare('SELECT COUNT(*) AS n FROM agent_queue WHERE message_id = ?')
+  .get(selfGroupMessage.id).n, 0);
+const linkedSelfGroupAttachment = database.prepare(`SELECT message_id, state FROM attachments
+  WHERE connector_id = ? AND external_id = ?`).get(connectorId, selfGroupAttachment.externalId);
+assert.equal(linkedSelfGroupAttachment.message_id, selfGroupMessage.id);
+assert.equal(linkedSelfGroupAttachment.state, 'received');
+const selfGroupBackup = await ingestBackups([selfGroupEvent]);
+assert.equal(selfGroupBackup.status, 400);
+assert.equal((await selfGroupBackup.json()).error, 'self_message_requires_event_ingest');
+assert.equal(database.prepare('SELECT COUNT(*) AS n FROM group_text_backups WHERE connector_id = ? AND external_id = ?')
+  .get(connectorId, selfGroupEvent.externalId).n, 0);
 
 const receiptFirst = seedCommand('receipt-first');
 const receiptFirstAck = await complete(receiptFirst);

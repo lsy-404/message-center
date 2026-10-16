@@ -1494,6 +1494,10 @@ async function ingestGroupTextBackups(request, env) {
   const normalized = [];
   for (const item of body.messages) {
     const bodyText = String(item?.body || "").trim();
+    if (item?.isSelf !== undefined && typeof item.isSelf !== "boolean") {
+      throw new Error("invalid_message_self_flag");
+    }
+    if (item?.isSelf === true) throw new Error("self_message_requires_event_ingest");
     if (item?.attachments !== undefined && !Array.isArray(item.attachments)) {
       throw new Error("invalid_group_backup_attachment");
     }
