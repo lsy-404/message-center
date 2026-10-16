@@ -328,6 +328,35 @@ class DeviceActivityRuntimeTests(unittest.TestCase):
         self.assertNotIn("activityResumeCleanup", calls[2])
         relay.close()
 
+    def test_ensure_active_accepts_completion_ack_and_clears_pending_cleanup(self):
+        monitor = ManualMonitor(armed=True)
+        token = "a" * 32 + ":123:0:0"
+        monitor.request_fields = lambda: {
+            "activityStatePath": self.db_path + ".activity.json",
+            "activityMonitorId": "a" * 32,
+            "activityRuntimePid": 123,
+            "activityResumeToken": token,
+        }
+        requests = []
+
+        def adapter(request):
+            requests.append(request)
+            return {"ok": True, "ready": False, "attempted": True,
+                    "reason": "qq_resume_cleanup_submitted",
+                    "activityResumeCleanupComplete": True,
+                    "activityResumeCleanupToken": token}
+
+        config = dict(self.config, autoWake=True)
+        relay = self.make_relay(monitor, adapter, config=config)
+        relay.activity_state()
+        monitor.armed = False
+        relay.activity_state()
+        self.assertFalse(relay.ensure_active())
+        self.assertTrue(requests[0]["activityResumeCleanup"])
+        self.assertFalse(relay.activity_resume_pending)
+        self.assertFalse(relay.wake_ready)
+        relay.close()
+
     def event(self, ident):
         return {"externalId": ident, "conversationExternalId": "conversation-aaaaaaaa",
                 "conversationTitle": "Test", "senderName": "Sender",

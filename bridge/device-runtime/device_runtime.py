@@ -597,10 +597,17 @@ class Relay:
                 guarded_request["activityResumeToken"] = self.activity_resume_token
             request = guarded_request
         response = self.adapter_call(request)
-        if (request.get("activityResumeCleanup") is True and
-                isinstance(response, dict) and
-                response.get("activityResumeCleanupComplete") is True and
-                response.get("activityResumeCleanupToken") == self.activity_resume_token):
+        if isinstance(response, dict) and (
+                "activityResumeCleanupComplete" in response or
+                "activityResumeCleanupToken" in response):
+            response = dict(response)
+            complete = response.pop("activityResumeCleanupComplete", None)
+            token = response.pop("activityResumeCleanupToken", None)
+        else:
+            complete = None
+            token = None
+        if (request.get("activityResumeCleanup") is True and complete is True and
+                token == request.get("activityResumeToken") == self.activity_resume_token):
             self.activity_resume_pending = False
             self.activity_resume_token = None
         return response

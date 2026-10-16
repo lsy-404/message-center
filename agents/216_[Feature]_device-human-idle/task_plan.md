@@ -5,4 +5,5 @@
 - [x] Gate runtime UI work and preserve outbox delivery during human use.
 - [x] Signal cleanup on idle-resume, retaining a stable request token until explicit completion acknowledgement.
 - [x] Keep host runtime fixtures from starting the native monitor; close fixture monitors during teardown.
+- [x] Consume and strip the private cleanup acknowledgement at the wake schema boundary.
 - [x] Run focused runtime and monitor tests; commit the scoped change.
