@@ -566,6 +566,18 @@ class Relay:
         except Exception:
             pass
 
+    def call_adapter(self, request):
+        request_fields = getattr(self.activity_monitor, "request_fields", None)
+        if callable(request_fields):
+            guarded_request = dict(request)
+            fields = request_fields()
+            if (not isinstance(fields, dict) or set(fields) != {
+                    "activityStatePath", "activityMonitorId", "activityRuntimePid"}):
+                raise RuntimeError("activity_request_state_invalid")
+            guarded_request.update(fields)
+            request = guarded_request
+        return self.adapter_call(request)
+
     def media_directory_for(self, connector_id):
         if not any(item["id"] == connector_id for item in self.connectors):
             raise RuntimeError("invalid_connector_media_directory")
@@ -875,7 +887,7 @@ class Relay:
         if driver not in {"qq", "wechat"}:
             raise RuntimeError("unsupported_connector_driver")
         try:
-            result = self.adapter_call({"op": "scan", "driver": driver,
+            result = self.call_adapter({"op": "scan", "driver": driver,
                                         "profile": profile, "cursor": cursor,
                                         "limit": limit, "maxBytes": MAX_SCAN_RESPONSE,
                                         "maxEventBytes": MAX_EVENT, "mediaDirectory": self.media_directory_for(self.connector),
@@ -1078,7 +1090,7 @@ class Relay:
                 request.update({"reason": recovery_reason, "driver": recovery_driver})
                 if recovery_reason in {"attach_failure", "query_gate_pending"}:
                     request["observedPid"] = observed_pid
-            result = self.adapter_call(request)
+            result = self.call_adapter(request)
             if (not isinstance(result, dict) or set(result) != {"ok", "ready", "attempted", "reason"} or
                     result.get("ok") is not True or type(result.get("ready")) is not bool or
                     type(result.get("attempted")) is not bool or
@@ -1481,7 +1493,7 @@ class Relay:
                        "attachments": payload.get("attachments", [])}
             if driver == "qq":
                 request["cursor"] = self.qq_send_cursor(connector, profile)
-            result = self.adapter_call(request)
+            result = self.call_adapter(request)
             if result.get("ok") is True and isinstance(result.get("receipt"), str) and result.get("receipt"):
                 if driver == "qq":
                     external_id = result.get("externalId")
