@@ -65,3 +65,5 @@
 | 046 | [BugFix] QQ query pending recovery | Recover only after repeated exact pending-gate evidence for the same QQ PID | A pinned callback gate can otherwise remain occupied while generic active-app wakeups leave QQ running | 🔄 进行中 |
 
 - 047_[BugFix]_qq-send-cursor-forwarding: Forward the current connector/profile cursor only in the local QQ send adapter request, with strict scope and replay guards.
+
+| 048 | [BugFix] Adapter send timeout | Give the public runtime 10 seconds of return margin above the private 120-second bounded QQ send path | Prevent the runtime subprocess deadline from expiring before a verified send returns | ✅ Completed; runtime tests pass |\n

@@ -682,7 +682,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout"], runtime.ADAPTER_SCAN_TIMEOUT)
         self.assertEqual(runtime.ADAPTER_SCAN_TIMEOUT, 60)
 
-    def test_send_adapter_timeout_uses_longer_deadline_and_remains_uncertain(self):
+    def test_send_adapter_timeout_covers_private_deadline_and_remains_uncertain(self):
         self.save_cursor()
         command = {"id": "command-timeout", "leaseToken": "lease-timeout",
                    "idempotencyKey": "key-timeout",
@@ -697,7 +697,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         request = run.call_args.args[1]
         self.assertEqual(request["op"], "send")
         self.assertEqual(run.call_args.kwargs["timeout"], runtime.ADAPTER_SEND_TIMEOUT)
-        self.assertEqual(runtime.ADAPTER_SEND_TIMEOUT, 90)
+        self.assertEqual(runtime.ADAPTER_SEND_TIMEOUT, 130)
         state, result, retryable = self.db.execute(
             "SELECT state,result,retryable FROM command_ledger WHERE connector_id=? AND idempotency_key=?",
             ("connector-a", "key-timeout"),
