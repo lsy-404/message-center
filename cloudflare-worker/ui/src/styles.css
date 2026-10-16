@@ -309,6 +309,17 @@ button { color: inherit; }
   cursor: pointer;
 }
 .quiet-button.fluent-button { min-height: 34px; padding: 0; border-color: transparent; background: transparent; box-shadow: none; }
+.quiet-button.group-helper-back-button.fluent-button {
+  display: inline-flex;
+  width: auto;
+  min-width: 0;
+  height: 34px;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  white-space: nowrap;
+}
 .quiet-button:hover, .quiet-button.fluent-button:hover:not(:disabled) { color: var(--text-primary); background: var(--row-hover); }
 .quiet-button:active { background: var(--subtle-pressed); }
 .refresh-button.spinning .app-icon { animation: spin .8s linear infinite; }
