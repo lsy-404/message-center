@@ -326,6 +326,7 @@ class NativeActivityMonitor:
 
     def stop(self, timeout: float = 3.0) -> None:
         self._stop_event.set()
+        self.policy.fail("monitor_stopped")
         thread = self._thread
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=max(0.0, timeout))

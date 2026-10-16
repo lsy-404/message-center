@@ -600,7 +600,11 @@ class Relay:
         if (request.get("activityResumeCleanup") is True and
                 isinstance(response, dict) and
                 response.get("activityResumeCleanupComplete") is True and
-                response.get("activityResumeCleanupToken") == self.activity_resume_token):
+                response.get("activityResumeCleanupToken") ==
+                request.get("activityResumeToken") == self.activity_resume_token):
+            response = dict(response)
+            response.pop("activityResumeCleanupComplete")
+            response.pop("activityResumeCleanupToken")
             self.activity_resume_pending = False
             self.activity_resume_token = None
         return response

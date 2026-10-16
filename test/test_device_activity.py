@@ -80,6 +80,17 @@ class DeviceActivityPolicyTests(unittest.TestCase):
         self.assertEqual(saved["generation"], 3)
         self.assertIsInstance(saved["publishedAt"], (int, float))
 
+    def test_monitor_stop_invalidates_persisted_lease_immediately(self):
+        monitor = device_activity.NativeActivityMonitor(
+            self.state_path, clock=self.clock)
+        monitor.policy.start_grace()
+        monitor.policy.mark_ready()
+        monitor.stop()
+        with open(self.state_path, encoding="utf-8") as state_file:
+            state = json.load(state_file)
+        self.assertFalse(state["healthy"])
+        self.assertTrue(state["armed"])
+
     def test_native_monitor_exposes_durable_state_lease_and_resume_token(self):
         monitor = device_activity.NativeActivityMonitor(self.state_path,
                                                          idle_seconds=3,
@@ -326,6 +337,54 @@ class DeviceActivityRuntimeTests(unittest.TestCase):
         self.assertEqual(calls[0]["activityResumeToken"], "a" * 32 + ":123:0:0")
         self.assertTrue(calls[1]["activityResumeCleanup"])
         self.assertNotIn("activityResumeCleanup", calls[2])
+        relay.close()
+
+    def test_ensure_active_accepts_completion_ack_and_clears_pending_cleanup(self):
+        monitor = ManualMonitor(armed=True)
+        token = "a" * 32 + ":123:0:0"
+        monitor.request_fields = lambda: {
+            "activityStatePath": self.db_path + ".activity.json",
+            "activityMonitorId": "a" * 32,
+            "activityRuntimePid": 123,
+            "activityResumeToken": token,
+        }
+        requests = []
+
+        def adapter(request):
+            requests.append(request)
+            return {"ok": True, "ready": False, "attempted": True,
+                    "reason": "qq_resume_cleanup_submitted",
+                    "activityResumeCleanupComplete": True,
+                    "activityResumeCleanupToken": token}
+
+        config = dict(self.config, autoWake=True)
+        relay = self.make_relay(monitor, adapter, config=config)
+        relay.activity_state()
+        monitor.armed = False
+        relay.activity_state()
+        self.assertFalse(relay.ensure_active())
+        self.assertTrue(requests[0]["activityResumeCleanup"])
+        self.assertFalse(relay.activity_resume_pending)
+        self.assertFalse(relay.wake_ready)
+        relay.close()
+
+    def test_unrequested_cleanup_ack_is_not_stripped(self):
+        monitor = ManualMonitor()
+        monitor.request_fields = lambda: {
+            "activityStatePath": self.db_path + ".activity.json",
+            "activityMonitorId": "a" * 32,
+            "activityRuntimePid": 123,
+            "activityResumeToken": "a" * 32 + ":123:0:0",
+        }
+        relay = self.make_relay(
+            monitor,
+            lambda _request: {"ok": True, "ready": False, "attempted": False,
+                              "reason": "activity_state_unknown",
+                              "activityResumeCleanupComplete": True,
+                              "activityResumeCleanupToken": "a" * 32 + ":123:0:0"},
+            config=dict(self.config, autoWake=True))
+        self.assertFalse(relay.ensure_active())
+        self.assertFalse(relay.wake_ready)
         relay.close()
 
     def event(self, ident):
