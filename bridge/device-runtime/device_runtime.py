@@ -536,6 +536,7 @@ class Relay:
         self.activity_monitor.start()
         self.activity_pause_active = False
         self.activity_fresh_required = set()
+        self.activity_resume_pending = False
 
     def activity_state(self):
         try:
@@ -548,12 +549,15 @@ class Relay:
             state = {"healthy": False, "armed": True, "shouldPause": True,
                      "reason": "activity_state_unknown"}
         paused = state["shouldPause"] or state["armed"] or not state["healthy"]
-        if paused and not self.activity_pause_active:
+        was_paused = self.activity_pause_active
+        if paused and not was_paused:
             self.activity_fresh_required.update(self.connector_by_id)
             for connector_id in self.connector_by_id:
                 self.health[connector_id] = False
                 self.last_scan[connector_id] = float("-inf")
             self.wake_ready = False
+        elif was_paused and not paused:
+            self.activity_resume_pending = True
         self.activity_pause_active = paused
         return state | {"shouldPause": paused}
 
@@ -575,6 +579,9 @@ class Relay:
                     "activityStatePath", "activityMonitorId", "activityRuntimePid"}):
                 raise RuntimeError("activity_request_state_invalid")
             guarded_request.update(fields)
+            if request.get("op") == "ensure-active" and self.activity_resume_pending:
+                guarded_request["activityResumeCleanup"] = True
+                self.activity_resume_pending = False
             request = guarded_request
         return self.adapter_call(request)
 

@@ -1,9 +1,7 @@
 # Task plan
 
-- [x] Load repository instructions and inspect the device runtime scheduling and persistence boundaries.
-- [x] Confirm the public worktree branch and assigned base commit.
-- [x] Implement generic IOKit/CoreFoundation activity monitor with bounded callback state and thread-owned lifecycle.
-- [x] Persist armed pause state atomically and fail closed on unknown or unhealthy monitoring.
-- [x] Gate scan, command, and auto-wake paths while preserving outbox flush and explicit unavailable heartbeat.
-- [x] Add focused `/test` coverage for HOME, touch, 180-second grace, rollback, monitor failure, restart, commands, and outbox behavior.
-- [x] Run focused validation, review scoped diff, and commit locally without push.
+- [x] Load agent-mode workflow and confirm the assigned isolated worktree.
+- [x] Implement the on-device idle monitor and durable lease protocol.
+- [x] Gate runtime UI work and preserve outbox delivery during human use.
+- [x] Signal one cleanup cycle on the first idle-resume wake request.
+- [x] Run focused runtime and monitor tests; commit the scoped change.

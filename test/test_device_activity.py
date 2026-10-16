@@ -270,6 +270,24 @@ class DeviceActivityRuntimeTests(unittest.TestCase):
                                   "activityRuntimePid": 123}])
         relay.close()
 
+    def test_resume_cleanup_signal_is_sent_once_after_activity_ends(self):
+        monitor = ManualMonitor(armed=True)
+        monitor.request_fields = lambda: {
+            "activityStatePath": self.db_path + ".activity.json",
+            "activityMonitorId": "a" * 32,
+            "activityRuntimePid": 123,
+        }
+        calls = []
+        relay = self.make_relay(monitor, lambda request: calls.append(request) or {})
+        self.assertTrue(relay.activity_state()["shouldPause"])
+        monitor.armed = False
+        self.assertFalse(relay.activity_state()["shouldPause"])
+        relay.call_adapter({"op": "ensure-active", "driver": "qq"})
+        relay.call_adapter({"op": "ensure-active", "driver": "qq"})
+        self.assertTrue(calls[0]["activityResumeCleanup"])
+        self.assertNotIn("activityResumeCleanup", calls[1])
+        relay.close()
+
     def event(self, ident):
         return {"externalId": ident, "conversationExternalId": "conversation-aaaaaaaa",
                 "conversationTitle": "Test", "senderName": "Sender",
