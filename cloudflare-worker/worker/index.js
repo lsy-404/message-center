@@ -2512,6 +2512,12 @@ async function completeCommand(request, env, commandId, batchRetry = false) {
   const isQQConnector = command.connector_kind === "qq";
   const qqIdentity = body.ok === true && isQQConnector ? verifiedQQExternalId(resultValue) : { present: false };
   let state = body.retry === true ? "pending" : body.uncertain === true ? "manual_review" : body.ok === true ? "completed" : "failed";
+  const retryHasPhysicalEvidence = isQQConnector && body.retry === true && (
+    body.ok === true || body.uncertain === true || body.dispatched === true ||
+    resultValue.ok === true || resultValue.uncertain === true || resultValue.dispatched === true ||
+    resultValue.receipt !== undefined || resultValue.externalId !== undefined
+  );
+  if (retryHasPhysicalEvidence) state = "manual_review";
   let completionMessageId = command.message_id;
   let mergeFromMessageId = null;
   if (state === "completed" && isQQConnector && (!qqIdentity.present || !qqIdentity.valid)) {

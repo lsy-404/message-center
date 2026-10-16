@@ -93,10 +93,13 @@ function seedCommand(suffix, body = 'same outbound body', options = {}) {
   return { connectorId: commandConnectorId, conversationId, messageId, commandId, leaseToken: `lease-${suffix}`, body };
 }
 
-async function complete(command, sourceId = '9007199254740993') {
+async function complete(command, sourceId = '9007199254740993', overrides = {}) {
   const identity = typeof sourceId === 'string' ? qqIdentity(sourceId) : sourceId;
   return worker.fetch(new Request(`https://message.example.com/api/connectors/commands/${command.commandId}/complete`, {
-    method: 'POST', headers: headersFor(command.connectorId), body: JSON.stringify({ connectorId: command.connectorId, leaseToken: command.leaseToken, ok: true, result: identity }),
+    method: 'POST',
+    headers: headersFor(command.connectorId),
+    body: JSON.stringify({ connectorId: command.connectorId, leaseToken: command.leaseToken,
+      ok: true, result: identity, ...overrides }),
   }), env, {});
 }
 
@@ -237,6 +240,38 @@ assert.equal(missingQQAck.status, 200);
 assert.equal((await missingQQAck.json()).state, 'manual_review');
 assert.equal(database.prepare('SELECT delivery_state, external_id FROM messages WHERE id = ?')
   .get(missingQQReceipt.messageId).delivery_state, 'uncertain');
+
+const contradictoryQQRetry = seedCommand('contradictory-qq-retry');
+const contradictoryQQAck = await complete(contradictoryQQRetry, '9007199254741010', { retry: true });
+assert.equal(contradictoryQQAck.status, 200);
+assert.equal((await contradictoryQQAck.json()).state, 'manual_review');
+assert.equal(database.prepare('SELECT state FROM commands WHERE id = ?').get(contradictoryQQRetry.commandId).state, 'manual_review');
+assert.equal(database.prepare('SELECT delivery_state, external_id FROM messages WHERE id = ?')
+  .get(contradictoryQQRetry.messageId).delivery_state, 'uncertain');
+
+const dispatchedQQRetry = seedCommand('dispatched-qq-retry');
+const dispatchedQQAck = await complete(dispatchedQQRetry, {}, {
+  retry: true, ok: false, result: { dispatched: true },
+});
+assert.equal(dispatchedQQAck.status, 200);
+assert.equal((await dispatchedQQAck.json()).state, 'manual_review');
+
+const uncertainQQRetry = seedCommand('uncertain-qq-retry');
+const uncertainQQAck = await complete(uncertainQQRetry, {}, {
+  retry: true, ok: false, uncertain: true, result: { dispatched: false },
+});
+assert.equal(uncertainQQAck.status, 200);
+assert.equal((await uncertainQQAck.json()).state, 'manual_review');
+
+const genuineQQRetry = seedCommand('genuine-qq-retry');
+const genuineQQAck = await complete(genuineQQRetry, {}, {
+  retry: true, ok: false, result: { dispatched: false, retryable: true },
+});
+assert.equal(genuineQQAck.status, 200);
+assert.equal((await genuineQQAck.json()).state, 'pending');
+assert.equal(database.prepare('SELECT state FROM commands WHERE id = ?').get(genuineQQRetry.commandId).state, 'pending');
+assert.equal(database.prepare('SELECT delivery_state, external_id FROM messages WHERE id = ?')
+  .get(genuineQQRetry.messageId).delivery_state, 'queued');
 
 const genericCommand = seedCommand('generic-receipt', 'generic outbound body', {
   connectorId: genericConnectorId, conversationId: genericConversationRowId,
