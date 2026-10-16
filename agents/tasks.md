@@ -71,3 +71,4 @@
 
 | 050 | [BugFix] QQ confirmed-send alias contract | Register confirmed QQ reads using the canonical conversation external ID in Worker commands | The runtime expected a profile prefix that the Worker and adapter do not add to conversation IDs | ✅ Locally verified |
 | 195 | [BugFix] QQ create_script timeout recovery | Accept only explicit pre-dispatch QQ create_script timeouts and route them through existing same-PID bounded recovery | Repeated Frida script-creation timeouts need the existing safe QQ recovery path | ✅ Locally verified |
+| 212 | [Feature] QQ 群助手入口 | 在收件箱提供 QQ 折叠/消息盒子群的独立入口，保持现有搜索、未读和聊天选择流程 | 群目录已同步但 folded/message_box 会话缺少可进入的用户界面 | 🔄 进行中 |

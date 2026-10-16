@@ -8,7 +8,18 @@ export function normalizeChannelLabel(value) {
   return label
 }
 
+export function isQQGroupAssistantConversation(conversation) {
+  return conversation.connectorKind === 'qq'
+    && conversation.conversationType === 'group'
+    && (conversation.placement === 'folded' || conversation.placement === 'message_box')
+}
+
+export function filterQQGroupAssistantConversations(conversations) {
+  return conversations.filter(isQQGroupAssistantConversation)
+}
+
 export function filterConversations(conversations, options = {}) {
+  const connectorKind = String(options.connectorKind || '')
   const connectorId = String(options.connectorId || '')
   const channelLabel = normalizeChannelLabel(options.channelLabel || '')
   const query = String(options.query || '').trim().toLowerCase()
@@ -16,6 +27,7 @@ export function filterConversations(conversations, options = {}) {
   const unreadOnly = Boolean(options.unreadOnly)
 
   return conversations.filter((conversation) => {
+    if (connectorKind && conversation.connectorKind !== connectorKind) return false
     if (connectorId && conversation.connectorId !== connectorId) return false
     if (unreadOnly && !(Number(conversation.unreadCount) > 0)) return false
     if (channelLabel) {

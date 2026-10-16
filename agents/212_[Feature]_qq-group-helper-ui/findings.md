@@ -1,0 +1,8 @@
+# 调研发现
+
+- Worker `/api/inbox` 在 `cloudflare-worker/worker/index.js` 查询 `k.kind AS connector_kind`，映射为 UI `connectorKind`；conversation projection 同时返回 `conversationType`、`placement` 和 `unreadCount`。协议 kind `qq` 是分类依据，`channelLabel` 是可自定义显示名。
+- `conversationType` 必须为 `group`，且 `placement` 必须为 `folded` 或 `message_box` 才进入助手；普通群、私聊、未知 placement 及其他 connector 不纳入。
+- `filterConversations()` 原先只有 connectorId/channel/search/unread 条件；新增 connectorKind 条件让总 QQ 列表也按协议字段筛选。搜索字段与现有所有列表一致。
+- UI 选择仍经 `selectConversationById()` / `selectConversation()`；本次不改发送、Worker schema、适配器或配置。
+- 首轮检查发现新 `connectorKind` 条件少了局部取值声明，Node 测试直接报 `ReferenceError`；补齐后相关测试全通过。
+- 首轮安装前 UI check/build 因 worktree 无 `node_modules` 失败；依据已锁定依赖文件离线安装后 check/build 通过。Worker 集成测试也因缺 `openid-client` 失败；在 `cloudflare-worker` 按 lockfile 离线安装后测试通过。
