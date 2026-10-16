@@ -1,0 +1,8 @@
+# Progress
+
+- Created isolated review worktree from public baseline `40e8dba`; recorded scope before source review.
+- Retrieved current Cloudflare Workers best-practices documentation and `@cloudflare/workers-types@5.20261016.1`; no changed Worker TypeScript binding/API signature required type lookup.
+- Reviewed candidate `ac7ccd30f78275c33875fba69dee5f6606caa89f` and identified two races: attachment metadata could change after the pre-read, and an already leased legacy placeholder could still be replied to. Author follow-up `d50933f831e5d35cbe58815fa5466fd9cfbd9505` closes both with exact metadata CAS plus reply pre-read/atomic-insert source checks.
+- Verified the actual Python device-runtime path, marker validation, route exception, outbox preservation, and route-aware batching. The private native source producer remains outside this public review and has not been live-validated.
+- Verification passed: `node --experimental-sqlite test/worker-schema.test.mjs`; `python -m unittest test_device_runtime test_device_runtime_outbox_batch` (118 tests, 2 skipped); `node --test test/bridge-spool-presentation.test.mjs`; `npm run check` in `bridge`; `npm run check` and `npm run build` in `cloudflare-worker/ui`; `node test/ui-navigation-media.cjs` (synthetic fixture); additional local scan-to-outbox-to-normal-route marker preservation check.
+- Initial review attempts without locally installed dependencies failed to load test modules; installed dependencies only into ignored `node_modules` folders in this review worktree and reran the focused checks successfully. No author source files were changed.
