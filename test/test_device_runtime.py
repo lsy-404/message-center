@@ -272,6 +272,44 @@ class DeviceRuntimeTests(unittest.TestCase):
             relay.scan_profile("primary")
         self.assertEqual(caught.exception.attach_failure_pid, 12345)
 
+    def test_create_script_timeout_requires_exact_metadata_and_uses_same_pid_recovery(self):
+        valid = {"stage": "create_script", "errorCode": "timeout",
+                 "dispatch": "not_started", "processId": 12345}
+        self.assertTrue(runtime.explicit_native_create_script_timeout(valid))
+        for invalid in (
+            None,
+            {key: value for key, value in valid.items() if key != "processId"},
+            {**valid, "processId": True},
+            {**valid, "processId": 1},
+            {**valid, "stage": "attach"},
+            {**valid, "stage": "query_gate"},
+            {**valid, "errorCode": "attach_failed"},
+            {**valid, "dispatch": "unknown"},
+            {**valid, "extra": "ignored"},
+        ):
+            self.assertFalse(runtime.explicit_native_create_script_timeout(invalid))
+
+        config = self.auto_wake_config()
+        config["connectors"] = config["connectors"][:1]
+        requests = []
+        response = {"ok": False, "sourceReadOk": False, "nativeFailure": valid}
+        relay = runtime.Relay(config, self.db,
+                              lambda request: requests.append(dict(request)) or
+                              (self.wake_result(True) if request.get("op") == "ensure-active" else response))
+        with self.assertRaises(runtime.SourceReadError) as caught:
+            relay.scan_profile("primary")
+        self.assertEqual(caught.exception.attach_failure_pid, 12345)
+        self.assertIsNone(caught.exception.query_gate_pending_pid)
+
+        relay.source_read_failed("connector-a", attach_failure_pid=12345)
+        relay.source_read_failed("connector-a", attach_failure_pid=12345)
+        self.assertFalse(relay.recover_attach_after_failures("connector-a"))
+        relay.source_read_failed("connector-a", attach_failure_pid=12345)
+        self.assertTrue(relay.recover_attach_after_failures("connector-a"))
+        recoveries = [request for request in requests if request.get("op") == "ensure-active"]
+        self.assertEqual(recoveries, [{"op": "ensure-active", "reason": "attach_failure",
+                                       "driver": "qq", "observedPid": 12345}])
+
     def test_native_query_gate_classification_requires_exact_safe_metadata(self):
         valid = {"stage": "query_gate", "errorCode": "native-query-busy",
                  "dispatch": "not_started", "processId": 12345}

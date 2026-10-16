@@ -70,3 +70,4 @@
 | 049 | [Feature] QQ confirmed-send priority read | Register locally verified QQ send receipts as bounded read-priority metadata on the same connector/profile cursor | Ordinary round-robin reads may take too long to observe a newly confirmed self-message | ✅ Host tests pass; local commit ready for integration |
 
 | 050 | [BugFix] QQ confirmed-send alias contract | Register confirmed QQ reads using the canonical conversation external ID in Worker commands | The runtime expected a profile prefix that the Worker and adapter do not add to conversation IDs | ✅ Locally verified |
+| 195 | [BugFix] QQ create_script timeout recovery | Accept only explicit pre-dispatch QQ create_script timeouts and route them through existing same-PID bounded recovery | Repeated Frida script-creation timeouts need the existing safe QQ recovery path | ✅ Locally verified |

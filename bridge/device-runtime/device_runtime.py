@@ -83,6 +83,15 @@ def explicit_native_attach_failure(value):
             and type(value["processId"]) is int and value["processId"] > 1)
 
 
+def explicit_native_create_script_timeout(value):
+    if type(value) is not dict or set(value) != {"stage", "errorCode", "dispatch", "processId"}:
+        return False
+    return (type(value["stage"]) is str and value["stage"] == "create_script"
+            and type(value["errorCode"]) is str and value["errorCode"] == "timeout"
+            and type(value["dispatch"]) is str and value["dispatch"] == "not_started"
+            and type(value["processId"]) is int and value["processId"] > 1)
+
+
 def _event_route(message):
     default_trigger = "background" if message.get("conversationType") == "group" else "direct"
     background_group = (message.get("conversationType") == "group" and
@@ -842,7 +851,8 @@ class Relay:
             raise SourceReadError(
                 "source_read_failed",
                 attach_failure_pid=(failure["processId"]
-                                    if explicit_native_attach_failure(failure) else None),
+                                    if (explicit_native_attach_failure(failure)
+                                        or explicit_native_create_script_timeout(failure)) else None),
                 query_gate_pending_pid=(failure["processId"]
                                         if explicit_native_query_gate_pending(failure) else None),
             )
