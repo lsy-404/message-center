@@ -66,4 +66,5 @@
 
 - 047_[BugFix]_qq-send-cursor-forwarding: Forward the current connector/profile cursor only in the local QQ send adapter request, with strict scope and replay guards.
 
-| 048 | [BugFix] Adapter send timeout | Give the public runtime 10 seconds of return margin above the private 120-second bounded QQ send path | Prevent the runtime subprocess deadline from expiring before a verified send returns | ✅ Completed; runtime tests pass |\n
+| 048 | [BugFix] Adapter send timeout | Give the public runtime 10 seconds of return margin above the private 120-second bounded QQ send path | Prevent the runtime subprocess deadline from expiring before a verified send returns | ✅ Completed; runtime tests pass |
+| 049 | [Feature] QQ confirmed-send priority read | Register locally verified QQ send receipts as bounded read-priority metadata on the same connector/profile cursor | Ordinary round-robin reads may take too long to observe a newly confirmed self-message | ✅ Host tests pass; local commit ready for integration |

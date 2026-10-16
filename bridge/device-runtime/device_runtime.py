@@ -25,6 +25,8 @@ if os.name == "posix":
 MAX_RESPONSE = 1024 * 1024
 MAX_SCAN_RESPONSE = 900 * 1024
 MAX_CURSOR_BYTES = 65_536
+MAX_QQ_CONFIRMED_SEND_READS = 8
+QQ_CONFIRMED_SEND_READ_ATTEMPTS = 3
 MAX_EVENT = 256 * 1024
 MAX_OUTBOX_BATCH_MESSAGES = 20
 MAX_OUTBOX_BATCH_BYTES = MAX_SCAN_RESPONSE
@@ -181,13 +183,7 @@ def verified_qq_external_id(profile, external_id, receipt_text):
     if not isinstance(receipt, dict):
         return False
     source_id = receipt.get("sourceId")
-    if not isinstance(source_id, str) or not re.fullmatch(r"-?(?:0|[1-9][0-9]*)", source_id):
-        return False
-    try:
-        numeric_id = int(source_id)
-    except ValueError:
-        return False
-    if not -(1 << 63) <= numeric_id < (1 << 63) or source_id == "-0":
+    if not canonical_qq_source_id(source_id):
         return False
     value = 0x811C9DC5
     for byte in source_id.encode("ascii"):
@@ -198,6 +194,146 @@ def verified_qq_external_id(profile, external_id, receipt_text):
             and type(receipt.get("sendStatus")) is int and receipt["sendStatus"] == 2
             and receipt.get("confirmation") == "verified-status"
             and external_id == f"{profile}:qq-message:{source_id}")
+
+
+def canonical_qq_source_id(value):
+    if not isinstance(value, str) or len(value) > 20:
+        return False
+    if re.fullmatch(r"-?(?:0|[1-9][0-9]*)", value) is None or value == "-0":
+        return False
+    try:
+        numeric = int(value)
+    except ValueError:
+        return False
+    return -(1 << 63) <= numeric < (1 << 63)
+
+
+def canonical_qq_owner_uin(value):
+    return isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,18}", value) is not None
+
+
+def qq_directory_string(value, allow_empty=False):
+    if not isinstance(value, str) or (not allow_empty and not value) or len(value) > 256:
+        return False
+    if value.strip() != value or any(ord(character) < 0x20 or ord(character) == 0x7F
+                                     for character in value):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def qq_conversation_alias(value):
+    digest = 0x811C9DC5
+    encoded = value.encode("utf-16-le")
+    for offset in range(0, len(encoded), 2):
+        unit = encoded[offset] | (encoded[offset + 1] << 8)
+        digest = ((digest ^ unit) * 0x01000193) & 0xFFFFFFFF
+    return f"conversation-{digest:08x}"
+
+
+def valid_qq_friend_directory(directory):
+    if (not isinstance(directory, dict)
+            or set(directory) != {"version", "ownerUin", "entries", "lastAttemptUin",
+                                  "lastAttemptAt", "nextMainItem"}
+            or directory.get("version") != "qfd1"
+            or not canonical_qq_owner_uin(directory.get("ownerUin"))
+            or not isinstance(directory.get("entries"), list)
+            or len(directory["entries"]) > 100):
+        return False
+    last_uin = directory.get("lastAttemptUin")
+    last_at = directory.get("lastAttemptAt")
+    next_item = directory.get("nextMainItem")
+    if last_uin is not None and not canonical_qq_owner_uin(last_uin):
+        return False
+    if (type(last_at) is not int or not 0 <= last_at <= 9007199254740991
+            or (last_uin is None) != (last_at == 0)
+            or type(next_item) is not int or not 0 <= next_item <= 512):
+        return False
+    seen_uins = set()
+    seen_uids = set()
+    seen_aliases = set()
+    for entry in directory["entries"]:
+        if (not isinstance(entry, dict) or set(entry) != {"peerUin", "peerUid", "guildId"}
+                or not canonical_qq_owner_uin(entry.get("peerUin"))
+                or not qq_directory_string(entry.get("peerUid"))
+                or not qq_directory_string(entry.get("guildId"), allow_empty=True)):
+            return False
+        alias = qq_conversation_alias(entry["peerUid"])
+        if (entry["peerUin"] in seen_uins or entry["peerUid"] in seen_uids
+                or alias in seen_aliases):
+            return False
+        seen_uins.add(entry["peerUin"])
+        seen_uids.add(entry["peerUid"])
+        seen_aliases.add(alias)
+    try:
+        return len(compact(directory).encode("utf-8")) <= 16 * 1024
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        return False
+
+
+def qq_priority_owner_uin(cursor, profile):
+    owners = []
+    directory = cursor.get("qqFriendDirectory")
+    if valid_qq_friend_directory(directory):
+        owners.append(directory["ownerUin"])
+    discovery = cursor.get("qqDiscoveryCache")
+    discovery_size_ok = False
+    if isinstance(discovery, list):
+        try:
+            discovery_size_ok = len(compact(discovery).encode("utf-8")) <= 24 * 1024
+        except (TypeError, ValueError, UnicodeError, RecursionError):
+            pass
+    if (isinstance(discovery, list) and len(discovery) == 8
+            and discovery[0] == "qdc3" and discovery[1] == profile
+            and type(discovery[2]) is int and discovery[2] > 1
+            and type(discovery[3]) is bool
+            and type(discovery[4]) is int and 3600 <= discovery[4] <= 604800
+            and type(discovery[5]) is int and 0 <= discovery[5] <= 9007199254740991
+            and isinstance(discovery[7], list) and len(discovery[7]) <= 200
+            and discovery_size_ok
+            and canonical_qq_owner_uin(discovery[6])):
+        owners.append(discovery[6])
+    if not owners or len(set(owners)) != 1:
+        return None
+    return owners[0]
+
+
+def valid_qq_confirmed_read_queue(value, owner_uin):
+    if not isinstance(value, list) or len(value) > MAX_QQ_CONFIRMED_SEND_READS:
+        return None
+    expected = {"ownerUin", "alias", "sourceId", "remainingAttempts"}
+    seen_aliases = set()
+    queue_owner = owner_uin
+    for entry in value:
+        if (not isinstance(entry, dict) or set(entry) != expected
+                or not canonical_qq_owner_uin(entry.get("ownerUin"))
+                or (queue_owner is not None and entry.get("ownerUin") != queue_owner)
+                or not isinstance(entry.get("alias"), str)
+                or re.fullmatch(r"conversation-[a-f0-9]{8}", entry["alias"]) is None
+                or entry["alias"] in seen_aliases
+                or not canonical_qq_source_id(entry.get("sourceId"))
+                or type(entry.get("remainingAttempts")) is not int
+                or not 1 <= entry["remainingAttempts"] <= QQ_CONFIRMED_SEND_READ_ATTEMPTS):
+            return None
+        if queue_owner is None:
+            queue_owner = entry["ownerUin"]
+        seen_aliases.add(entry["alias"])
+    return value
+
+
+def qq_command_conversation_alias(profile, external_conversation_id):
+    if not isinstance(profile, str) or not isinstance(external_conversation_id, str):
+        return None
+    prefix = profile + ":"
+    if not external_conversation_id.startswith(prefix):
+        return None
+    alias = external_conversation_id[len(prefix):]
+    if re.fullmatch(r"conversation-[a-f0-9]{8}", alias) is None:
+        return None
+    return alias
 
 
 def resolve_local_paths(config, config_path):
@@ -1101,6 +1237,105 @@ class Relay:
             raise SendPreDispatchError("qq_send_cursor_oversized")
         return cursor
 
+    def _register_qq_confirmed_read(self, profile, alias, source_id):
+        connector = self.connector_by_id.get(self.connector, {})
+        if (connector.get("kind") != "qq" or connector.get("profile") != profile
+                or not isinstance(profile, str)
+                or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", profile)
+                or not isinstance(alias, str)
+                or re.fullmatch(r"conversation-[a-f0-9]{8}", alias) is None
+                or not canonical_qq_source_id(source_id)):
+            return
+        savepoint_started = False
+        try:
+            self.db.execute("SAVEPOINT qq_confirmed_read")
+            savepoint_started = True
+            row = self.db.execute(
+                "SELECT value FROM cursors WHERE connector_id=? AND profile=?",
+                (self.connector, profile),
+            ).fetchone()
+            if row is None or not isinstance(row[0], str):
+                self.db.execute("RELEASE qq_confirmed_read")
+                return
+            raw_cursor = row[0]
+            if len(raw_cursor.encode("utf-8")) > MAX_CURSOR_BYTES:
+                self.db.execute("RELEASE qq_confirmed_read")
+                return
+            try:
+                cursor = json.loads(raw_cursor)
+            except (TypeError, ValueError, UnicodeError):
+                self.db.execute("RELEASE qq_confirmed_read")
+                return
+            if (not isinstance(cursor, dict) or type(cursor.get("version")) is not int
+                    or cursor.get("version") != 1
+                    or not isinstance(cursor.get("conversations"), dict)):
+                self.db.execute("RELEASE qq_confirmed_read")
+                return
+            owner_uin = qq_priority_owner_uin(cursor, profile)
+            original_queue = cursor.get("qqConfirmedSendReads")
+            queue_was_present = "qqConfirmedSendReads" in cursor
+            queue = valid_qq_confirmed_read_queue(original_queue, owner_uin)
+            malformed_queue = queue_was_present and queue is None
+            if owner_uin is None:
+                if malformed_queue:
+                    candidate_cursor = dict(cursor)
+                    candidate_cursor.pop("qqConfirmedSendReads", None)
+                    updated_value = compact(candidate_cursor)
+                    if len(updated_value.encode("utf-8")) <= MAX_CURSOR_BYTES:
+                        self.db.execute(
+                            "UPDATE cursors SET value=? WHERE connector_id=? AND profile=? AND value=?",
+                            (updated_value, self.connector, profile, raw_cursor),
+                        )
+                self.db.execute("RELEASE qq_confirmed_read")
+                return
+            if queue is None:
+                queue = []
+            replacement = {"ownerUin": owner_uin, "alias": alias,
+                           "sourceId": source_id,
+                           "remainingAttempts": QQ_CONFIRMED_SEND_READ_ATTEMPTS}
+            existing_index = next((index for index, entry in enumerate(queue)
+                                   if entry["alias"] == alias), None)
+            if existing_index is None:
+                if len(queue) >= MAX_QQ_CONFIRMED_SEND_READS:
+                    queue.pop(0)
+                queue.append(replacement)
+            else:
+                queue[existing_index] = replacement
+            candidate_cursor = dict(cursor)
+            candidate_cursor["qqConfirmedSendReads"] = queue
+            candidate = compact(candidate_cursor)
+            if len(candidate.encode("utf-8")) <= MAX_CURSOR_BYTES:
+                updated_value = candidate
+            elif malformed_queue:
+                candidate_cursor = dict(cursor)
+                candidate_cursor.pop("qqConfirmedSendReads", None)
+                updated_value = compact(candidate_cursor)
+                if len(updated_value.encode("utf-8")) > MAX_CURSOR_BYTES:
+                    self.db.execute("RELEASE qq_confirmed_read")
+                    return
+            else:
+                self.db.execute("RELEASE qq_confirmed_read")
+                return
+            self.db.execute(
+                "UPDATE cursors SET value=? WHERE connector_id=? AND profile=? AND value=?",
+                (updated_value, self.connector, profile, raw_cursor),
+            )
+            self.db.execute("RELEASE qq_confirmed_read")
+        except sqlite3.Error:
+            if savepoint_started:
+                try:
+                    self.db.execute("ROLLBACK TO qq_confirmed_read")
+                    self.db.execute("RELEASE qq_confirmed_read")
+                except sqlite3.Error:
+                    pass
+        except (TypeError, ValueError, UnicodeError, RecursionError, OverflowError):
+            if savepoint_started:
+                try:
+                    self.db.execute("ROLLBACK TO qq_confirmed_read")
+                    self.db.execute("RELEASE qq_confirmed_read")
+                except sqlite3.Error:
+                    pass
+
     def process_command(self, command, profile):
         key = command.get("idempotencyKey")
         if not key:
@@ -1157,6 +1392,7 @@ class Relay:
             self.db.commit()
             self.complete(command, {"retry": True, "error": "device_not_ready"})
             return
+        priority_read = None
         try:
             connector = self.connector_by_id[self.connector]
             driver = connector.get("kind")
@@ -1178,6 +1414,11 @@ class Relay:
                     if verified_qq_external_id(profile, external_id, result["receipt"]):
                         outcome = {"ok": True, "result": {
                             "receipt": result["receipt"], "externalId": external_id}}
+                        receipt = json.loads(result["receipt"])
+                        alias = qq_command_conversation_alias(
+                            profile, payload.get("externalConversationId"))
+                        if alias is not None:
+                            priority_read = (alias, receipt["sourceId"])
                     else:
                         outcome = {"uncertain": True, "error": "qq_receipt_identity_unverified"}
                 else:
@@ -1201,8 +1442,11 @@ class Relay:
         except Exception:
             outcome, retryable = {"uncertain": True, "error": "device_send_outcome_uncertain"}, 0
         if not retryable:
+            self.db.execute("BEGIN IMMEDIATE")
             self.db.execute("UPDATE command_ledger SET state='done',result=?,retryable=? WHERE connector_id=? AND idempotency_key=?",
                             (compact(outcome), retryable, self.connector, key))
+            if priority_read is not None:
+                self._register_qq_confirmed_read(profile, *priority_read)
         self.db.commit()
         self.complete(command, outcome)
 

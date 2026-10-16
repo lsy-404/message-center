@@ -59,7 +59,10 @@ class DeviceRuntimeTests(unittest.TestCase):
     def save_cursor(self, connector_id="connector-a", profile="primary", cursor=None):
         if cursor is None:
             cursor = {"version": 1, "conversations": {},
-                      "qqFriendDirectory": {"schema": "qfd1", "ownerUin": "1234", "entries": []}}
+                      "qqFriendDirectory": {
+                          "version": "qfd1", "ownerUin": "1234", "entries": [],
+                          "lastAttemptUin": None, "lastAttemptAt": 0, "nextMainItem": 0,
+                      }}
         self.db.execute(
             "INSERT INTO cursors(connector_id,profile,value) VALUES(?,?,?) "
             "ON CONFLICT(connector_id,profile) DO UPDATE SET value=excluded.value",
@@ -1520,6 +1523,10 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(adapter_calls[0]["driver"], "wechat")
         self.assertNotIn("cursor", adapter_calls[0])
         self.assertNotIn("cursor", completions[-1])
+        wechat_cursor = json.loads(self.db.execute(
+            "SELECT value FROM cursors WHERE connector_id='connector-b' AND profile='secondary'"
+        ).fetchone()[0])
+        self.assertNotIn("qqConfirmedSendReads", wechat_cursor)
 
     def test_leased_command_passes_driver_canonical_target_and_authorization(self):
         cursor = self.save_cursor()
@@ -1579,6 +1586,273 @@ class DeviceRuntimeTests(unittest.TestCase):
         completion = next(payload for payload in completions if payload and "result" in payload)
         self.assertEqual(completion["result"]["externalId"], "primary:qq-message:9007199254740993")
         self.assertEqual(json.loads(completion["result"]["receipt"])["sourceId"], "9007199254740993")
+
+    def test_verified_qq_send_registers_priority_read_with_latest_cursor_atomically(self):
+        cursor = self.save_cursor()
+        trace = []
+        self.db.set_trace_callback(trace.append)
+        adapter_calls = []
+
+        def adapter(_request):
+            adapter_calls.append(True)
+            latest = dict(cursor, conversations={"conversation-aaaaaaaa": {"head": "new-head"}},
+                          next={"page": 17}, sweep={"active": False})
+            self.db.execute(
+                "UPDATE cursors SET value=? WHERE connector_id=? AND profile=?",
+                (runtime.compact(latest), "connector-a", "primary"),
+            )
+            self.db.commit()
+            return qq_receipt_result()
+
+        relay = runtime.Relay(
+            self.config, self.db, adapter,
+            lambda *_args: {"ok": True},
+        )
+        command = {
+            "id": "priority-command", "leaseToken": "priority-lease",
+            "idempotencyKey": "priority-key",
+            "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "sent"},
+        }
+        relay.process_command(command, "primary")
+
+        stored = json.loads(self.db.execute(
+            "SELECT value FROM cursors WHERE connector_id='connector-a' AND profile='primary'"
+        ).fetchone()[0])
+        self.assertEqual(stored["conversations"], {"conversation-aaaaaaaa": {"head": "new-head"}})
+        self.assertEqual(stored["next"], {"page": 17})
+        self.assertEqual(stored["sweep"], {"active": False})
+        self.assertEqual(stored["qqConfirmedSendReads"], [{
+            "ownerUin": "1234", "alias": "conversation-aaaaaaaa",
+            "sourceId": "9007199254740993", "remainingAttempts": 3,
+        }])
+        ledger = self.db.execute(
+            "SELECT state,result FROM command_ledger WHERE connector_id='connector-a' AND idempotency_key='priority-key'"
+        ).fetchone()
+        self.assertEqual(ledger[0], "done")
+        self.assertTrue(json.loads(ledger[1])["ok"])
+        self.assertEqual(adapter_calls, [True])
+        transaction = trace[trace.index("BEGIN IMMEDIATE", max(
+            index for index, statement in enumerate(trace) if statement == "BEGIN IMMEDIATE")):]
+        completed = next(i for i, statement in enumerate(transaction)
+                         if statement.startswith("UPDATE command_ledger SET state='done'"))
+        cursor_update = next(i for i, statement in enumerate(transaction)
+                             if statement.startswith("UPDATE cursors SET value="))
+        commit = transaction.index("COMMIT")
+        self.assertLess(completed, cursor_update)
+        self.assertLess(cursor_update, commit)
+
+    def test_priority_read_requires_verified_qq_and_matching_owner(self):
+        cases = (
+            ("bad-receipt", {"owner": "1234", "qdc_owner": None}, "reject"),
+            ("missing-owner", {"owner": None, "qdc_owner": None}, "accept"),
+            ("owner-conflict", {"owner": "1234", "qdc_owner": "5678"}, "accept"),
+        )
+        for index, (label, owners, receipt_mode) in enumerate(cases):
+            with self.subTest(label=label):
+                self.db.execute("DELETE FROM cursors")
+                cursor = {"version": 1, "conversations": {"page": index}}
+                if owners["owner"] is not None:
+                    cursor["qqFriendDirectory"] = {
+                        "version": "qfd1", "ownerUin": owners["owner"], "entries": [],
+                        "lastAttemptUin": None, "lastAttemptAt": 0, "nextMainItem": 0,
+                    }
+                if owners["qdc_owner"] is not None:
+                    cursor["qqDiscoveryCache"] = [
+                        "qdc3", "primary", 42, False, 3600, 1, owners["qdc_owner"], [],
+                    ]
+                if label == "missing-owner":
+                    cursor["qqConfirmedSendReads"] = {"malformed": True}
+                self.save_cursor(cursor=cursor)
+                result = qq_receipt_result()
+                if receipt_mode == "reject":
+                    result["externalId"] = "primary:qq-message:1"
+                adapter_calls = []
+                relay = runtime.Relay(
+                    self.config, self.db,
+                    lambda _request: adapter_calls.append(True) or result,
+                    lambda *_args: {"ok": True},
+                )
+                command = {
+                    "id": f"priority-negative-{index}", "leaseToken": "lease",
+                    "idempotencyKey": f"priority-negative-key-{index}",
+                    "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "sent"},
+                }
+                relay.process_command(command, "primary")
+                stored = json.loads(self.db.execute(
+                    "SELECT value FROM cursors WHERE connector_id='connector-a' AND profile='primary'"
+                ).fetchone()[0])
+                self.assertNotIn("qqConfirmedSendReads", stored)
+                if receipt_mode == "reject":
+                    self.assertEqual(stored["conversations"], {"page": index})
+                    self.assertTrue(json.loads(self.db.execute(
+                        "SELECT result FROM command_ledger WHERE idempotency_key=?",
+                        (f"priority-negative-key-{index}",),
+                    ).fetchone()[0])["uncertain"])
+                else:
+                    self.assertTrue(json.loads(self.db.execute(
+                        "SELECT result FROM command_ledger WHERE idempotency_key=?",
+                        (f"priority-negative-key-{index}",),
+                    ).fetchone()[0])["ok"])
+                self.assertEqual(adapter_calls, [True])
+
+    def test_priority_read_uses_profile_scoped_qdc3_and_updates_only_active_connector(self):
+        self.config["connectors"].append({
+            "id": "connector-b", "token": "y" * 40, "kind": "qq",
+            "accountLabel": "other", "displayName": "other", "profile": "secondary",
+        })
+        first = self.save_cursor(cursor={"version": 1, "conversations": {"keep": "a"}})
+        second = {
+            "version": 1, "conversations": {"keep": "b"},
+            "qqDiscoveryCache": [
+                "qdc3", "secondary", 42, False, 3600, 1, "987654321", [],
+            ],
+        }
+        self.save_cursor(connector_id="connector-b", profile="secondary", cursor=second)
+        result = qq_receipt_result()
+        result["externalId"] = "secondary:qq-message:9007199254740993"
+        relay = runtime.Relay(self.config, self.db,
+                              lambda _request: result, lambda *_args: {"ok": True})
+        relay.select_connector(self.config["connectors"][1])
+        command = {
+            "id": "priority-scope", "leaseToken": "lease", "idempotencyKey": "priority-scope-key",
+            "payload": {"externalConversationId": "secondary:conversation-bbbbbbbb", "body": "sent"},
+        }
+        relay.process_command(command, "secondary")
+        primary_after = json.loads(self.db.execute(
+            "SELECT value FROM cursors WHERE connector_id='connector-a' AND profile='primary'"
+        ).fetchone()[0])
+        secondary_after = json.loads(self.db.execute(
+            "SELECT value FROM cursors WHERE connector_id='connector-b' AND profile='secondary'"
+        ).fetchone()[0])
+        self.assertEqual(primary_after, first)
+        self.assertEqual(secondary_after["conversations"], {"keep": "b"})
+        self.assertEqual(secondary_after["qqConfirmedSendReads"], [{
+            "ownerUin": "987654321", "alias": "conversation-bbbbbbbb",
+            "sourceId": "9007199254740993", "remainingAttempts": 3,
+        }])
+
+    def test_priority_read_drops_malformed_queue_and_keeps_latest_target_once(self):
+        cursor = self.save_cursor()
+        cursor["qqConfirmedSendReads"] = [{"ownerUin": "1234", "alias": "bad"}]
+        cursor["scanAnchor"] = {"before": "keep"}
+        self.save_cursor(cursor=cursor)
+        command = {
+            "id": "priority-malformed", "leaseToken": "lease",
+            "idempotencyKey": "priority-malformed-key",
+            "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "sent"},
+        }
+        calls = []
+        relay = runtime.Relay(
+            self.config, self.db,
+            lambda _request: calls.append(True) or qq_receipt_result(),
+            lambda *_args: {"ok": True},
+        )
+        relay.process_command(command, "primary")
+        updated = json.loads(self.db.execute(
+            "SELECT value FROM cursors WHERE connector_id='connector-a' AND profile='primary'"
+        ).fetchone()[0])
+        self.assertEqual(updated["scanAnchor"], {"before": "keep"})
+        self.assertEqual(len(updated["qqConfirmedSendReads"]), 1)
+        self.assertEqual(updated["qqConfirmedSendReads"][0]["sourceId"], "9007199254740993")
+        relay.process_command(command, "primary")
+        unchanged = json.loads(self.db.execute(
+            "SELECT value FROM cursors WHERE connector_id='connector-a' AND profile='primary'"
+        ).fetchone()[0])
+        self.assertEqual(len(unchanged["qqConfirmedSendReads"]), 1)
+        self.assertEqual(calls, [True])
+
+    def test_priority_read_replaces_duplicate_in_place_and_evicts_oldest_at_capacity(self):
+        cursor = self.save_cursor()
+        cursor["qqConfirmedSendReads"] = [
+            {"ownerUin": "1234", "alias": f"conversation-{index:08x}",
+             "sourceId": str(index + 1), "remainingAttempts": 1}
+            for index in range(runtime.MAX_QQ_CONFIRMED_SEND_READS)
+        ]
+        cursor["qqConfirmedSendReads"][3]["alias"] = "conversation-aaaaaaaa"
+        self.save_cursor(cursor=cursor)
+        command = {
+            "id": "priority-capacity", "leaseToken": "lease",
+            "idempotencyKey": "priority-capacity-key",
+            "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "sent"},
+        }
+        relay = runtime.Relay(self.config, self.db, lambda _request: qq_receipt_result(),
+                              lambda *_args: {"ok": True})
+        relay.process_command(command, "primary")
+        queue = json.loads(self.db.execute(
+            "SELECT value FROM cursors WHERE connector_id='connector-a' AND profile='primary'"
+        ).fetchone()[0])["qqConfirmedSendReads"]
+        self.assertEqual(len(queue), runtime.MAX_QQ_CONFIRMED_SEND_READS)
+        self.assertEqual(queue[0]["alias"], "conversation-00000000")
+        self.assertEqual(queue[2]["alias"], "conversation-00000002")
+        self.assertEqual(queue[3]["alias"], "conversation-aaaaaaaa")
+        self.assertEqual(queue[3]["sourceId"], "9007199254740993")
+        self.assertEqual(queue[3]["remainingAttempts"], 3)
+        other = {
+            "id": "priority-capacity-second", "leaseToken": "lease",
+            "idempotencyKey": "priority-capacity-key-second",
+            "payload": {"externalConversationId": "primary:conversation-bbbbbbbb", "body": "sent"},
+        }
+        relay.process_command(other, "primary")
+        queue = json.loads(self.db.execute(
+            "SELECT value FROM cursors WHERE connector_id='connector-a' AND profile='primary'"
+        ).fetchone()[0])["qqConfirmedSendReads"]
+        self.assertEqual(len(queue), runtime.MAX_QQ_CONFIRMED_SEND_READS)
+        self.assertEqual(queue[0]["alias"], "conversation-00000001")
+        self.assertEqual(queue[-1]["alias"], "conversation-bbbbbbbb")
+
+    def test_priority_read_respects_cursor_byte_limit_without_changing_send_result(self):
+        base = {"version": 1, "conversations": {},
+                "qqFriendDirectory": {
+                    "version": "qfd1", "ownerUin": "1234", "entries": [],
+                    "lastAttemptUin": None, "lastAttemptAt": 0, "nextMainItem": 0,
+                }}
+        overhead = len(runtime.compact(dict(base, padding="")).encode("utf-8"))
+        cursor = dict(base, padding="x" * (runtime.MAX_CURSOR_BYTES - overhead - 4))
+        self.assertLessEqual(len(runtime.compact(cursor).encode("utf-8")), runtime.MAX_CURSOR_BYTES)
+        self.save_cursor(cursor=cursor)
+        command = {
+            "id": "priority-size", "leaseToken": "lease", "idempotencyKey": "priority-size-key",
+            "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "sent"},
+        }
+        relay = runtime.Relay(self.config, self.db, lambda _request: qq_receipt_result(),
+                              lambda *_args: {"ok": True})
+        relay.process_command(command, "primary")
+        stored = self.db.execute(
+            "SELECT value FROM cursors WHERE connector_id='connector-a' AND profile='primary'"
+        ).fetchone()[0]
+        self.assertEqual(stored, runtime.compact(cursor))
+        ledger = self.db.execute(
+            "SELECT state,result FROM command_ledger WHERE idempotency_key='priority-size-key'"
+        ).fetchone()
+        self.assertEqual(ledger[0], "done")
+        self.assertTrue(json.loads(ledger[1])["ok"])
+
+    def test_priority_cursor_write_failure_does_not_undo_confirmed_send(self):
+        cursor = self.save_cursor()
+        old_value = runtime.compact(cursor)
+        self.db.execute(
+            "CREATE TRIGGER reject_priority_cursor BEFORE UPDATE OF value ON cursors "
+            "WHEN instr(NEW.value,'qqConfirmedSendReads')>0 "
+            "BEGIN SELECT RAISE(ABORT,'priority metadata unavailable'); END"
+        )
+        self.db.commit()
+        command = {
+            "id": "priority-write-failure", "leaseToken": "lease",
+            "idempotencyKey": "priority-write-failure-key",
+            "payload": {"externalConversationId": "primary:conversation-aaaaaaaa", "body": "sent"},
+        }
+        relay = runtime.Relay(self.config, self.db, lambda _request: qq_receipt_result(),
+                              lambda *_args: {"ok": True})
+        relay.process_command(command, "primary")
+        stored = self.db.execute(
+            "SELECT value FROM cursors WHERE connector_id='connector-a' AND profile='primary'"
+        ).fetchone()[0]
+        ledger = self.db.execute(
+            "SELECT state,result FROM command_ledger WHERE idempotency_key='priority-write-failure-key'"
+        ).fetchone()
+        self.assertEqual(stored, old_value)
+        self.assertEqual(ledger[0], "done")
+        self.assertTrue(json.loads(ledger[1])["ok"])
 
     def test_qq_receipt_mismatch_is_terminal_uncertain(self):
         self.save_cursor()
