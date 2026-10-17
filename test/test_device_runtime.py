@@ -48,7 +48,11 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.db = runtime.open_database(self.db_path)
         self.inactive_monitors = []
 
-        def inactive_monitor(_path):
+        # Keep ordinary relay fixtures platform-neutral; Darwin bootstrap has a dedicated test below.
+        self.platform_patch = patch.object(runtime.device_activity.platform, "system", return_value="Windows")
+        self.platform_patch.start()
+
+        def inactive_monitor(_path, **_kwargs):
             monitor = runtime.device_activity.InactiveHostMonitor()
             self.inactive_monitors.append(monitor)
             return monitor
@@ -59,6 +63,7 @@ class DeviceRuntimeTests(unittest.TestCase):
 
     def tearDown(self):
         self.activity_factory_patch.stop()
+        self.platform_patch.stop()
         for monitor in self.inactive_monitors:
             monitor.stop()
         self.db.close()
