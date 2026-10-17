@@ -125,7 +125,7 @@ jobs:
             -arch arm64 -miphoneos-version-min=15.0 -isysroot "$sdk" \
             "$out/hid-activity-diagnostic-main.o" \
             "$out/hid-activity-diagnostic-event-tree.o" \
-            -Wl,-framework,CoreFoundation,-framework,IOKit -ldl -lm \
+            -Wl,-framework,CoreFoundation -ldl -lm \
             -o "$out/hid-activity-diagnostic"
           if ! command -v ldid >/dev/null 2>&1; then
             brew install ldid
