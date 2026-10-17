@@ -22,3 +22,6 @@
 - Implemented strict QQ canonical signal allowlist at `scan_profile` boundary.
 - Added metadata and negative-path tests; no device/cloud access.
 - Targeted host suites pass; pending commit for parent integration.
+
+- Reviewed qdc4 cache validation and native helper/source lifecycle read-only.
+- Recorded timeout/throw cleanup containment as a falsifiable hypothesis; no device/cloud access and no production change.

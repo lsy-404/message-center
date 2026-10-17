@@ -15,3 +15,13 @@
 The generic DirtyHint watcher remains path-agnostic. The QQ scan boundary now accepts only the canonical JBROOT-derived `signals/changed.json` and `signals` pair, verifies no symlink at each accepted node, and checks root-owned 0755 state plus mobile-owned 0700/0600 signal state. Invalid or missing metadata clears the watcher after a durable scan, allowing a later valid scan to restore it. The receive-hint field is removed before cursor/outbox persistence, so local paths do not enter durable state.
 
 Host evidence: `test_device_runtime.py` passed 121 tests (2 skipped); `test_device_runtime_dirty_hint.py` passed 8 tests. Added positive canonical metadata, arbitrary-path rejection/clear, and symlinked-signal-directory rejection coverage.
+
+## Private QQ native lifecycle review
+
+The current qdc4 discovery cache is recognized by `native_helper.py`; the older qdc1-only diagnostic is stale evidence. A 60-second cache TTL can increase full discovery work during 60-second inactive scans, but there is no evidence here that it caused the QQ exit.
+
+The source has a real timeout containment gap to verify: `runGatedNativePage` delivers a timeout before `canFinishNativeWork()` becomes true. If the native callback never arrives, `queueCleanup()` returns while the outer helper can proceed to unload/detach. Synchronous native throw without a callback similarly delivers `native-page-invocation-uncertain` without queueing cleanup. The associated query token is process-scoped, so a leaked token should be observable on the next helper as `native-query-busy` with the existing pending diagnostic. No claim of root cause is made without that sequence.
+
+Existing build_scan tail only recognizes pending gate state after a later readPage call; it does not keep a timed-out native operation alive and does not prevent helper unload. `Script.pin` is released only in the deferred cleanup path and is not an external helper keepalive contract. The minimum safe direction is to make helper lifetime conditional on native cleanup completion, with one bounded containment path for an unresolved operation; never eternalize every scan.
+
+Required phase evidence: target PID, helper stages through unload/detach/close, dispatch state, cleanup code, and the existing pending snapshot fields (operation, stage, callbackSeen, nativeFrames, parserTasks, nativeCallOutcome, nativeCallErrorClass, cleanupReason). Distinguish helper attach failure (`dispatch=not_started`) from JS/native page failure.
