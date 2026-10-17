@@ -19,6 +19,7 @@ import urllib.request
 
 from conversation_profiles import sync_profiles, sync_sender_avatars
 import device_activity
+import dirty_hint
 
 if os.name == "posix":
     import fcntl
@@ -465,7 +466,7 @@ def wake_error_category(error):
 
 class Relay:
     def __init__(self, config, db=None, adapter_call=None, http_call=None,
-                 activity_monitor=None):
+                 activity_monitor=None, dirty_watcher=None):
         self.config = config
         self.db = db or open_database(config["database"])
         self.adapter_call = adapter_call or (
@@ -551,6 +552,7 @@ class Relay:
         self.activity_fresh_required = set()
         self.activity_resume_pending = False
         self.activity_resume_token = None
+        self.dirty_watcher = dirty_watcher if dirty_watcher is not None else dirty_hint.DirtyHint()
 
     def activity_state(self):
         try:
@@ -592,6 +594,10 @@ class Relay:
         return self.activity_state()["shouldPause"]
 
     def close(self):
+        try:
+            self.dirty_watcher.close()
+        except Exception:
+            pass
         try:
             self.activity_monitor.stop()
         except Exception:
@@ -959,6 +965,7 @@ class Relay:
             return None
         if not isinstance(result, dict):
             raise RuntimeError("invalid_scan_result")
+        receive_hint_paths = result.pop("receiveHintPaths", None)
         source_read_ok = result.get("sourceReadOk")
         if type(source_read_ok) is not bool:
             raise RuntimeError("invalid_scan_result")
@@ -1124,6 +1131,8 @@ class Relay:
         except Exception:
             self.db.rollback()
             raise
+        if driver == "qq" and receive_hint_paths is not None:
+            self.dirty_watcher.set_paths(receive_hint_paths)
         active = result.get("active") is True
         self.scan_interval[self.connector] = 15 if result.get("more") is True else (60 if active else 300)
         self.source_read_succeeded(self.connector)
@@ -1630,6 +1639,7 @@ class Relay:
                 self.send_heartbeat(connector_id, heartbeat_state)
             except Exception:
                 break
+        self.dirty_watcher.poll(0)
         for connector in self.connectors:
             self.select_connector(connector)
             profile = connector["profile"]
@@ -1637,7 +1647,10 @@ class Relay:
             ready = self.ensure_active()
             activity_paused = self.activity_paused()
             force_scan = self.auto_wake and ready and connector_id in self.wake_scan_pending
-            scan_due = (time.monotonic() - self.last_scan[connector_id] >= self.scan_interval[connector_id])
+            dirty_generation = (self.dirty_watcher.due_generation()
+                                if connector.get("kind") == "qq" else None)
+            scan_due = (time.monotonic() - self.last_scan[connector_id] >= self.scan_interval[connector_id]
+                        or dirty_generation is not None)
             scan_allowed = (not activity_paused and
                             (ready if self.auto_wake else self.eligible(connector_id)))
             scan_retry_allowed = (force_scan or time.monotonic() >= self.wake_scan_retry_at[connector_id])
@@ -1646,10 +1659,13 @@ class Relay:
                     (force_scan or scan_due)):
                 backpressured = False
                 try:
+                    self.dirty_watcher.scan_started()
                     scan_health = self.scan_profile(profile)
                     if scan_health is None:
                         backpressured = True
                     else:
+                        if dirty_generation is not None:
+                            self.dirty_watcher.acknowledge(dirty_generation)
                         self.health[connector_id] = scan_health
                         self.last_scan[connector_id] = time.monotonic()
                         self.activity_fresh_required.discard(connector_id)
@@ -1772,7 +1788,7 @@ def main(argv):
                 relay.register_connectors()
                 relay.pass_once()
                 backoff = 1
-                time.sleep(15)
+                relay.dirty_watcher.wait(15)
             except KeyboardInterrupt:
                 return
             except Exception:

@@ -172,6 +172,153 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM cursors").fetchone()[0], 1)
 
+    def test_receive_hint_paths_are_local_and_published_only_after_durable_scan(self):
+        class Watcher:
+            def __init__(self):
+                self.paths = None
+                self.closed = False
+
+            def set_paths(self, paths):
+                self.paths = paths
+
+            def close(self):
+                self.closed = True
+
+        paths = ["/private/container/nt_msg.db", "/private/container/nt_msg.db-wal",
+                 "/private/container"]
+        result = {"ok": True, "sourceReadOk": True, "health": "online",
+                  "cursor": {"next": "2"}, "messages": [self.event("new-1")],
+                  "receiveHintPaths": paths}
+        watcher = Watcher()
+        relay = runtime.Relay(self.config, self.db, lambda _: result,
+                              dirty_watcher=watcher)
+        relay.scan_profile("primary")
+        self.assertEqual(watcher.paths, paths)
+        self.assertNotIn("receiveHintPaths", result)
+        self.assertNotIn("receiveHintPaths", json_cursor(self.db))
+        stored_body = self.db.execute("SELECT body FROM outbox").fetchone()[0]
+        self.assertNotIn("/private/container", stored_body)
+        relay.close()
+        self.assertTrue(watcher.closed)
+
+    def test_receive_hint_paths_are_not_activated_for_failed_scan(self):
+        class Watcher:
+            def __init__(self):
+                self.paths = None
+
+            def set_paths(self, paths):
+                self.paths = paths
+
+            def close(self):
+                pass
+
+        watcher = Watcher()
+        result = {"ok": True, "sourceReadOk": False, "health": "offline",
+                  "cursor": {"next": "2"}, "messages": [],
+                  "receiveHintPaths": ["/private/container/nt_msg.db"]}
+        relay = runtime.Relay(self.config, self.db, lambda _: result,
+                              dirty_watcher=watcher)
+        with self.assertRaises(runtime.SourceReadError):
+            relay.scan_profile("primary")
+        self.assertIsNone(watcher.paths)
+        self.assertNotIn("receiveHintPaths", result)
+
+    def test_dirty_scan_ack_requires_durable_scan_and_never_bypasses_existing_gates(self):
+        class Watcher:
+            def __init__(self):
+                self.generation = 9
+                self.acknowledged = []
+                self.started = 0
+
+            def poll(self, _timeout):
+                pass
+
+            def due_generation(self):
+                return self.generation
+
+            def scan_started(self):
+                self.started += 1
+
+            def acknowledge(self, generation):
+                self.acknowledged.append(generation)
+
+            def set_paths(self, _paths):
+                pass
+
+            def close(self):
+                pass
+
+        watcher = Watcher()
+        result = {"ok": True, "sourceReadOk": True, "health": "online",
+                  "cursor": {"next": "2"}, "messages": []}
+        adapter_calls = []
+        order = []
+        relay = runtime.Relay(self.config, self.db,
+                              lambda request: (order.append("scan"), adapter_calls.append(request), result)[2],
+                              lambda *_args: {"commands": []}, dirty_watcher=watcher)
+        flush_results = iter(("connector-a", None))
+        relay.flush_one = lambda: (order.append("outbox"), next(flush_results))[1]
+        relay.ensure_active = lambda: True
+        relay.activity_paused = lambda: False
+        relay.send_heartbeat = lambda *_args: None
+        relay.pass_once()
+        self.assertEqual(watcher.acknowledged, [9])
+        self.assertEqual(watcher.started, 1)
+        self.assertEqual(len(adapter_calls), 1)
+        self.assertEqual(order, ["outbox", "outbox", "scan"])
+
+        blocked_watcher = Watcher()
+        blocked_calls = []
+        blocked = runtime.Relay(self.config, self.db,
+                                lambda request: blocked_calls.append(request) or result,
+                                lambda *_args: {"commands": []}, dirty_watcher=blocked_watcher)
+        blocked.flush_one = lambda: None
+        blocked.ensure_active = lambda: True
+        blocked.activity_paused = lambda: False
+        blocked.eligible = lambda _connector_id: False
+        blocked.send_heartbeat = lambda *_args: None
+        blocked.pass_once()
+        self.assertEqual(blocked_calls, [])
+        self.assertEqual(blocked_watcher.acknowledged, [])
+
+        capacity_watcher = Watcher()
+        capacity = runtime.Relay(self.config, self.db, lambda _request: result,
+                                 lambda *_args: {"commands": []},
+                                 dirty_watcher=capacity_watcher)
+        capacity.flush_one = lambda: None
+        capacity.ensure_active = lambda: True
+        capacity.activity_paused = lambda: False
+        capacity.send_heartbeat = lambda *_args: None
+        capacity.scan_profile = lambda _profile: None
+        capacity.pass_once()
+        self.assertEqual(capacity_watcher.acknowledged, [])
+
+        wake_config = dict(self.config, autoWake=True)
+        sleeping_watcher = Watcher()
+        sleeping_calls = []
+        sleeping = runtime.Relay(wake_config, self.db,
+                                 lambda request: sleeping_calls.append(request) or result,
+                                 lambda *_args: {"commands": []},
+                                 dirty_watcher=sleeping_watcher)
+        sleeping.flush_one = lambda: None
+        sleeping.ensure_active = lambda: False
+        sleeping.activity_paused = lambda: False
+        sleeping.send_heartbeat = lambda *_args: None
+        sleeping.pass_once()
+        self.assertEqual(sleeping_calls, [])
+        self.assertEqual(sleeping_watcher.acknowledged, [])
+
+        failed_watcher = Watcher()
+        failed = runtime.Relay(self.config, self.db,
+                               lambda _request: (_ for _ in ()).throw(RuntimeError("read failed")),
+                               lambda *_args: {"commands": []}, dirty_watcher=failed_watcher)
+        failed.flush_one = lambda: None
+        failed.ensure_active = lambda: True
+        failed.activity_paused = lambda: False
+        failed.send_heartbeat = lambda *_args: None
+        failed.pass_once()
+        self.assertEqual(failed_watcher.acknowledged, [])
+
     def test_failed_native_read_does_not_commit_cursor_messages_or_profiles(self):
         self.db.execute(
             "INSERT INTO cursors(connector_id,profile,value) VALUES(?,?,?)",
