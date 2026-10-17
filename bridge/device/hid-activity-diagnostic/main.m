@@ -20,7 +20,7 @@
 #define MC_MAX_EVENTS 25000
 
 typedef void (*mc_hid_callback)(void *, void *, void *, void *);
-typedef void *(*mc_create_fn)(void *, int, void *);
+typedef void *(*mc_create_fn)(CFAllocatorRef, int, CFDictionaryRef);
 typedef void (*mc_register_fn)(void *, mc_hid_callback, void *, void *);
 typedef void (*mc_client_fn)(void *);
 typedef void (*mc_runloop_fn)(void *, CFRunLoopRef, CFStringRef);
