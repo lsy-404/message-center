@@ -79,3 +79,5 @@
 
 | 221 | [BugFix] QQ sticker content and quote preview | Render explicitly classified QQ stickers within a compact display box, validate inbound attachment bytes and preserve structured quote content | Image stickers can render at full image size and attachment/reply metadata must cross Worker/UI boundaries safely | 🔄 Public changes locally verified; native image discovery and browser proof remain with root |
 | 216 | [Feature] device-human-idle | Monitor HOME and digitizer activity on-device; pause scans, commands, and auto-wake until a continuous 180-second idle interval | Protect human app use while resuming safe QQ collection after idle; retain outbox delivery | 🔄 In progress |
+
+| 222 | [Diagnostic] HID touch entitlement probe | Build a short-lived iOS event-type monitor carrying only the private HID event-monitor entitlement | Test whether entitlement filtering explains missing touch callback types without changing production processes | 🔄 In progress |
