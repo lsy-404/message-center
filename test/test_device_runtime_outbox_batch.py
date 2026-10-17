@@ -230,12 +230,12 @@ class DeviceRuntimeOutboxBatchTests(unittest.TestCase):
         relay = self.make_relay(lambda *_args: {})
         calls = []
         for ack in ack_failures:
-            relay.retry_at["connector-a"] = 0
+            relay.outbox_retry_at["connector-a"] = 0
             relay.http_call = lambda _method, _path, payload=None, response=ack: calls.append(
                 [item["externalId"] for item in payload["messages"]]) or response
             self.assertIsNone(relay.flush_one())
             self.assertEqual(self.outbox_ids(), ["retry-a", "retry-b", "retry-c"])
-        relay.retry_at["connector-a"] = 0
+        relay.outbox_retry_at["connector-a"] = 0
         def replay_ack(_method, _path, payload=None):
             calls.append([item["externalId"] for item in payload["messages"]])
             return self.event_ack(3, inserted=0, upgraded=1, promoted=1)

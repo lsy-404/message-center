@@ -526,6 +526,8 @@ class Relay:
         self.flush_next_index = 0
         self.failures = {item["id"]: 0 for item in self.connectors}
         self.retry_at = {item["id"]: 0 for item in self.connectors}
+        self.outbox_failures = {item["id"]: 0 for item in self.connectors}
+        self.outbox_retry_at = {item["id"]: 0 for item in self.connectors}
         self.heartbeat_failures = {item["id"]: 0 for item in self.connectors}
         self.heartbeat_retry_at = {item["id"]: 0 for item in self.connectors}
         self.heartbeat_last_state = {item["id"]: None for item in self.connectors}
@@ -639,6 +641,18 @@ class Relay:
     def succeeded(self, connector_id):
         self.failures[connector_id] = 0
         self.retry_at[connector_id] = 0
+
+    def outbox_eligible(self, connector_id):
+        return time.monotonic() >= self.outbox_retry_at[connector_id]
+
+    def outbox_failed(self, connector_id):
+        count = self.outbox_failures[connector_id] + 1
+        self.outbox_failures[connector_id] = count
+        self.outbox_retry_at[connector_id] = time.monotonic() + min(15 * (2 ** min(count - 1, 5)), 300)
+
+    def outbox_succeeded(self, connector_id):
+        self.outbox_failures[connector_id] = 0
+        self.outbox_retry_at[connector_id] = 0
 
     def persist_source_state(self, connector_id):
         try:
@@ -1279,7 +1293,7 @@ class Relay:
         for index in order:
             connector = self.connectors[index]
             connector_id = connector["id"]
-            if not self.eligible(connector_id):
+            if not self.outbox_eligible(connector_id):
                 continue
             row = self.db.execute("SELECT seq,profile,external_id,body,size FROM outbox "
                                   "WHERE connector_id=? ORDER BY seq LIMIT 1",
@@ -1302,7 +1316,7 @@ class Relay:
                                           {"connectorId": connector_id, "messages": messages})
                 self._validate_event_ack(path, response, len(rows))
             except Exception:
-                self.failed(connector_id)
+                self.outbox_failed(connector_id)
                 continue
             self._delete_outbox_prefix(connector_id, rows)
             for attachment in attachments:
@@ -1310,7 +1324,7 @@ class Relay:
                     os.remove(os.path.join(self.media_directory_for(connector_id), attachment["stagingKey"]))
                 except OSError:
                     pass
-            self.succeeded(connector_id)
+            self.outbox_succeeded(connector_id)
             self.flush_next_index = (index + 1) % count
             return connector_id
         return None
@@ -1605,7 +1619,6 @@ class Relay:
                 self.send_heartbeat(connector_id, heartbeat_state)
             except Exception:
                 break
-        pending_connectors = {row[0] for row in self.db.execute("SELECT DISTINCT connector_id FROM outbox")}
         for connector in self.connectors:
             self.select_connector(connector)
             profile = connector["profile"]
@@ -1617,7 +1630,7 @@ class Relay:
             scan_allowed = (not activity_paused and
                             (ready if self.auto_wake else self.eligible(connector_id)))
             scan_retry_allowed = (force_scan or time.monotonic() >= self.wake_scan_retry_at[connector_id])
-            if (connector_id not in pending_connectors and scan_allowed and scan_retry_allowed and
+            if (scan_allowed and scan_retry_allowed and
                     time.time() >= self.source_settle_until[connector_id] and
                     (force_scan or scan_due)):
                 backpressured = False
