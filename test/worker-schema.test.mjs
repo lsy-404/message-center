@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 import worker from '../cloudflare-worker/worker/index.js';
 import { createAdminTestAuth } from './helpers/oidc-fixture.mjs';
 import { testLateInboundImageReplay } from './inbound-late-attachment.test.mjs';
+import { testQuoteReplay } from './quote-replay.test.mjs';
 
 const stamp = new Date().toISOString();
 const freshMigrationDatabase = new DatabaseSync(':memory:');
@@ -1990,6 +1991,8 @@ assert.equal(database.prepare(`
 assert.deepEqual({ ...database.prepare(`
   SELECT state, last_seen_at, updated_at FROM connector_instances WHERE id = ?
 `).get(connectorId) }, { state: 'offline', last_seen_at: authoritativeLastSeen, updated_at: authoritativeUpdatedAt });
+
+await testQuoteReplay({ database, d1, connectorId, stamp, requestEvents, requestBackups, putInboundFile });
 
 const inferredProfileResponse = await putProfile(backupMessage.conversationExternalId, { displayName: 'Backup group profile' });
 assert.equal(inferredProfileResponse.status, 201);
