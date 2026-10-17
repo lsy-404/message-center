@@ -1,6 +1,7 @@
 #define _DARWIN_C_SOURCE
 
 #include "event-tree.h"
+#include "runtime-status.h"
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
@@ -14,10 +15,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/codesign.h>
+#include <sys/types.h>
 #include <time.h>
+#include <unistd.h>
 
 #define MC_MAX_SECONDS 300
 #define MC_MAX_EVENTS 25000
+#define MC_CS_ENTITLEMENTS_VALIDATED 0x00004000u
 
 typedef void (*mc_hid_callback)(void *, void *, void *, void *);
 typedef void *(*mc_create_fn)(CFAllocatorRef, int, CFDictionaryRef);
@@ -26,6 +31,15 @@ typedef void (*mc_client_fn)(void *);
 typedef void (*mc_runloop_fn)(void *, CFRunLoopRef, CFStringRef);
 typedef uint32_t (*mc_event_type_fn)(void *);
 typedef CFArrayRef (*mc_event_children_fn)(void *);
+typedef void *(*mc_task_create_fn)(CFAllocatorRef);
+typedef CFTypeRef (*mc_task_copy_entitlement_fn)(void *, CFStringRef, CFErrorRef *);
+typedef int (*mc_csops_fn)(pid_t, unsigned int, void *, size_t);
+
+typedef struct {
+    mc_task_create_fn task_create;
+    mc_task_copy_entitlement_fn task_copy_entitlement;
+    mc_csops_fn csops;
+} mc_runtime_probe;
 
 typedef struct {
     mc_hid_event_counters counters;
@@ -110,7 +124,8 @@ static void mc_print_type_counts(const uint64_t *counts) {
 
 static void mc_print_status(const mc_monitor *monitor, bool ready, bool running,
                             double elapsed, time_t started_at, time_t ended_at,
-                            const char *stop_reason, unsigned teardown_errors) {
+                            const char *stop_reason, unsigned teardown_errors,
+                            const mc_runtime_status *runtime_status) {
     printf("{\"ready\":%s,\"running\":%s,\"startedAt\":%lld,\"endedAt\":",
            ready ? "true" : "false", running ? "true" : "false",
            (long long)started_at);
@@ -119,8 +134,10 @@ static void mc_print_status(const mc_monitor *monitor, bool ready, bool running,
     } else {
         printf("%lld", (long long)ended_at);
     }
-    printf(",\"elapsedSeconds\":%.3f,\"events\":%" PRIu64 ",\"rootTypes\":",
+    printf(",\"elapsedSeconds\":%.3f,\"events\":%" PRIu64,
            elapsed, monitor->counters.events);
+    mc_runtime_status_write_json(stdout, runtime_status);
+    fputs(",\"rootTypes\":", stdout);
     mc_print_type_counts(monitor->counters.root_types);
     fputs(",\"childTypes\":", stdout);
     mc_print_type_counts(monitor->counters.child_types);
@@ -130,6 +147,52 @@ static void mc_print_status(const mc_monitor *monitor, bool ready, bool running,
            monitor->counters.unknown_child_types,
            monitor->counters.malformed_trees, teardown_errors, stop_reason);
     fflush(stdout);
+}
+
+static bool mc_query_hid_entitlement(void *context, bool *value) {
+    mc_runtime_probe *probe = context;
+    void *task;
+    CFErrorRef error = NULL;
+    CFTypeRef result;
+    bool known = false;
+
+    if (probe == NULL || value == NULL || probe->task_create == NULL ||
+        probe->task_copy_entitlement == NULL) {
+        return false;
+    }
+    task = probe->task_create(kCFAllocatorDefault);
+    if (task == NULL) {
+        return false;
+    }
+    result = probe->task_copy_entitlement(
+        task, CFSTR("com.apple.private.hid.client.event-monitor"), &error);
+    if (error == NULL && result == NULL) {
+        *value = false;
+        known = true;
+    } else if (error == NULL && result != NULL &&
+               CFGetTypeID(result) == CFBooleanGetTypeID()) {
+        *value = CFBooleanGetValue((CFBooleanRef)result);
+        known = true;
+    }
+    if (result != NULL) {
+        CFRelease(result);
+    }
+    if (error != NULL) {
+        CFRelease(error);
+    }
+    CFRelease(task);
+    return known;
+}
+
+static bool mc_query_code_signature_entitlements(void *context, bool *value) {
+    mc_runtime_probe *probe = context;
+    uint32_t flags = 0;
+    if (probe == NULL || value == NULL || probe->csops == NULL ||
+        probe->csops(getpid(), CS_OPS_STATUS, &flags, sizeof(flags)) != 0) {
+        return false;
+    }
+    *value = (flags & MC_CS_ENTITLEMENTS_VALIDATED) != 0;
+    return true;
 }
 
 static int mc_parse_duration(int argc, char **argv, unsigned *seconds) {
@@ -156,6 +219,8 @@ int main(int argc, char **argv) {
     const char *framework_path = "/System/Library/Frameworks/IOKit.framework/IOKit";
     unsigned seconds = MC_MAX_SECONDS;
     void *io = NULL;
+    void *security = NULL;
+    void *system = NULL;
     void *client = NULL;
     CFRunLoopRef run_loop = NULL;
     CFStringRef mode = kCFRunLoopDefaultMode;
@@ -165,6 +230,8 @@ int main(int argc, char **argv) {
     mc_runloop_fn schedule_client = NULL;
     mc_runloop_fn unschedule_client = NULL;
     mc_monitor monitor = {0};
+    mc_runtime_probe runtime_probe = {0};
+    mc_runtime_status runtime_status = {0};
     bool registered = false;
     bool scheduled = false;
     bool ready = false;
@@ -204,6 +271,37 @@ int main(int argc, char **argv) {
     MC_BIND(monitor.event_children, "IOHIDEventGetChildren");
 #undef MC_BIND
 
+    security = dlopen("/System/Library/Frameworks/Security.framework/Security",
+                      RTLD_NOW | RTLD_LOCAL);
+    system = dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOW | RTLD_LOCAL);
+#define MC_BIND_OPTIONAL(handle, name, symbol) do { \
+    void *symbol_address = (handle) == NULL ? NULL : dlsym((handle), (symbol)); \
+    _Static_assert(sizeof(name) == sizeof(symbol_address), "function pointer ABI size"); \
+    if (symbol_address != NULL) { \
+        memcpy(&(name), &symbol_address, sizeof(name)); \
+    } \
+} while (0)
+    MC_BIND_OPTIONAL(security, runtime_probe.task_create, "SecTaskCreateFromSelf");
+    MC_BIND_OPTIONAL(security, runtime_probe.task_copy_entitlement,
+                     "SecTaskCopyValueForEntitlement");
+    MC_BIND_OPTIONAL(system, runtime_probe.csops, "csops");
+#undef MC_BIND_OPTIONAL
+    mc_runtime_status_read(
+        &runtime_status,
+        runtime_probe.task_create != NULL &&
+            runtime_probe.task_copy_entitlement != NULL,
+        mc_query_hid_entitlement, &runtime_probe,
+        runtime_probe.csops != NULL, mc_query_code_signature_entitlements,
+        &runtime_probe);
+    if (security != NULL) {
+        dlclose(security);
+        security = NULL;
+    }
+    if (system != NULL) {
+        dlclose(system);
+        system = NULL;
+    }
+
     client = create_client(kCFAllocatorDefault, 1, NULL);
     if (client == NULL || mode == NULL) {
         fputs("hid_activity_error: client_creation_failed\n", stderr);
@@ -234,7 +332,8 @@ int main(int argc, char **argv) {
     deadline = started_monotonic + (double)seconds;
     started_wall = time(NULL);
     ready = true;
-    mc_print_status(&monitor, true, true, 0.0, started_wall, 0, "running", 0);
+    mc_print_status(&monitor, true, true, 0.0, started_wall, 0, "running", 0,
+                    &runtime_status);
 
     while (!mc_stop_requested && !monitor.stopped_by_limit) {
         double now = mc_monotonic_seconds();
@@ -259,7 +358,7 @@ int main(int argc, char **argv) {
         now = mc_monotonic_seconds();
         mc_print_status(&monitor, true, true,
                         now < 0.0 ? (double)seconds : now - started_monotonic,
-                        started_wall, 0, "running", 0);
+                        started_wall, 0, "running", 0, &runtime_status);
     }
     if (monitor.stopped_by_limit) {
         stop_reason = "event_limit";
@@ -284,7 +383,8 @@ cleanup:
     if (ready) {
         double elapsed = mc_monotonic_seconds() - started_monotonic;
         mc_print_status(&monitor, true, false, elapsed, started_wall,
-                        time(NULL), stop_reason, teardown_errors);
+                        time(NULL), stop_reason, teardown_errors,
+                        &runtime_status);
     }
     return exit_code;
 }

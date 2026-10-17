@@ -12,6 +12,7 @@ on:
       - "test/device-native-helper-binary-output.test.c"
       - "test/device-native-helper-contract.test.mjs"
       - "test/device-hid-event-tree.test.c"
+      - "test/device-hid-runtime-status.test.c"
 
 permissions:
   contents: read
@@ -79,6 +80,16 @@ jobs:
             -o "$RUNNER_TEMP/device-hid-event-tree-test"
           "$RUNNER_TEMP/device-hid-event-tree-test"
 
+      - name: Test HID runtime status reporting
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang -std=c11 -Wall -Wextra -Werror \
+            test/device-hid-runtime-status.test.c \
+            bridge/device/hid-activity-diagnostic/runtime-status.c \
+            -o "$RUNNER_TEMP/device-hid-runtime-status-test"
+          "$RUNNER_TEMP/device-hid-runtime-status-test"
+
       - name: Test native helper lifecycle contract
         shell: bash
         run: node --test test/device-native-helper-contract.test.mjs
@@ -123,8 +134,14 @@ jobs:
             -o "$out/hid-activity-diagnostic-event-tree.o"
           xcrun --sdk iphoneos clang \
             -arch arm64 -miphoneos-version-min=15.0 -isysroot "$sdk" \
+            -std=c11 -Wall -Wextra -Werror \
+            -c bridge/device/hid-activity-diagnostic/runtime-status.c \
+            -o "$out/hid-activity-diagnostic-runtime-status.o"
+          xcrun --sdk iphoneos clang \
+            -arch arm64 -miphoneos-version-min=15.0 -isysroot "$sdk" \
             "$out/hid-activity-diagnostic-main.o" \
             "$out/hid-activity-diagnostic-event-tree.o" \
+            "$out/hid-activity-diagnostic-runtime-status.o" \
             -Wl,-framework,CoreFoundation -ldl -lm \
             -o "$out/hid-activity-diagnostic"
           if ! command -v ldid >/dev/null 2>&1; then
@@ -208,22 +225,25 @@ jobs:
           cp bridge/device/hid-activity-diagnostic/main.m "$out/hid-activity-diagnostic-main.m"
           cp bridge/device/hid-activity-diagnostic/event-tree.c "$out/hid-activity-diagnostic-event-tree.c"
           cp bridge/device/hid-activity-diagnostic/event-tree.h "$out/hid-activity-diagnostic-event-tree.h"
+          cp bridge/device/hid-activity-diagnostic/runtime-status.c "$out/hid-activity-diagnostic-runtime-status.c"
+          cp bridge/device/hid-activity-diagnostic/runtime-status.h "$out/hid-activity-diagnostic-runtime-status.h"
           cp bridge/device/hid-activity-diagnostic/entitlements.plist "$out/hid-activity-diagnostic-entitlements.plist"
           cp "$RUNNER_TEMP/hid-activity-entitlements.plist" "$out/hid-activity-diagnostic-signed-entitlements.plist"
           cp bridge/device/hid-activity-diagnostic/README.md "$out/hid-activity-diagnostic-README.md"
           cp test/device-hid-event-tree.test.c "$out/device-hid-event-tree.test.c"
+          cp test/device-hid-runtime-status.test.c "$out/device-hid-runtime-status.test.c"
           cp .frida-core-source/COPYING "$out/FRIDA-COPYING"
           printf '%s\n' \
             "Frida 16.3.3 iOS arm64 devkit SHA-256: C31AA39618A6996BF43A472F2F48E3E4C2CC72EEE101A1ED6820192CBF58BDEC" \
             "Frida source tag: 16.3.3" > "$out/BUILD-PROVENANCE.txt"
           printf '%s\n' \
             "HID diagnostic entitlement: com.apple.private.hid.client.event-monitor=true" \
-            "HID diagnostic source: hid-activity-diagnostic-main.m, hid-activity-diagnostic-event-tree.c/.h" \
+            "HID diagnostic source: hid-activity-diagnostic-main.m, hid-activity-diagnostic-event-tree.c/.h, hid-activity-diagnostic-runtime-status.c/.h" \
             "HID diagnostic is separate from the production Python runtime and native Frida helper" \
             "Repository commit: $(git rev-parse HEAD)" \
             "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)" \
             "$(xcrun --sdk iphoneos clang --version | head -n 1)" >> "$out/BUILD-PROVENANCE.txt"
-          (cd "$out" && shasum --algorithm 256 native-frida-helper main.o binary-output.o main.m binary-output.c binary-output.h README.md native-runtime-launcher native-runtime-launcher.c native-runtime-launcher-README.md hid-activity-diagnostic hid-activity-diagnostic-main.o hid-activity-diagnostic-event-tree.o hid-activity-diagnostic-main.m hid-activity-diagnostic-event-tree.c hid-activity-diagnostic-event-tree.h hid-activity-diagnostic-entitlements.plist hid-activity-diagnostic-signed-entitlements.plist hid-activity-diagnostic-README.md device-hid-event-tree.test.c FRIDA-COPYING BUILD-PROVENANCE.txt > SHA256SUMS.txt)
+          (cd "$out" && shasum --algorithm 256 native-frida-helper main.o binary-output.o main.m binary-output.c binary-output.h README.md native-runtime-launcher native-runtime-launcher.c native-runtime-launcher-README.md hid-activity-diagnostic hid-activity-diagnostic-main.o hid-activity-diagnostic-event-tree.o hid-activity-diagnostic-runtime-status.o hid-activity-diagnostic-main.m hid-activity-diagnostic-event-tree.c hid-activity-diagnostic-event-tree.h hid-activity-diagnostic-runtime-status.c hid-activity-diagnostic-runtime-status.h hid-activity-diagnostic-entitlements.plist hid-activity-diagnostic-signed-entitlements.plist hid-activity-diagnostic-README.md device-hid-event-tree.test.c device-hid-runtime-status.test.c FRIDA-COPYING BUILD-PROVENANCE.txt > SHA256SUMS.txt)
 
       - name: Upload build artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

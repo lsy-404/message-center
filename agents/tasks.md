@@ -81,6 +81,6 @@
 | 216 | [Feature] device-human-idle | Monitor HOME and digitizer activity on-device; pause scans, commands, and auto-wake until a continuous 180-second idle interval | Protect human app use while resuming safe QQ collection after idle; retain outbox delivery | 🔄 In progress |
 
 | 222 | [BugFix] QQ inbound backpressure | Separate durable outbox delivery retries from inbound source scanning while retaining bounded capacity and cursor atomicity | A single unacknowledged queue row currently blocks all new scans for its connector | ✅ Locally verified and committed |
-| 230 | [Diagnostic] HID touch entitlement probe | Build a short-lived iOS event-type monitor carrying only the private HID event-monitor entitlement | Test whether entitlement filtering explains missing touch callback types without changing production processes | 🔄 In progress |
+| 230 | [Diagnostic] HID touch entitlement probe | Build a short-lived iOS event-type monitor that reports only its own effective HID event-monitor entitlement and restricted-entitlement validation status | Distinguish runtime entitlement state from missing touch callbacks without changing production processes | 🔄 In progress |
 
 | 223 | [Feature] device-activity-mirror | Publish the exact v4 activity lease to a validated root-readable atomic mirror for the private sender | The sender needs a durable local activity guard without access to the primary 0600 runtime state | 🔄 In progress |
