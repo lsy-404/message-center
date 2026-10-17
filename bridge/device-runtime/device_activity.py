@@ -24,7 +24,7 @@ CONSUMER_USAGE_PAGE = 0x0C
 HOME_USAGE = 0x40
 STATE_VERSION = 4
 HEARTBEAT_SECONDS = 2.0
-MIRROR_STATE_PATH = "/var/mobile/Library/MessageCenterActivity/runtime.activity.json"
+MIRROR_STATE_PATH = "/private/var/MessageCenterActivity/runtime.activity.json"
 STATE_FIELDS = {
     "version", "monitorId", "runtimePid", "generation", "publishedAt",
     "healthy", "armed", "cleanupRequired", "lastActivityAt",
@@ -74,7 +74,8 @@ def _mirror_parent_metadata(path: str) -> os.stat_result:
     current = parent
     while current != os.path.dirname(current):
         current_metadata = os.lstat(current)
-        if not stat.S_ISDIR(current_metadata.st_mode) or current_metadata.st_uid != 0:
+        if (not stat.S_ISDIR(current_metadata.st_mode) or current_metadata.st_uid != 0 or
+                stat.S_IMODE(current_metadata.st_mode) & 0o022):
             raise ActivityStateError("mirror_path_component_invalid")
         current = os.path.dirname(current)
     return metadata

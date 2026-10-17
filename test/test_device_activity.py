@@ -268,7 +268,7 @@ class DeviceActivityPolicyTests(unittest.TestCase):
              patch.object(device_activity.os, "geteuid", return_value=0, create=True), \
              patch.object(device_activity.os, "lstat", return_value=fake_directory):
             self.assertIs(device_activity._mirror_parent_metadata(
-                "/var/mobile/Library/MessageCenterActivity/runtime.activity.json"),
+                "/private/var/MessageCenterActivity/runtime.activity.json"),
                 fake_directory)
 
         for metadata in (
@@ -283,7 +283,19 @@ class DeviceActivityPolicyTests(unittest.TestCase):
                  patch.object(device_activity.os, "lstat", return_value=metadata):
                 with self.assertRaises(device_activity.ActivityStateError):
                     device_activity._mirror_parent_metadata(
-                        "/var/mobile/Library/MessageCenterActivity/runtime.activity.json")
+                        "/private/var/MessageCenterActivity/runtime.activity.json")
+
+        writable_ancestor = type("Stat", (), {
+            "st_mode": device_activity.stat.S_IFDIR | 0o775,
+            "st_uid": 0, "st_dev": 1, "st_ino": 3,
+        })()
+        with patch.object(device_activity.os, "name", "posix"), \
+             patch.object(device_activity.os, "geteuid", return_value=0, create=True), \
+             patch.object(device_activity.os, "lstat",
+                          side_effect=[fake_directory, writable_ancestor]):
+            with self.assertRaises(device_activity.ActivityStateError):
+                device_activity._mirror_parent_metadata(
+                    "/private/var/MessageCenterActivity/runtime.activity.json")
 
     def test_mirror_does_not_create_or_chmod_untrusted_directory(self):
         mirror_path = os.path.join(self.temp.name, "absent", "runtime.activity.json")
