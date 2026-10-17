@@ -107,6 +107,65 @@ class DirtyHintTests(unittest.TestCase):
             self.assertEqual(watcher.due_generation(), generation)
         watcher.close()
 
+    def test_wait_wakes_when_polled_generation_is_already_due(self):
+        clock = FakeClock()
+        queue = FakeQueue()
+        watcher = self._watcher(clock, queue)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "source.db"
+            path.write_bytes(b"fixture")
+            watcher.set_paths([str(path)])
+            fd = next(iter(watcher._watched))
+            queue.events = [SimpleNamespace(ident=fd, fflags=dirty_hint.NOTE_WRITE)]
+            watcher.poll()
+            clock.advance(dirty_hint.DEBOUNCE_SECONDS + 0.1)
+            watcher.wait(0)
+            self.assertEqual(watcher._last_wake, clock())
+            self.assertEqual(watcher.due_generation(), watcher._generation)
+        watcher.close()
+
+    def test_transient_queue_failure_recovers_at_bounded_retry(self):
+        clock = FakeClock()
+        first, recovered = FakeQueue(), FakeQueue()
+        original_control = first.control
+
+        def fail_once(changes, max_events, timeout):
+            if changes is not None:
+                return original_control(changes, max_events, timeout)
+            first.control = original_control
+            raise OSError("temporary kqueue failure")
+
+        first.control = fail_once
+        queues = iter((first, recovered))
+        descriptors = {}
+        next_fd = [100]
+
+        def open_fd(path, directory):
+            next_fd[0] += 1
+            descriptors[next_fd[0]] = os.stat(path)
+            return next_fd[0]
+
+        watcher = dirty_hint.DirtyHint(
+            clock=clock, queue_factory=lambda: next(queues),
+            api=(-4, 0x21, dirty_hint.DARWIN_O_EVTONLY), open_fd=open_fd,
+            kevent_factory=lambda fd, **kwargs: SimpleNamespace(ident=fd, **kwargs),
+            fstat_fn=lambda fd: descriptors[fd], close_fd=descriptors.pop,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "source.db"
+            path.write_bytes(b"fixture")
+            self.assertTrue(watcher.set_paths([str(path)]))
+            watcher.poll()
+            self.assertTrue(watcher.available)
+            self.assertEqual(watcher._paths, (str(path),))
+            self.assertFalse(watcher._watched)
+            self.assertEqual(watcher.poll(), 0)
+            clock.advance(dirty_hint.RETRY_SECONDS)
+            self.assertEqual(watcher.poll(), 0)
+            self.assertIs(watcher._queue, recovered)
+            self.assertEqual(len(watcher._watched), 1)
+        watcher.close()
+
     def test_later_events_coalesce_without_resetting_debounce_deadline(self):
         clock = FakeClock()
         queue = FakeQueue()

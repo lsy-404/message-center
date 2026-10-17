@@ -10,6 +10,7 @@ import time
 
 MAX_WATCHED_PATHS = 3
 RECONCILE_SECONDS = 1.0
+RETRY_SECONDS = 5.0
 DEBOUNCE_SECONDS = 1.0
 MIN_SCAN_INTERVAL = 5.0
 MIN_WAKE_INTERVAL = 5.0
@@ -65,18 +66,14 @@ class DirtyHint:
         self._last_scan_started = float("-inf")
         self._last_wake = float("-inf")
         self._closed = False
-        self._unavailable = self._api is None
-        if not self._unavailable and self._queue_factory is None:
-            self._unavailable = True
-        if not self._unavailable:
-            try:
-                self._queue = self._queue_factory()
-            except (OSError, AttributeError):
-                self._unavailable = True
+        self._permanently_unavailable = self._api is None or self._queue_factory is None
+        self._retry_at = float("-inf")
+        if not self._permanently_unavailable:
+            self._ensure_queue()
 
     @property
     def available(self):
-        return not self._unavailable and not self._closed
+        return not self._permanently_unavailable and not self._closed
 
     @property
     def paths(self):
@@ -101,19 +98,16 @@ class DirtyHint:
             normalized.append(absolute)
         new_paths = tuple(normalized)
         if new_paths == self._paths:
-            return self.available
+            return self._recover()
         self._close_watched()
         self._paths = new_paths
         if not new_paths:
             self._acknowledged = self._generation
             self._dirty_at = None
             return False
-        if self._unavailable:
+        if self._permanently_unavailable:
             return False
-        try:
-            self._reconcile()
-        except (OSError, ValueError):
-            self._disable()
+        if not self._recover():
             return False
         self._mark_dirty()
         return True
@@ -121,28 +115,35 @@ class DirtyHint:
     def poll(self, timeout=0):
         if not self.available:
             return 0
+        if self._queue is None and not self._recover():
+            return 0
         try:
             events = self._queue.control(None, MAX_WATCHED_PATHS, max(0, timeout))
         except OSError:
-            self._disable()
+            self._fail_transient()
             return 0
         if events:
             self._mark_dirty(len(events))
         try:
             self._reconcile()
         except (OSError, ValueError):
-            self._disable()
+            self._fail_transient()
             return 0
         return len(events)
 
     def wait(self, timeout):
         deadline = self.clock() + max(0.0, timeout)
-        starting_generation = self._generation
         while self.available:
             now = self.clock()
+            if self._queue is None and now < self._retry_at:
+                remaining = deadline - now
+                if remaining <= 0:
+                    return
+                time.sleep(min(remaining, self._retry_at - now, RECONCILE_SECONDS))
+                continue
             self.poll(0)
-            if (self._generation != starting_generation
-                    and self.due_generation(now) is not None
+            now = self.clock()
+            if (self.due_generation(now) is not None
                     and now - self._last_wake >= MIN_WAKE_INTERVAL):
                 self._last_wake = now
                 return
@@ -207,7 +208,42 @@ class DirtyHint:
     def _disable(self):
         self._close_watched()
         self._paths = ()
-        self._unavailable = True
+        self._permanently_unavailable = True
+
+    def _ensure_queue(self):
+        if self._queue is not None:
+            return True
+        try:
+            self._queue = self._queue_factory()
+            return True
+        except (OSError, AttributeError):
+            self._retry_at = self.clock() + RETRY_SECONDS
+            return False
+
+    def _fail_transient(self):
+        self._close_watched()
+        queue, self._queue = self._queue, None
+        if queue is not None:
+            try:
+                queue.close()
+            except OSError:
+                pass
+        self._retry_at = self.clock() + RETRY_SECONDS
+
+    def _recover(self):
+        if not self.available:
+            return False
+        if self._queue is None:
+            if self.clock() < self._retry_at or not self._ensure_queue():
+                return False
+        if not self._paths:
+            return True
+        try:
+            self._reconcile()
+        except (OSError, ValueError):
+            self._fail_transient()
+            return False
+        return True
 
     def _close_watched(self):
         for fd in tuple(self._watched):
