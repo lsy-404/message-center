@@ -10,6 +10,7 @@ import stat
 import selectors
 import signal
 import sqlite3
+import tempfile
 import subprocess
 import sys
 import time
@@ -552,7 +553,8 @@ class Relay:
                 raise ValueError("invalid_connector_configuration")
         self.connector_by_id = {item["id"]: item for item in self.connectors}
         self.native_operation_state_path = self.config["database"] + ".native-operation.json"
-        self.native_operation_uncertain = self._load_native_operation_state()
+        self.native_operation_uncertain, self.native_operation_state_unavailable = (
+            self._load_native_operation_state())
         self.auto_wake = config.get("autoWake") is True
         if self.auto_wake and any(item.get("kind") != "qq" for item in self.connectors):
             raise ValueError("auto_wake_requires_qq_only")
@@ -608,33 +610,90 @@ class Relay:
         self.dirty_watcher = dirty_watcher if dirty_watcher is not None else dirty_hint.DirtyHint()
 
     def _load_native_operation_state(self):
+        descriptor = -1
         try:
-            with open(self.native_operation_state_path, "r", encoding="utf-8") as stream:
-                value = json.load(stream)
+            descriptor = os.open(self.native_operation_state_path,
+                                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                                | getattr(os, "O_CLOEXEC", 0))
+            metadata = os.fstat(descriptor)
+            if (not stat.S_ISREG(metadata.st_mode) or
+                    (os.name == "posix" and hasattr(os, "getuid")
+                     and metadata.st_uid != os.getuid()) or
+                    (os.name == "posix" and stat.S_IMODE(metadata.st_mode) != 0o600) or
+                    metadata.st_size > 4096):
+                return {}, True
+            encoded = os.read(descriptor, 4097)
+            if len(encoded) > 4096:
+                return {}, True
+            value = json.loads(encoded.decode("utf-8"))
             if (type(value) is not dict or set(value) != {"version", "entries"}
                     or value["version"] != 1 or type(value["entries"]) is not dict):
-                return {}
+                return {}, True
             result = {}
             for connector_id, entry in value["entries"].items():
                 if (connector_id in self.connector_by_id and type(entry) is int
                         and entry > 1):
                     result[connector_id] = entry
-            return result
-        except (OSError, ValueError, TypeError):
-            return {}
+                elif connector_id in self.connector_by_id:
+                    return {}, True
+            return result, False
+        except FileNotFoundError:
+            return {}, False
+        except (OSError, UnicodeDecodeError, ValueError, TypeError):
+            return {}, True
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
     def _persist_native_operation_state(self):
-        temporary = self.native_operation_state_path + ".tmp"
         payload = {"version": 1, "entries": self.native_operation_uncertain}
+        descriptor = -1
+        temporary_path = None
         try:
-            with open(temporary, "w", encoding="utf-8") as stream:
-                json.dump(payload, stream, separators=(",", ":"), allow_nan=False)
-            os.chmod(temporary, 0o600)
-            os.replace(temporary, self.native_operation_state_path)
+            parent = os.path.dirname(self.native_operation_state_path)
+            parent_info = os.lstat(parent)
+            if not stat.S_ISDIR(parent_info.st_mode) or stat.S_ISLNK(parent_info.st_mode):
+                raise OSError("invalid_state_parent")
+            encoded = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
+            if len(encoded) > 4096:
+                raise OSError("state_too_large")
+            descriptor, temporary_name = tempfile.mkstemp(prefix=".native-operation.", dir=parent)
+            temporary_path = temporary_name
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            else:
+                os.chmod(temporary_name, 0o600)
+            metadata = os.fstat(descriptor)
+            if (not stat.S_ISREG(metadata.st_mode) or
+                    (os.name == "posix" and stat.S_IMODE(metadata.st_mode) != 0o600)):
+                raise OSError("invalid_state_mode")
+            offset = 0
+            while offset < len(encoded):
+                written = os.write(descriptor, encoded[offset:])
+                if written <= 0:
+                    raise OSError("state_write_failed")
+                offset += written
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            os.replace(temporary_path, self.native_operation_state_path)
+            temporary_path = None
+            if os.name == "posix":
+                directory_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                                       | getattr(os, "O_NOFOLLOW", 0))
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            self.native_operation_state_unavailable = False
             return True
         except (OSError, TypeError, ValueError):
+            self.native_operation_state_unavailable = True
+            if descriptor >= 0:
+                os.close(descriptor)
             try:
-                os.unlink(temporary)
+                if temporary_path is not None:
+                    os.unlink(temporary_path)
             except OSError:
                 pass
             return False
@@ -646,8 +705,10 @@ class Relay:
 
     def _clear_native_operation(self, connector_id):
         if connector_id in self.native_operation_uncertain:
+            previous = self.native_operation_uncertain[connector_id]
             del self.native_operation_uncertain[connector_id]
-            self._persist_native_operation_state()
+            if not self._persist_native_operation_state():
+                self.native_operation_uncertain[connector_id] = previous
 
     def activity_state(self):
         try:
@@ -1067,6 +1128,8 @@ class Relay:
         driver = connector.get("kind")
         if driver not in {"qq", "wechat"}:
             raise RuntimeError("unsupported_connector_driver")
+        if driver == "qq" and self.native_operation_state_unavailable:
+            raise SourceReadError("native_operation_state_unavailable")
         scan_request = {"op": "scan", "driver": driver,
                                         "profile": profile, "cursor": cursor,
                                         "limit": limit, "maxBytes": MAX_SCAN_RESPONSE,
@@ -1849,7 +1912,8 @@ class Relay:
                             if native_uncertain_pid is not None:
                                 self.recover_native_operation_after_uncertain(connector_id, native_uncertain_pid)
                             elif native_blocked_pid is not None:
-                                pass
+                                self.recover_native_operation_after_uncertain(
+                                    connector_id, native_blocked_pid)
                             elif error.attach_failure_pid is not None:
                                 self.recover_attach_after_failures(connector_id)
                             elif query_gate_pid is not None:

@@ -669,6 +669,31 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(caught.exception.native_operation_blocked_pid, 12345)
         self.assertEqual(requests[0]["blockedProcessId"], 12345)
 
+    def test_blocked_recovery_retries_after_cooldown(self):
+        config = self.auto_wake_config()
+        config["connectors"] = config["connectors"][:1]
+        requests = []
+        relay = runtime.Relay(config, self.db,
+                              lambda request: requests.append(dict(request)) or self.wake_result(True))
+        relay._block_native_operation("connector-a", 12345)
+        relay.source_recovery_after["connector-a"] = runtime.time.time() + 300
+        self.assertFalse(relay.recover_native_operation_after_uncertain("connector-a", 12345))
+        relay.source_recovery_after["connector-a"] = 0
+        self.assertTrue(relay.recover_native_operation_after_uncertain("connector-a", 12345))
+        self.assertEqual(requests[-1], {"op": "ensure-active", "reason": "native_operation_uncertain",
+                                        "driver": "qq", "observedPid": 12345})
+
+    def test_corrupt_native_operation_state_fails_closed(self):
+        relay = runtime.Relay(self.auto_wake_config(), self.db,
+                              lambda _request: {"ok": True, "commands": []})
+        with open(relay.native_operation_state_path, "w", encoding="utf-8") as stream:
+            stream.write("not-json")
+        restarted = runtime.Relay(self.auto_wake_config(), self.db,
+                                  lambda _request: {"ok": True, "commands": []})
+        self.assertTrue(restarted.native_operation_state_unavailable)
+        with self.assertRaises(runtime.SourceReadError):
+            restarted.scan_profile("primary")
+
     def test_changed_process_resets_attach_streak_and_requests_observed_pid(self):
         config = self.auto_wake_config()
         config["connectors"] = config["connectors"][:1]
