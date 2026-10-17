@@ -950,6 +950,19 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout"], runtime.ADAPTER_SCAN_TIMEOUT)
         self.assertEqual(runtime.ADAPTER_SCAN_TIMEOUT, 60)
 
+    def test_default_relay_adapter_uses_activity_mirror_operation_deadline_on_darwin(self):
+        path = ("/private/var/mobile/Containers/Data/Application/"
+                "00000000-0000-0000-0000-000000000000/Library/MessageCenterActivity/runtime.activity.json")
+        result = {"ok": True, "activityMirrorPath": path}
+        with patch.object(runtime.device_activity.platform, "system", return_value="Darwin"), \
+             patch.object(runtime, "run_adapter", return_value=result) as run:
+            relay = runtime.Relay(self.config, self.db)
+            relay.close()
+        request = run.call_args.args[1]
+        self.assertEqual(request, {"op": "activity-mirror-path", "driver": "qq"})
+        self.assertEqual(run.call_args.kwargs["timeout"], runtime.ADAPTER_ACTIVITY_MIRROR_TIMEOUT)
+        self.assertEqual(runtime.ADAPTER_ACTIVITY_MIRROR_TIMEOUT, 5)
+
     def test_send_adapter_timeout_covers_private_deadline_and_remains_uncertain(self):
         self.save_cursor()
         command = {"id": "command-timeout", "leaseToken": "lease-timeout",

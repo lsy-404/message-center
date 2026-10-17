@@ -43,6 +43,7 @@ HEARTBEAT_MIN_INTERVAL = 30
 ADAPTER_SCAN_TIMEOUT = 60
 ADAPTER_SEND_TIMEOUT = 130
 ADAPTER_WAKE_TIMEOUT = 55
+ADAPTER_ACTIVITY_MIRROR_TIMEOUT = 5
 AUTO_WAKE_INTERVAL = 60
 SOURCE_RECOVERY_FAILURE_THRESHOLD = 3
 SOURCE_RECOVERY_COOLDOWN = 300
@@ -443,6 +444,8 @@ def adapter_timeout_for_request(request):
         return ADAPTER_SEND_TIMEOUT
     if operation == "ensure-active":
         return ADAPTER_WAKE_TIMEOUT
+    if operation == "activity-mirror-path":
+        return ADAPTER_ACTIVITY_MIRROR_TIMEOUT
     raise ValueError("unsupported_adapter_operation")
 
 
