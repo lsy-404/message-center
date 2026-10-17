@@ -532,9 +532,15 @@ class Relay:
         self.heartbeat_retry_at = {item["id"]: 0 for item in self.connectors}
         self.heartbeat_last_state = {item["id"]: None for item in self.connectors}
         self.heartbeat_last_sent = {item["id"]: float("-inf") for item in self.connectors}
-        self.activity_monitor = (activity_monitor if activity_monitor is not None else
-                                 device_activity.create_monitor(
-                                     config["database"] + ".activity.json"))
+        if activity_monitor is not None:
+            self.activity_monitor = activity_monitor
+        elif device_activity.platform.system() == "Darwin":
+            self.activity_monitor = device_activity.create_monitor(
+                config["database"] + ".activity.json",
+                readable_state_path=device_activity.MIRROR_STATE_PATH)
+        else:
+            self.activity_monitor = device_activity.create_monitor(
+                config["database"] + ".activity.json")
         self.activity_monitor.start()
         self.activity_pause_active = False
         self.activity_fresh_required = set()

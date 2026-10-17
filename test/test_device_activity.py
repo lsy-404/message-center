@@ -220,6 +220,98 @@ class DeviceActivityPolicyTests(unittest.TestCase):
         self.assertEqual(fields["activityResumeToken"],
                          f"{monitor.policy.monitor_id}:{os.getpid()}:0:0")
 
+    def test_mirror_publishes_exact_v4_state_and_request_points_to_mirror(self):
+        mirror_path = os.path.join(self.temp.name, "readable", "runtime.activity.json")
+        states = []
+        monitor = device_activity.NativeActivityMonitor(
+            self.state_path, readable_state_path=mirror_path,
+            idle_seconds=3, clock=self.clock)
+        with patch.object(device_activity, "_atomic_mirror_state_write",
+                          side_effect=lambda path, state: states.append((path, dict(state)))):
+            self.assertTrue(monitor.policy.start_grace())
+            monitor.policy.mark_ready()
+            monitor.policy.record_activity("home")
+            monitor.policy.stop()
+        self.assertGreaterEqual(len(states), 4)
+        self.assertTrue(all(path == mirror_path for path, _ in states))
+        self.assertTrue(all(set(state) == device_activity.STATE_FIELDS
+                            for _, state in states))
+        self.assertEqual(states[-1][1]["healthy"], False)
+        self.assertEqual(states[-1][1]["armed"], True)
+        fields = monitor.request_fields()
+        self.assertEqual(fields["activityStatePath"], mirror_path)
+        self.assertEqual(fields["activityMonitorId"], monitor.policy.monitor_id)
+
+    def test_mirror_failure_fails_closed_and_persists_unhealthy_primary_state(self):
+        mirror_path = os.path.join(self.temp.name, "readable", "runtime.activity.json")
+        policy = device_activity.ActivityPolicy(
+            self.state_path, readable_state_path=mirror_path, clock=self.clock)
+        with patch.object(device_activity, "_atomic_mirror_state_write",
+                          side_effect=OSError("mirror unavailable")):
+            self.assertFalse(policy.start_grace())
+        state = policy.snapshot()
+        self.assertFalse(state["healthy"])
+        self.assertTrue(state["armed"])
+        self.assertTrue(state["cleanupRequired"])
+        with open(self.state_path, encoding="utf-8") as stream:
+            saved = json.load(stream)
+        self.assertFalse(saved["healthy"])
+        self.assertTrue(saved["armed"])
+        self.assertTrue(saved["cleanupRequired"])
+
+    def test_mirror_parent_must_be_root_owned_real_directory_with_exact_mode(self):
+        fake_directory = type("Stat", (), {
+            "st_mode": device_activity.stat.S_IFDIR | 0o755,
+            "st_uid": 0, "st_dev": 1, "st_ino": 2,
+        })()
+        with patch.object(device_activity.os, "name", "posix"), \
+             patch.object(device_activity.os, "geteuid", return_value=0, create=True), \
+             patch.object(device_activity.os, "lstat", return_value=fake_directory):
+            self.assertIs(device_activity._mirror_parent_metadata(
+                "/var/mobile/Library/MessageCenterActivity/runtime.activity.json"),
+                fake_directory)
+
+        for metadata in (
+                type("Stat", (), {"st_mode": device_activity.stat.S_IFLNK | 0o777,
+                                  "st_uid": 0, "st_dev": 1, "st_ino": 2})(),
+                type("Stat", (), {"st_mode": device_activity.stat.S_IFDIR | 0o755,
+                                  "st_uid": 501, "st_dev": 1, "st_ino": 2})(),
+                type("Stat", (), {"st_mode": device_activity.stat.S_IFDIR | 0o775,
+                                  "st_uid": 0, "st_dev": 1, "st_ino": 2})()):
+            with patch.object(device_activity.os, "name", "posix"), \
+                 patch.object(device_activity.os, "geteuid", return_value=0, create=True), \
+                 patch.object(device_activity.os, "lstat", return_value=metadata):
+                with self.assertRaises(device_activity.ActivityStateError):
+                    device_activity._mirror_parent_metadata(
+                        "/var/mobile/Library/MessageCenterActivity/runtime.activity.json")
+
+    def test_mirror_does_not_create_or_chmod_untrusted_directory(self):
+        mirror_path = os.path.join(self.temp.name, "absent", "runtime.activity.json")
+        with patch.object(device_activity.os, "name", "posix"), \
+             patch.object(device_activity.os, "geteuid", return_value=0, create=True):
+            with self.assertRaises(FileNotFoundError):
+                device_activity._atomic_mirror_state_write(mirror_path, {})
+        self.assertFalse(os.path.exists(os.path.dirname(mirror_path)))
+
+    def test_mirror_refuses_existing_symlink_nonroot_or_wrong_mode_target(self):
+        path = os.path.join(self.temp.name, "runtime.activity.json")
+        parent = type("Stat", (), {"st_mode": device_activity.stat.S_IFDIR | 0o755,
+                                    "st_uid": 0, "st_dev": 1, "st_ino": 2})()
+        for metadata in (
+                type("Stat", (), {"st_mode": device_activity.stat.S_IFLNK | 0o777,
+                                  "st_uid": 0})(),
+                type("Stat", (), {"st_mode": device_activity.stat.S_IFREG | 0o644,
+                                  "st_uid": 501})(),
+                type("Stat", (), {"st_mode": device_activity.stat.S_IFREG | 0o600,
+                                  "st_uid": 0})()):
+            with patch.object(device_activity, "_mirror_parent_metadata",
+                              return_value=parent), \
+                 patch.object(device_activity.os, "lstat", return_value=metadata), \
+                 patch.object(device_activity.os, "name", "posix"), \
+                 patch.object(device_activity.os, "geteuid", return_value=0, create=True):
+                with self.assertRaises(device_activity.ActivityStateError):
+                    device_activity._atomic_mirror_state_write(path, {})
+
     def test_home_and_digitizer_activity_renew_the_grace(self):
         self.clock.value += 150
         self.policy.record_activity("home")
