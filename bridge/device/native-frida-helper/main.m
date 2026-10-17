@@ -41,6 +41,7 @@ typedef struct {
   const gchar *error_code;
   const gchar *response_error_code;
   const gchar *cleanup_code;
+  const gchar *cleanup_stage;
   guint timeout_source;
   guint cleanup_timeout_source;
   guint force_source;
@@ -100,6 +101,26 @@ fail(Helper *helper, const gchar *stage, const gchar *code)
 }
 
 static void
+record_cleanup_failure(Helper *helper, const gchar *code,
+    const gchar *stage_override)
+{
+  if (helper->cleanup_code != NULL)
+    return;
+  helper->cleanup_code = code;
+  if (stage_override != NULL) {
+    helper->cleanup_stage = stage_override;
+  } else if (!helper->cleanup_started) {
+    helper->cleanup_stage = "not_started";
+  } else if (g_strcmp0(helper->stage, "unload") == 0 ||
+      g_strcmp0(helper->stage, "detach") == 0 ||
+      g_strcmp0(helper->stage, "close") == 0) {
+    helper->cleanup_stage = helper->stage;
+  } else {
+    helper->cleanup_stage = "unknown";
+  }
+}
+
+static void
 remove_source(guint *source_id)
 {
   if (*source_id != 0) {
@@ -124,8 +145,7 @@ force_finish(gpointer user_data)
   Helper *helper = user_data;
   helper->force_source = 0;
   helper->hard_timeout = TRUE;
-  if (helper->cleanup_code == NULL)
-    helper->cleanup_code = "cleanup_timeout";
+  record_cleanup_failure(helper, "cleanup_timeout", NULL);
   finish(helper);
   return G_SOURCE_REMOVE;
 }
@@ -135,8 +155,7 @@ on_cleanup_timeout(gpointer user_data)
 {
   Helper *helper = user_data;
   helper->cleanup_timeout_source = 0;
-  if (helper->cleanup_code == NULL)
-    helper->cleanup_code = "cleanup_timeout";
+  record_cleanup_failure(helper, "cleanup_timeout", NULL);
   g_cancellable_cancel(helper->cleanup_cancel);
   helper->force_source = g_timeout_add(CANCEL_GRACE_MS, force_finish, helper);
   return G_SOURCE_REMOVE;
@@ -152,8 +171,7 @@ on_manager_closed(GObject *source, GAsyncResult *result, gpointer user_data)
   GError *error = NULL;
   frida_device_manager_close_finish(FRIDA_DEVICE_MANAGER(source), result, &error);
   if (error != NULL) {
-    if (helper->cleanup_code == NULL)
-      helper->cleanup_code = "manager_close_failed";
+    record_cleanup_failure(helper, "manager_close_failed", NULL);
     g_error_free(error);
   }
   finish(helper);
@@ -178,8 +196,7 @@ on_session_detached(GObject *source, GAsyncResult *result, gpointer user_data)
   GError *error = NULL;
   frida_session_detach_finish(FRIDA_SESSION(source), result, &error);
   if (error != NULL) {
-    if (helper->cleanup_code == NULL)
-      helper->cleanup_code = "detach_failed";
+    record_cleanup_failure(helper, "detach_failed", NULL);
     g_error_free(error);
   }
   close_manager(helper);
@@ -236,8 +253,7 @@ on_script_unloaded(GObject *source, GAsyncResult *result, gpointer user_data)
   GError *error = NULL;
   frida_script_unload_finish(FRIDA_SCRIPT(source), result, &error);
   if (error != NULL) {
-    if (helper->cleanup_code == NULL)
-      helper->cleanup_code = "unload_failed";
+    record_cleanup_failure(helper, "unload_failed", NULL);
     g_error_free(error);
   }
   detach_session(helper);
@@ -293,8 +309,10 @@ on_script_message(FridaScript *script, const gchar *message, GBytes *data,
   if (helper->result_received) {
     if (helper->binary_output.enabled) {
       fail(helper, "result", "duplicate_send");
-      if (binary_output_reset(&helper->binary_output) != BINARY_OUTPUT_OK)
+      if (binary_output_reset(&helper->binary_output) != BINARY_OUTPUT_OK) {
         helper->cleanup_code = "binary_output_reset_failed";
+        helper->cleanup_stage = "binary_output";
+      }
       helper->binary_written = FALSE;
       helper->binary_byte_count = 0;
       if (helper->operation_in_flight)
@@ -796,10 +814,12 @@ main(int argc, char **argv)
     output[@"code"] = [NSString stringWithUTF8String:
         helper.error_code ?: helper.cleanup_code ?: "helper_failed"];
   }
-  if (helper.cleanup_code != NULL)
+  output[@"cleanupIncomplete"] = @(helper.hard_timeout);
+  if (helper.cleanup_code != NULL) {
     output[@"cleanupCode"] = [NSString stringWithUTF8String:helper.cleanup_code];
-  if (helper.hard_timeout)
-    output[@"cleanupIncomplete"] = @YES;
+    output[@"cleanupStage"] = [NSString stringWithUTF8String:
+        helper.cleanup_stage ?: "unknown"];
+  }
   if (helper.binary_output.enabled) {
     output[@"binaryWritten"] = (success && helper.binary_written) ? @YES : @NO;
     if (success)

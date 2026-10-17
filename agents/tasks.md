@@ -84,3 +84,5 @@
 | 230 | [Diagnostic] HID touch entitlement probe | Build a short-lived iOS event-type monitor that reports only its own effective HID event-monitor entitlement and restricted-entitlement validation status | Distinguish runtime entitlement state from missing touch callbacks without changing production processes | 🔄 In progress |
 
 | 223 | [Feature] device-activity-mirror | Publish the exact v4 activity lease to a validated root-readable atomic mirror for the private sender | The sender needs a durable local activity guard without access to the primary 0600 runtime state | 🔄 In progress |
+
+| 232 | [Diagnostic] Native helper cleanup stage | Preserve finite cleanup-stage and strict cleanup-completion evidence in helper failures | Generic cleanup errors hide the pending Frida cleanup step and whether forced exit occurred | ✅ Complete |

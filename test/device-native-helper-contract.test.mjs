@@ -24,6 +24,24 @@ test('helper reports uncertain dispatch after script loading starts', () => {
   assert.match(docs, /dispatch.*unknown/);
 });
 
+test('helper preserves bounded cleanup stage and exact cleanup completion state', () => {
+  assert.match(source, /#define CLEANUP_TIMEOUT_MS 5000/);
+  assert.match(source, /#define CANCEL_GRACE_MS 3000/);
+  assert.match(source, /record_cleanup_failure\(helper, "cleanup_timeout", NULL\)/);
+  assert.match(source, /helper->cleanup_stage = "not_started"/);
+  assert.match(source, /g_strcmp0\(helper->stage, "unload"\)/);
+  assert.match(source, /g_strcmp0\(helper->stage, "detach"\)/);
+  assert.match(source, /g_strcmp0\(helper->stage, "close"\)/);
+  assert.match(source, /output\[@"cleanupIncomplete"\] = @\(helper\.hard_timeout\)/);
+  assert.match(source, /output\[@"cleanupStage"\] = \[NSString stringWithUTF8String:\s+helper\.cleanup_stage \?: "unknown"\]/);
+  const cleanupTimeout = source.match(/on_cleanup_timeout\([\s\S]*?(?=static void\nclose_manager)/)?.[0];
+  assert.ok(cleanupTimeout);
+  assert.match(cleanupTimeout, /g_cancellable_cancel\(helper->cleanup_cancel\)/);
+  assert.match(cleanupTimeout, /g_timeout_add\(CANCEL_GRACE_MS, force_finish, helper\)/);
+  assert.match(docs, /cleanupStage.*unload.*detach.*close/);
+  assert.match(docs, /boolean `cleanupIncomplete`/i);
+});
+
 test('script eternalization is opt-in and follows only a valid setup result', () => {
   assert.match(source, /gboolean eternalize_requested;/);
   assert.match(source, /strcmp\(argv\[i\], "--eternalize"\)/);
