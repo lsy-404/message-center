@@ -29,3 +29,7 @@ Required phase evidence: target PID, helper stages through unload/detach/close, 
 ## Containment qualification
 
 Frida `Script.pin()` is called after gate acquisition and before native dispatch, so the static review cannot claim that Promise delivery itself proves unsafe script unload or callback invalidation. The helper must be checked for its cleanup-cancel and hard-timeout behavior. The source-level fact remains narrower: timeout/throw paths can leave native work or the process-scoped gate pending, and the next helper can expose that through `native-query-busy` plus `pendingOperation`; whether the helper preserves the pinned script until that state clears is unverified. A Node stub binding was attempted but did not reproduce a valid Frida gate transition, so it is not evidence of runtime unload behavior.
+
+## Lifecycle evidence correction
+
+The existing source-bound Node lifecycle suite passes 19 tests. It demonstrates that timeout, no-callback, parser-schedule failure, and callback-exit failure keep `Script.pin()` active, retain the pending gate, and defer `unpin` until cleanup can finish. The review therefore distinguishes a helper-issued unload request from actual script destruction: current evidence proves the former may be requested while native work is pending, but does not prove that Frida destroyed the pinned script or invalidated a native callback. A real QQ exit remains un-attributed without sanitized helper cleanup phases or a subsequent `native-query-busy` plus pending snapshot sequence.
