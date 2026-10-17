@@ -11,3 +11,5 @@
 - `python -m unittest discover -s test`: 170 passed, 2 platform skips.
 - `git diff --check` passes after normalizing the appended task-index line ending.
 - Committed locally as `97e674a811c2d77a362b85bb7cb21682ce47453a` (`Fix inbound scan backpressure`); branch remains local and isolated.
+- Follow-up coverage review found missing combined cases for ready auto-wake and source-read backoff after an upload failure. Added both tests without changing runtime code.
+- Re-ran the full Python suite: 172 passed, 2 platform skips; `git diff --check` passes.

@@ -1474,6 +1474,80 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(relay.retry_at["connector-a"], 0)
         self.assertTrue(relay.health["connector-a"])
 
+    def test_failed_outbox_delivery_does_not_block_ready_auto_wake_scan(self):
+        queued = dict(self.event("conflict-head"), conversationType="group", trigger="background")
+        self.db.execute(
+            "INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,1)",
+            ("connector-a", "primary", queued["externalId"], runtime.compact(queued)),
+        )
+        self.db.commit()
+        adapter_calls = []
+        incoming = self.event("new-auto-wake-event")
+
+        def adapter(request):
+            adapter_calls.append(request)
+            if request["op"] == "ensure-active":
+                return self.wake_result(True)
+            return {"ok": True, "sourceReadOk": True, "health": "online",
+                    "cursor": {"next": "advanced"}, "messages": [incoming]}
+
+        def http(method, path, payload=None):
+            if path.endswith("group-text-backups"):
+                raise RuntimeError("message_external_id_conflict")
+            return {"ok": True, "commands": []}
+
+        config = self.auto_wake_config()
+        config["connectors"] = config["connectors"][:1]
+        relay = runtime.Relay(config, self.db, adapter, http)
+        relay.wake_readiness_established = True
+        relay.source_settle_until["connector-a"] = 0
+        with patch.object(runtime.time, "monotonic", return_value=1000):
+            relay.pass_once()
+
+        self.assertTrue(any(request["op"] == "scan" for request in adapter_calls))
+        self.assertEqual(json_cursor(self.db), runtime.compact({"next": "advanced"}))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 2)
+        self.assertGreater(relay.outbox_retry_at["connector-a"], 1000)
+        self.assertTrue(relay.health["connector-a"])
+
+    def test_source_read_failure_after_outbox_failure_keeps_scan_backoff(self):
+        queued = dict(self.event("conflict-head"), conversationType="group", trigger="background")
+        self.db.execute(
+            "INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,1)",
+            ("connector-a", "primary", queued["externalId"], runtime.compact(queued)),
+        )
+        self.db.commit()
+        scans = []
+
+        def adapter(request):
+            if request["op"] == "scan":
+                scans.append(request)
+                return {"ok": False, "sourceReadOk": False, "nativeFailure": {"code": "unavailable"}}
+            return {}
+
+        def http(method, path, payload=None):
+            if path.endswith("group-text-backups"):
+                raise RuntimeError("message_external_id_conflict")
+            return {"ok": True, "commands": []}
+
+        relay = runtime.Relay(self.config, self.db, adapter, http)
+        old_cursor = runtime.compact({"next": "old"})
+        self.db.execute(
+            "INSERT INTO cursors(connector_id,profile,value) VALUES('connector-a','primary',?)", (old_cursor,))
+        self.db.commit()
+        now = [1000.0]
+        with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]):
+            relay.pass_once()
+            self.assertEqual(len(scans), 1)
+            self.assertGreater(relay.outbox_retry_at["connector-a"], now[0])
+            self.assertGreater(relay.retry_at["connector-a"], now[0])
+            now[0] += 1
+            relay.pass_once()
+
+        self.assertEqual(len(scans), 1)
+        self.assertEqual(json_cursor(self.db), old_cursor)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
+
     def test_normal_ingest_ack_with_zero_suppressed_is_deduplicated_before_delete(self):
         message = self.event("once")
         self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,1)",
