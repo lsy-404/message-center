@@ -88,3 +88,4 @@
 | 232 | [Diagnostic] Native helper cleanup stage | Preserve finite cleanup-stage and strict cleanup-completion evidence in helper failures | Generic cleanup errors hide the pending Frida cleanup step and whether forced exit occurred | ✅ Complete |
 
 | 233 | [BugFix] Native helper JSON booleans | Encode hard_timeout as an actual Foundation JSON boolean and verify the emitted JSON type | Strict Python parsing discarded cleanupIncomplete because a boxed int serialized as 0/1 | ✅ Complete |
+| 234 | [BugFix] Native operation uncertain recovery | Block repeated QQ SDK work after an uncertain result and unload timeout, then recover through the normal UI under existing limits | Preserve explicit unresolved state across receiver restarts and avoid repeated native calls | ✅ Complete |

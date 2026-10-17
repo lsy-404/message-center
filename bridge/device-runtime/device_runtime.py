@@ -10,6 +10,7 @@ import stat
 import selectors
 import signal
 import sqlite3
+import tempfile
 import subprocess
 import sys
 import time
@@ -58,10 +59,13 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class SourceReadError(RuntimeError):
-    def __init__(self, code, *, attach_failure_pid=None, query_gate_pending_pid=None):
+    def __init__(self, code, *, attach_failure_pid=None, query_gate_pending_pid=None,
+                 native_operation_uncertain_pid=None, native_operation_blocked_pid=None):
         super().__init__(code)
         self.attach_failure_pid = attach_failure_pid
         self.query_gate_pending_pid = query_gate_pending_pid
+        self.native_operation_uncertain_pid = native_operation_uncertain_pid
+        self.native_operation_blocked_pid = native_operation_blocked_pid
 
 
 class SendPreDispatchError(RuntimeError):
@@ -93,6 +97,24 @@ def explicit_native_create_script_timeout(value):
     return (type(value["stage"]) is str and value["stage"] == "create_script"
             and type(value["errorCode"]) is str and value["errorCode"] == "timeout"
             and type(value["dispatch"]) is str and value["dispatch"] == "not_started"
+            and type(value["processId"]) is int and value["processId"] > 1)
+
+
+def explicit_native_operation_uncertain(value):
+    if type(value) is not dict or set(value) != {
+            "stage", "errorCode", "cleanupCode", "cleanupStage", "dispatch", "processId"}:
+        return False
+    return (value["stage"] == "await_result" and value["errorCode"] == "timeout"
+            and value["cleanupCode"] == "cleanup_timeout"
+            and value["cleanupStage"] == "unload" and value["dispatch"] == "unknown"
+            and type(value["processId"]) is int and value["processId"] > 1)
+
+
+def explicit_native_operation_blocked(value):
+    if type(value) is not dict or set(value) != {"stage", "errorCode", "dispatch", "processId"}:
+        return False
+    return (value["stage"] == "native_operation" and value["errorCode"] == "blocked_pid"
+            and value["dispatch"] == "not_started"
             and type(value["processId"]) is int and value["processId"] > 1)
 
 
@@ -530,6 +552,9 @@ class Relay:
                     len(connector["token"]) < 32):
                 raise ValueError("invalid_connector_configuration")
         self.connector_by_id = {item["id"]: item for item in self.connectors}
+        self.native_operation_state_path = self.config["database"] + ".native-operation.json"
+        self.native_operation_uncertain, self.native_operation_state_unavailable = (
+            self._load_native_operation_state())
         self.auto_wake = config.get("autoWake") is True
         if self.auto_wake and any(item.get("kind") != "qq" for item in self.connectors):
             raise ValueError("auto_wake_requires_qq_only")
@@ -583,6 +608,110 @@ class Relay:
         self.activity_resume_pending = False
         self.activity_resume_token = None
         self.dirty_watcher = dirty_watcher if dirty_watcher is not None else dirty_hint.DirtyHint()
+
+    def _load_native_operation_state(self):
+        descriptor = -1
+        try:
+            descriptor = os.open(self.native_operation_state_path,
+                                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                                | getattr(os, "O_CLOEXEC", 0)
+                                | (getattr(os, "O_NONBLOCK", 0) if os.name == "posix" else 0))
+            metadata = os.fstat(descriptor)
+            if (not stat.S_ISREG(metadata.st_mode) or
+                    (os.name == "posix" and hasattr(os, "getuid")
+                     and metadata.st_uid != os.getuid()) or
+                    (os.name == "posix" and stat.S_IMODE(metadata.st_mode) != 0o600) or
+                    metadata.st_size > 4096):
+                return {}, True
+            encoded = os.read(descriptor, 4097)
+            if len(encoded) > 4096:
+                return {}, True
+            value = json.loads(encoded.decode("utf-8"))
+            if (type(value) is not dict or set(value) != {"version", "entries"}
+                    or value["version"] != 1 or type(value["entries"]) is not dict):
+                return {}, True
+            result = {}
+            for connector_id, entry in value["entries"].items():
+                if (connector_id in self.connector_by_id and type(entry) is int
+                        and entry > 1):
+                    result[connector_id] = entry
+                elif connector_id in self.connector_by_id:
+                    return {}, True
+            return result, False
+        except FileNotFoundError:
+            return {}, False
+        except (OSError, UnicodeDecodeError, ValueError, TypeError):
+            return {}, True
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    def _persist_native_operation_state(self):
+        payload = {"version": 1, "entries": self.native_operation_uncertain}
+        descriptor = -1
+        temporary_path = None
+        try:
+            parent = os.path.dirname(self.native_operation_state_path)
+            parent_info = os.lstat(parent)
+            if not stat.S_ISDIR(parent_info.st_mode) or stat.S_ISLNK(parent_info.st_mode):
+                raise OSError("invalid_state_parent")
+            encoded = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
+            if len(encoded) > 4096:
+                raise OSError("state_too_large")
+            descriptor, temporary_name = tempfile.mkstemp(prefix=".native-operation.", dir=parent)
+            temporary_path = temporary_name
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            else:
+                os.chmod(temporary_name, 0o600)
+            metadata = os.fstat(descriptor)
+            if (not stat.S_ISREG(metadata.st_mode) or
+                    (os.name == "posix" and stat.S_IMODE(metadata.st_mode) != 0o600)):
+                raise OSError("invalid_state_mode")
+            offset = 0
+            while offset < len(encoded):
+                written = os.write(descriptor, encoded[offset:])
+                if written <= 0:
+                    raise OSError("state_write_failed")
+                offset += written
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            os.replace(temporary_path, self.native_operation_state_path)
+            temporary_path = None
+            if os.name == "posix":
+                directory_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                                       | getattr(os, "O_NOFOLLOW", 0))
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            self.native_operation_state_unavailable = False
+            return True
+        except (OSError, TypeError, ValueError):
+            self.native_operation_state_unavailable = True
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                if temporary_path is not None:
+                    os.unlink(temporary_path)
+            except OSError:
+                pass
+            return False
+
+    def _block_native_operation(self, connector_id, process_id):
+        if type(process_id) is int and process_id > 1:
+            self.native_operation_uncertain[connector_id] = process_id
+            self._persist_native_operation_state()
+
+    def _clear_native_operation(self, connector_id):
+        if connector_id in self.native_operation_uncertain:
+            previous = self.native_operation_uncertain[connector_id]
+            del self.native_operation_uncertain[connector_id]
+            if not self._persist_native_operation_state():
+                self.native_operation_uncertain[connector_id] = previous
+                return False
+        return True
 
     def activity_state(self):
         try:
@@ -807,6 +936,25 @@ class Relay:
         except Exception:
             return False
 
+    def recover_native_operation_after_uncertain(self, connector_id, observed_pid):
+        now = time.time()
+        if (not self.auto_wake or not self.source_state_durable[connector_id]
+                or now < self.source_recovery_after[connector_id]
+                or now < self.source_settle_until[connector_id]):
+            return False
+        self.source_recovery_after[connector_id] = now + SOURCE_RECOVERY_COOLDOWN
+        if not self.persist_source_state(connector_id):
+            return False
+        self.health[connector_id] = False
+        try:
+            return self.ensure_active(
+                recovery_driver=self.connector_by_id[connector_id].get("kind"),
+                recovery_reason="native_operation_uncertain",
+                observed_pid=observed_pid,
+            )
+        except Exception:
+            return False
+
     def heartbeat_failed(self, connector_id):
         count = self.heartbeat_failures[connector_id] + 1
         self.heartbeat_failures[connector_id] = count
@@ -983,12 +1131,18 @@ class Relay:
         driver = connector.get("kind")
         if driver not in {"qq", "wechat"}:
             raise RuntimeError("unsupported_connector_driver")
-        try:
-            result = self.call_adapter({"op": "scan", "driver": driver,
+        if driver == "qq" and self.native_operation_state_unavailable:
+            raise SourceReadError("native_operation_state_unavailable")
+        scan_request = {"op": "scan", "driver": driver,
                                         "profile": profile, "cursor": cursor,
                                         "limit": limit, "maxBytes": MAX_SCAN_RESPONSE,
                                         "maxEventBytes": MAX_EVENT, "mediaDirectory": self.media_directory_for(self.connector),
-                                        "maxMediaBytes": remaining, "history": bool(history)})
+                                        "maxMediaBytes": remaining, "history": bool(history)}
+        blocked_pid = self.native_operation_uncertain.get(self.connector)
+        if driver == "qq" and type(blocked_pid) is int and blocked_pid > 1:
+            scan_request["blockedProcessId"] = blocked_pid
+        try:
+            result = self.call_adapter(scan_request)
         except Exception as error:
             raise SourceReadError("source_read_failed") from error
         if self.activity_paused():
@@ -1011,6 +1165,10 @@ class Relay:
                                         or explicit_native_create_script_timeout(failure)) else None),
                 query_gate_pending_pid=(failure["processId"]
                                         if explicit_native_query_gate_pending(failure) else None),
+                native_operation_uncertain_pid=(failure["processId"]
+                                               if explicit_native_operation_uncertain(failure) else None),
+                native_operation_blocked_pid=(failure["processId"]
+                                              if explicit_native_operation_blocked(failure) else None),
             )
         if (result.get("ok") is not True or "cursor" not in result or
                 not isinstance(result.get("messages"), list)):
@@ -1168,6 +1326,9 @@ class Relay:
             self.dirty_watcher.set_paths(validated_receive_hint_paths or [])
         active = result.get("active") is True
         self.scan_interval[self.connector] = 15 if result.get("more") is True else (60 if active else 300)
+        if not self._clear_native_operation(self.connector):
+            self.health[self.connector] = False
+            raise SourceReadError("native_operation_state_persist_failed")
         self.source_read_succeeded(self.connector)
         return result.get("health") == "online"
 
@@ -1186,12 +1347,14 @@ class Relay:
             request = {"op": "ensure-active", "driver": "qq"}
             if recovery_driver is not None:
                 if (recovery_driver != "qq"
-                        or recovery_reason not in {"read_failure", "attach_failure", "query_gate_pending"}
-                        or (recovery_reason in {"attach_failure", "query_gate_pending"}
+                        or recovery_reason not in {"read_failure", "attach_failure", "query_gate_pending",
+                                                   "native_operation_uncertain"}
+                        or (recovery_reason in {"attach_failure", "query_gate_pending",
+                                                "native_operation_uncertain"}
                             and (type(observed_pid) is not int or observed_pid <= 1))):
                     raise RuntimeError("invalid_recovery_driver")
                 request.update({"reason": recovery_reason, "driver": recovery_driver})
-                if recovery_reason in {"attach_failure", "query_gate_pending"}:
+                if recovery_reason in {"attach_failure", "query_gate_pending", "native_operation_uncertain"}:
                     request["observedPid"] = observed_pid
             result = self.call_adapter(request)
             if (not isinstance(result, dict) or set(result) != {"ok", "ready", "attempted", "reason"} or
@@ -1715,6 +1878,14 @@ class Relay:
                     query_gate_pid = (error.query_gate_pending_pid
                                       if type(error.query_gate_pending_pid) is int
                                       and error.query_gate_pending_pid > 1 else None)
+                    native_uncertain_pid = (error.native_operation_uncertain_pid
+                                            if type(error.native_operation_uncertain_pid) is int
+                                            and error.native_operation_uncertain_pid > 1 else None)
+                    native_blocked_pid = (error.native_operation_blocked_pid
+                                          if type(error.native_operation_blocked_pid) is int
+                                          and error.native_operation_blocked_pid > 1 else None)
+                    if native_uncertain_pid is not None:
+                        self._block_native_operation(connector_id, native_uncertain_pid)
                     source_state_saved = self.source_read_failed(
                         connector_id, attach_failure_pid=failure_pid,
                         query_gate_pending_pid=query_gate_pid,
@@ -1728,10 +1899,14 @@ class Relay:
                                 "observedAt": observed_at,
                                 "driver": driver,
                                 "consecutiveFailures": self.source_failures[connector_id],
-                                "classification": ("explicit_attach" if failure_pid is not None else
+                                "classification": ("native_operation_uncertain" if native_uncertain_pid is not None else
+                                                   "native_operation_blocked" if native_blocked_pid is not None else
+                                                   "explicit_attach" if failure_pid is not None else
                                                    "explicit_query_gate" if query_gate_pid is not None else
                                                    "source_unclassified"),
-                                "processId": (failure_pid if failure_pid is not None else query_gate_pid),
+                                "processId": (native_uncertain_pid if native_uncertain_pid is not None else
+                                               native_blocked_pid if native_blocked_pid is not None else
+                                               failure_pid if failure_pid is not None else query_gate_pid),
                             }) + "\n")
                             sys.stderr.flush()
                         except Exception:
@@ -1739,7 +1914,12 @@ class Relay:
                     if self.auto_wake:
                         self.wake_scan_failed(connector_id)
                         if source_state_saved:
-                            if error.attach_failure_pid is not None:
+                            if native_uncertain_pid is not None:
+                                self.recover_native_operation_after_uncertain(connector_id, native_uncertain_pid)
+                            elif native_blocked_pid is not None:
+                                self.recover_native_operation_after_uncertain(
+                                    connector_id, native_blocked_pid)
+                            elif error.attach_failure_pid is not None:
                                 self.recover_attach_after_failures(connector_id)
                             elif query_gate_pid is not None:
                                 self.recover_query_gate_after_failures(connector_id)
