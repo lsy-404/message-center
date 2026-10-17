@@ -624,7 +624,6 @@ class DeviceRuntimeTests(unittest.TestCase):
         with self.assertRaises(runtime.SourceReadError) as caught:
             failed_helper.scan_profile("primary")
         self.assertIsNone(caught.exception.query_gate_pending_pid)
-
         relay = runtime.Relay(self.config, self.db, lambda _request: {
             "ok": True, "sourceReadOk": True, "health": "online",
             "cursor": {"next": "same"}, "messages": []})
@@ -634,6 +633,41 @@ class DeviceRuntimeTests(unittest.TestCase):
         relay.source_read_failed("connector-a", query_gate_pending_pid=12345)
         self.assertTrue(relay.scan_profile("primary"))
         self.assertEqual(relay.query_gate_failure_streak["connector-a"], (None, 0))
+
+    def test_native_operation_uncertain_requires_exact_cleanup_metadata(self):
+        valid = {"stage": "await_result", "errorCode": "timeout",
+                 "cleanupCode": "cleanup_timeout", "cleanupStage": "unload",
+                 "dispatch": "unknown", "processId": 12345}
+        self.assertTrue(runtime.explicit_native_operation_uncertain(valid))
+        self.assertFalse(runtime.explicit_native_operation_uncertain(
+            {**valid, "cleanupIncomplete": True}))
+        self.assertFalse(runtime.explicit_native_operation_uncertain(
+            {**valid, "dispatch": "not_started"}))
+        self.assertFalse(runtime.explicit_native_operation_uncertain(
+            {**valid, "cleanupStage": "detach"}))
+
+    def test_native_operation_state_survives_relay_restart(self):
+        relay = runtime.Relay(self.auto_wake_config(), self.db,
+                              lambda _request: {"ok": True, "commands": []})
+        relay._block_native_operation("connector-a", 12345)
+        restarted = runtime.Relay(self.auto_wake_config(), self.db,
+                                  lambda _request: {"ok": True, "commands": []})
+        self.assertEqual(restarted.native_operation_uncertain["connector-a"], 12345)
+        restarted._clear_native_operation("connector-a")
+
+    def test_native_operation_block_is_sent_to_qq_adapter(self):
+        requests = []
+        relay = runtime.Relay(self.config, self.db,
+                              lambda request: requests.append(request) or {
+                                  "ok": False, "sourceReadOk": False,
+                                  "nativeFailure": {"stage": "native_operation",
+                                      "errorCode": "blocked_pid", "dispatch": "not_started",
+                                      "processId": 12345}})
+        relay._block_native_operation("connector-a", 12345)
+        with self.assertRaises(runtime.SourceReadError) as caught:
+            relay.scan_profile("primary")
+        self.assertEqual(caught.exception.native_operation_blocked_pid, 12345)
+        self.assertEqual(requests[0]["blockedProcessId"], 12345)
 
     def test_changed_process_resets_attach_streak_and_requests_observed_pid(self):
         config = self.auto_wake_config()
