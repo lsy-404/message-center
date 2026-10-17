@@ -1,0 +1,13 @@
+# Progress
+
+- Confirmed public `main` and `origin/main` both resolve to `3f1e9fa286d2225b6c366c1e00e03ac9d4fd2fae`.
+- Created `fix/qq-inbound-backpressure` in the requested isolated public worktree.
+- Read agent-mode and repository instructions; inspected runtime and relevant test contracts. No production files changed yet.
+- Added separate bounded exponential outbox retry state and routed only delivery failures through it. Kept source/command retry state unchanged; removed the outbox-row scan gate.
+- Added regression tests proving a failed group-backup delivery remains queued while the source scan commits new data, and a full queue still skips scan without cursor advancement.
+- Updated delivery batch replay tests to target outbox retry state.
+- `python -m unittest discover -s test -p test_device_runtime.py`: 110 passed, 2 platform skips.
+- `python -m unittest discover -s test -p test_device_runtime_outbox_batch.py`: 10 passed.
+- `python -m unittest discover -s test`: 170 passed, 2 platform skips.
+- `git diff --check` passes after normalizing the appended task-index line ending.
+- Committed locally as `97e674a811c2d77a362b85bb7cb21682ce47453a` (`Fix inbound scan backpressure`); branch remains local and isolated.

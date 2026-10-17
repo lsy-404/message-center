@@ -719,6 +719,31 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(json_cursor(self.db), old)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
 
+    def test_full_pending_outbox_still_stops_pass_scan_without_advancing_cursor(self):
+        old = runtime.compact({"next": "old"})
+        self.db.execute(
+            "INSERT INTO cursors(connector_id,profile,value) VALUES('connector-a','primary',?)", (old,))
+        self.db.execute(
+            "INSERT INTO outbox(connector_id,profile,external_id,body,size) "
+            "VALUES('connector-a','primary','existing','{}',99)")
+        self.db.commit()
+        self.config["outboxMaxBytes"] = 99
+        scans = []
+        relay = runtime.Relay(
+            self.config, self.db,
+            lambda request: scans.append(request) or {
+                "ok": True, "sourceReadOk": True, "health": "online",
+                "cursor": {"next": "new"}, "messages": [self.event("would-overflow")],
+            },
+            lambda *args: {"ok": True},
+        )
+
+        relay.pass_once()
+
+        self.assertEqual(scans, [])
+        self.assertEqual(json_cursor(self.db), old)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
+
     def test_scan_passes_selected_connector_kind_as_explicit_driver(self):
         captured = []
         relay = runtime.Relay(
@@ -1405,16 +1430,49 @@ class DeviceRuntimeTests(unittest.TestCase):
                               lambda *args: {"ok": True, "suppressed": 1})
         with patch.object(runtime.time, "monotonic", return_value=100):
             self.assertFalse(relay.flush_one())
-            self.assertGreater(relay.retry_at["connector-a"], 100)
+            self.assertGreater(relay.outbox_retry_at["connector-a"], 100)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
         group = dict(self.event("group-background"), conversationType="group", trigger="background")
         self.db.execute("INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,1)",
                         ("connector-a", "primary", group["externalId"], runtime.compact(group)))
         self.db.commit()
-        relay.retry_at["connector-a"] = 0
+        relay.outbox_retry_at["connector-a"] = 0
         with patch.object(runtime.time, "monotonic", return_value=200):
             self.assertFalse(relay.flush_one())
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 2)
+
+    def test_failed_outbox_delivery_does_not_block_bounded_source_scan(self):
+        queued = dict(self.event("conflict-head"), conversationType="group", trigger="background")
+        self.db.execute(
+            "INSERT INTO outbox(connector_id,profile,external_id,body,size) VALUES(?,?,?,?,1)",
+            ("connector-a", "primary", queued["externalId"], runtime.compact(queued)),
+        )
+        self.db.commit()
+        scanned = []
+        incoming = self.event("new-source-event")
+
+        def adapter(request):
+            scanned.append(request)
+            return {"ok": True, "sourceReadOk": True, "health": "online",
+                    "cursor": {"next": "advanced"}, "messages": [incoming]}
+
+        def http(method, path, payload=None):
+            if path.endswith("group-text-backups"):
+                raise RuntimeError("message_external_id_conflict")
+            return {"ok": True, "commands": []}
+
+        relay = runtime.Relay(self.config, self.db, adapter, http)
+        with patch.object(runtime.time, "monotonic", return_value=1000):
+            relay.pass_once()
+
+        self.assertEqual(len(scanned), 1)
+        self.assertEqual(json_cursor(self.db), runtime.compact({"next": "advanced"}))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 2)
+        self.assertEqual(self.db.execute(
+            "SELECT external_id FROM outbox ORDER BY seq LIMIT 1").fetchone()[0], "conflict-head")
+        self.assertGreater(relay.outbox_retry_at["connector-a"], 1000)
+        self.assertEqual(relay.retry_at["connector-a"], 0)
+        self.assertTrue(relay.health["connector-a"])
 
     def test_normal_ingest_ack_with_zero_suppressed_is_deduplicated_before_delete(self):
         message = self.event("once")

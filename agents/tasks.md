@@ -79,3 +79,5 @@
 
 | 221 | [BugFix] QQ sticker content and quote preview | Render explicitly classified QQ stickers within a compact display box, validate inbound attachment bytes and preserve structured quote content | Image stickers can render at full image size and attachment/reply metadata must cross Worker/UI boundaries safely | 🔄 Public changes locally verified; native image discovery and browser proof remain with root |
 | 216 | [Feature] device-human-idle | Monitor HOME and digitizer activity on-device; pause scans, commands, and auto-wake until a continuous 180-second idle interval | Protect human app use while resuming safe QQ collection after idle; retain outbox delivery | 🔄 In progress |
+
+| 222 | [BugFix] QQ inbound backpressure | Separate durable outbox delivery retries from inbound source scanning while retaining bounded capacity and cursor atomicity | A single unacknowledged queue row currently blocks all new scans for its connector | ✅ Locally verified and committed |
