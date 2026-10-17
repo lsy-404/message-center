@@ -64,6 +64,34 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.db.close()
         self.temp.cleanup()
 
+    def test_darwin_activity_bootstrap_uses_only_valid_local_container_path(self):
+        path = ("/private/var/mobile/Containers/Data/Application/"
+                "00000000-0000-0000-0000-000000000000/Library/MessageCenterActivity/runtime.activity.json")
+        requests = []
+        monitor = runtime.device_activity.InactiveHostMonitor()
+
+        def adapter(request):
+            requests.append(request)
+            return {"ok": True, "activityMirrorPath": path}
+
+        with patch.object(runtime.device_activity.platform, "system", return_value="Darwin"), \
+             patch.object(runtime.device_activity, "create_monitor", return_value=monitor) as factory:
+            relay = runtime.Relay(self.config, db=self.db, adapter_call=adapter)
+            self.assertEqual(requests, [{"op": "activity-mirror-path", "driver": "qq"}])
+            factory.assert_called_once_with(self.db_path + ".activity.json", readable_state_path=path)
+            relay.close()
+
+    def test_darwin_activity_bootstrap_rejects_unavailable_or_extra_fields(self):
+        for response in ({"ok": False, "error": "unavailable"},
+                         {"ok": True, "activityMirrorPath": "/private/var/runtime.activity.json"},
+                         {"ok": True, "activityMirrorPath": None, "extra": True}):
+            with self.subTest(response=response), \
+                 patch.object(runtime.device_activity.platform, "system", return_value="Darwin"), \
+                 patch.object(runtime.device_activity, "create_monitor") as factory:
+                with self.assertRaisesRegex(RuntimeError, "activity_mirror_unavailable"):
+                    runtime.Relay(self.config, db=self.db, adapter_call=lambda _request: response)
+                factory.assert_not_called()
+
     def event(self, ident):
         return {"externalId": ident, "conversationExternalId": "conversation-aaaaaaaa",
                 "conversationTitle": "Test", "senderName": "Sender",

@@ -220,6 +220,54 @@ class DeviceActivityPolicyTests(unittest.TestCase):
         self.assertEqual(fields["activityResumeToken"],
                          f"{monitor.policy.monitor_id}:{os.getpid()}:0:0")
 
+    def test_mirror_publishes_exact_v4_state_and_request_points_to_mirror(self):
+        mirror_path = os.path.join(self.temp.name, "readable", "runtime.activity.json")
+        states = []
+        monitor = device_activity.NativeActivityMonitor(
+            self.state_path, readable_state_path=mirror_path,
+            idle_seconds=3, clock=self.clock)
+        with patch.object(device_activity, "_atomic_mirror_state_write",
+                          side_effect=lambda path, state: states.append((path, dict(state)))):
+            self.assertTrue(monitor.policy.start_grace())
+            monitor.policy.mark_ready()
+            monitor.policy.record_activity("home")
+            monitor.policy.stop()
+        self.assertGreaterEqual(len(states), 4)
+        self.assertTrue(all(path == mirror_path for path, _ in states))
+        self.assertTrue(all(set(state) == device_activity.STATE_FIELDS
+                            for _, state in states))
+        self.assertEqual(states[-1][1]["healthy"], False)
+        self.assertEqual(states[-1][1]["armed"], True)
+        fields = monitor.request_fields()
+        self.assertEqual(fields["activityStatePath"], mirror_path)
+        self.assertEqual(fields["activityMonitorId"], monitor.policy.monitor_id)
+
+    def test_mirror_failure_fails_closed_and_persists_unhealthy_primary_state(self):
+        mirror_path = os.path.join(self.temp.name, "readable", "runtime.activity.json")
+        policy = device_activity.ActivityPolicy(
+            self.state_path, readable_state_path=mirror_path, clock=self.clock)
+        with patch.object(device_activity, "_atomic_mirror_state_write",
+                          side_effect=OSError("mirror unavailable")):
+            self.assertFalse(policy.start_grace())
+        state = policy.snapshot()
+        self.assertFalse(state["healthy"])
+        self.assertTrue(state["armed"])
+        self.assertTrue(state["cleanupRequired"])
+        with open(self.state_path, encoding="utf-8") as stream:
+            saved = json.load(stream)
+        self.assertFalse(saved["healthy"])
+        self.assertTrue(saved["armed"])
+        self.assertTrue(saved["cleanupRequired"])
+
+    def test_mirror_path_accepts_only_canonical_container_suffix(self):
+        home = "/private/var/mobile/Containers/Data/Application/00000000-0000-0000-0000-000000000000"
+        suffix = "/Library/MessageCenterActivity/runtime.activity.json"
+        self.assertTrue(device_activity.validate_mirror_state_path(home + suffix))
+        for value in (None, home + "/../" + suffix, home + suffix + ".tmp",
+                      home.replace("/private/var", "/var") + suffix,
+                      "/private/var/MessageCenterActivity/runtime.activity.json"):
+            self.assertFalse(device_activity.validate_mirror_state_path(value))
+
     def test_home_and_digitizer_activity_renew_the_grace(self):
         self.clock.value += 150
         self.policy.record_activity("home")

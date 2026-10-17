@@ -82,3 +82,5 @@
 
 | 222 | [BugFix] QQ inbound backpressure | Separate durable outbox delivery retries from inbound source scanning while retaining bounded capacity and cursor atomicity | A single unacknowledged queue row currently blocks all new scans for its connector | ✅ Locally verified and committed |
 | 230 | [Diagnostic] HID touch entitlement probe | Build a short-lived iOS event-type monitor carrying only the private HID event-monitor entitlement | Test whether entitlement filtering explains missing touch callback types without changing production processes | 🔄 In progress |
+
+| 223 | [Feature] device-activity-mirror | Publish the exact v4 activity lease to a validated root-readable atomic mirror for the private sender | The sender needs a durable local activity guard without access to the primary 0600 runtime state | 🔄 In progress |

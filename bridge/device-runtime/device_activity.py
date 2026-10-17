@@ -24,6 +24,10 @@ CONSUMER_USAGE_PAGE = 0x0C
 HOME_USAGE = 0x40
 STATE_VERSION = 4
 HEARTBEAT_SECONDS = 2.0
+MIRROR_STATE_PATH_PATTERN = re.compile(
+    r"/private/var/mobile/Containers/Data/Application/"
+    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+    r"/Library/MessageCenterActivity/runtime\.activity\.json\Z")
 STATE_FIELDS = {
     "version", "monitorId", "runtimePid", "generation", "publishedAt",
     "healthy", "armed", "cleanupRequired", "lastActivityAt",
@@ -60,6 +64,91 @@ def _atomic_state_write(path: str, state: dict[str, Any]) -> None:
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def validate_mirror_state_path(path: Any) -> bool:
+    return type(path) is str and MIRROR_STATE_PATH_PATTERN.fullmatch(path) is not None
+
+
+def _open_mirror_parent(path: str) -> int:
+    if os.name != "posix" or not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise ActivityStateError("mirror_writer_not_root")
+    if (not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY") or
+            type(path) is not str or not path.startswith("/") or "\x00" in path or
+            any(part in ("", ".", "..") for part in path.split("/")[1:])):
+        raise ActivityStateError("mirror_path_invalid")
+    components = path.split("/")[1:-1]
+    if not components or components[-1] != "MessageCenterActivity":
+        raise ActivityStateError("mirror_directory_invalid")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open("/", flags)
+    try:
+        for index, component in enumerate(components):
+            created = False
+            if index == len(components) - 1:
+                try:
+                    os.mkdir(component, mode=0o755, dir_fd=descriptor)
+                    created = True
+                except FileExistsError:
+                    pass
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+            if created:
+                if os.fstat(descriptor).st_uid != 0:
+                    raise ActivityStateError("mirror_directory_owner_changed")
+                os.fchmod(descriptor, 0o755)
+                os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or
+                stat.S_IMODE(metadata.st_mode) != 0o755):
+            raise ActivityStateError("mirror_directory_invalid")
+        result, descriptor = descriptor, -1
+        return result
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _atomic_mirror_state_write(path: str, state: dict[str, Any]) -> None:
+    parent_fd = _open_mirror_parent(path)
+    basename = os.path.basename(path)
+    descriptor = -1
+    temporary = None
+    try:
+        try:
+            existing = os.stat(basename, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and (
+                not stat.S_ISREG(existing.st_mode) or existing.st_uid != 0 or
+                stat.S_IMODE(existing.st_mode) != 0o644):
+            raise ActivityStateError("mirror_file_invalid")
+        temporary = ".runtime-activity-" + secrets.token_hex(16)
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                             os.O_NOFOLLOW, 0o644, dir_fd=parent_fd)
+        os.fchmod(descriptor, 0o644)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            json.dump(state, stream, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, basename, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        temporary = None
+        published = os.stat(basename, dir_fd=parent_fd, follow_symlinks=False)
+        if (not stat.S_ISREG(published.st_mode) or published.st_uid != 0 or
+                stat.S_IMODE(published.st_mode) != 0o644):
+            raise ActivityStateError("mirror_publish_invalid")
+        os.fsync(parent_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary is not None:
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        os.close(parent_fd)
 
 
 def _load_saved_state(path: str) -> tuple[Optional[bool], Optional[bool]]:
@@ -120,12 +209,17 @@ def _load_saved_state(path: str) -> tuple[Optional[bool], Optional[bool]]:
 
 
 class ActivityPolicy:
-    def __init__(self, state_path: str, *, idle_seconds: float = IDLE_SECONDS,
+    def __init__(self, state_path: str, *, readable_state_path: Optional[str] = None,
+                 idle_seconds: float = IDLE_SECONDS,
                  clock: Callable[[], float] = time.monotonic) -> None:
         if (isinstance(idle_seconds, bool) or not isinstance(idle_seconds, (int, float))
                 or not math.isfinite(float(idle_seconds)) or idle_seconds <= 0):
             raise ValueError("invalid_idle_seconds")
         self.state_path = os.fspath(state_path)
+        self.readable_state_path = (None if readable_state_path is None else
+                                    os.fspath(readable_state_path))
+        if self.readable_state_path == self.state_path:
+            raise ValueError("mirror_must_be_separate_from_primary_state")
         self.monitor_id = secrets.token_hex(16)
         self.idle_seconds = float(idle_seconds)
         self.clock = clock
@@ -179,6 +273,29 @@ class ActivityPolicy:
             except Exception:
                 self.fail("state_unavailable", persist=False)
                 return False
+            if self.readable_state_path is not None:
+                try:
+                    _atomic_mirror_state_write(self.readable_state_path, state)
+                except Exception:
+                    with self._lock:
+                        self._healthy = False
+                        self._failed = True
+                        self._armed = True
+                        self._cleanup_required = True
+                        self._reason = "mirror_state_unavailable"
+                        self._persistence_pending = True
+                        self._state_generation += 1
+                        failed_state = self._state_locked(time.time())
+                    try:
+                        _atomic_state_write(self.state_path, failed_state)
+                        self._persisted_generation += 1
+                    except Exception:
+                        pass
+                    try:
+                        _atomic_mirror_state_write(self.readable_state_path, failed_state)
+                    except Exception:
+                        pass
+                    return False
             with self._lock:
                 self._persisted_generation += 1
                 self._last_persisted_at = float(now)
@@ -372,10 +489,12 @@ class InactiveHostMonitor:
 
 
 class NativeActivityMonitor:
-    def __init__(self, state_path: str, *, idle_seconds: float = IDLE_SECONDS,
+    def __init__(self, state_path: str, *, readable_state_path: Optional[str] = None,
+                 idle_seconds: float = IDLE_SECONDS,
                  clock: Callable[[], float] = time.monotonic,
                  iokit: Any = None, core_foundation: Any = None) -> None:
-        self.policy = ActivityPolicy(state_path, idle_seconds=idle_seconds, clock=clock)
+        self.policy = ActivityPolicy(state_path, readable_state_path=readable_state_path,
+                                     idle_seconds=idle_seconds, clock=clock)
         self._iokit = iokit
         self._cf = core_foundation
         self._client = None
@@ -400,7 +519,8 @@ class NativeActivityMonitor:
     def request_fields(self) -> dict[str, Any]:
         state = self.policy.snapshot()
         return {
-            "activityStatePath": self.policy.state_path,
+            "activityStatePath": (self.policy.readable_state_path or
+                                  self.policy.state_path),
             "activityMonitorId": self.policy.monitor_id,
             "activityRuntimePid": os.getpid(),
             "activityResumeToken": "{}:{}:{}:{}".format(
@@ -548,8 +668,10 @@ class NativeActivityMonitor:
             self._callback = None
 
 
-def create_monitor(state_path: str, *, idle_seconds: float = IDLE_SECONDS,
+def create_monitor(state_path: str, *, readable_state_path: Optional[str] = None,
+                   idle_seconds: float = IDLE_SECONDS,
                    clock: Callable[[], float] = time.monotonic) -> Any:
     if platform.system() == "Darwin" or os.environ.get("DEVICE_ACTIVITY_MONITOR") == "1":
-        return NativeActivityMonitor(state_path, idle_seconds=idle_seconds, clock=clock)
+        return NativeActivityMonitor(state_path, readable_state_path=readable_state_path,
+                                     idle_seconds=idle_seconds, clock=clock)
     return InactiveHostMonitor()
