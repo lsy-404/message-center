@@ -5,12 +5,14 @@ import io
 import json
 import os
 import sqlite3
+import stat
 import tempfile
 import sys
 import threading
 import time
 import unittest
 from contextlib import redirect_stderr
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -178,7 +180,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM cursors").fetchone()[0], 1)
 
-    def test_receive_hint_paths_are_local_and_published_only_after_durable_scan(self):
+    def test_receive_hint_paths_are_allowlisted_and_published_only_after_durable_scan(self):
         class Watcher:
             def __init__(self):
                 self.paths = None
@@ -190,22 +192,44 @@ class DeviceRuntimeTests(unittest.TestCase):
             def close(self):
                 self.closed = True
 
-        paths = ["/private/container/nt_msg.db", "/private/container/nt_msg.db-wal",
-                 "/private/container"]
+        paths = ["/private/preboot/JBROOT/var/mobile/Library/MessageCenterReceiveHints/signals/changed.json",
+                 "/private/preboot/JBROOT/var/mobile/Library/MessageCenterReceiveHints/signals"]
         result = {"ok": True, "sourceReadOk": True, "health": "online",
                   "cursor": {"next": "2"}, "messages": [self.event("new-1")],
                   "receiveHintPaths": paths}
         watcher = Watcher()
         relay = runtime.Relay(self.config, self.db, lambda _: result,
                               dirty_watcher=watcher)
-        relay.scan_profile("primary")
-        self.assertEqual(watcher.paths, paths)
+        with patch.object(runtime, "resolve_qq_receive_hint_paths", return_value=tuple(paths)):
+            relay.scan_profile("primary")
+        self.assertEqual(watcher.paths, tuple(paths))
         self.assertNotIn("receiveHintPaths", result)
         self.assertNotIn("receiveHintPaths", json_cursor(self.db))
         stored_body = self.db.execute("SELECT body FROM outbox").fetchone()[0]
         self.assertNotIn("/private/container", stored_body)
         relay.close()
         self.assertTrue(watcher.closed)
+
+    def test_receive_hint_paths_reject_arbitrary_local_paths_and_clear_watcher(self):
+        class Watcher:
+            def __init__(self):
+                self.paths = ["/private/preboot/JBROOT/var/mobile/Library/MessageCenterReceiveHints/signals"]
+
+            def set_paths(self, paths):
+                self.paths = paths
+
+            def close(self):
+                pass
+
+        result = {"ok": True, "sourceReadOk": True, "health": "online",
+                  "cursor": {"next": "2"}, "messages": [self.event("new-1")],
+                  "receiveHintPaths": ["/private/container/nt_msg.db", "/private/container"]}
+        watcher = Watcher()
+        relay = runtime.Relay(self.config, self.db, lambda _: result,
+                              dirty_watcher=watcher)
+        relay.scan_profile("primary")
+        self.assertEqual(watcher.paths, [])
+        self.assertNotIn("/private/container", json.dumps(json_cursor(self.db)))
 
     def test_receive_hint_paths_are_not_activated_for_failed_scan(self):
         class Watcher:
@@ -228,6 +252,45 @@ class DeviceRuntimeTests(unittest.TestCase):
             relay.scan_profile("primary")
         self.assertIsNone(watcher.paths)
         self.assertNotIn("receiveHintPaths", result)
+
+    def test_qq_receive_hint_allowlist_validates_canonical_metadata(self):
+        root = "/private/preboot/JBROOT/var/mobile/Library/MessageCenterReceiveHints"
+        paths = (root + "/signals/changed.json", root + "/signals")
+
+        def fake_realpath(path):
+            return "/private/preboot/JBROOT" if path == "/var/jb" else path
+
+        def fake_lstat(path):
+            if path == root:
+                return SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+            if path == paths[1]:
+                return SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=501)
+            if path == paths[0]:
+                return SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=501)
+            raise FileNotFoundError(path)
+
+        with patch.object(runtime.device_activity.platform, "system", return_value="Darwin"), \
+                patch.object(runtime.os.path, "realpath", side_effect=fake_realpath), \
+                patch.object(runtime.os, "lstat", side_effect=fake_lstat), \
+                patch.dict(sys.modules, {"pwd": SimpleNamespace(
+                    getpwnam=lambda _name: SimpleNamespace(pw_uid=501))}):
+            self.assertEqual(runtime.resolve_qq_receive_hint_paths(list(paths)), paths)
+            self.assertIsNone(runtime.resolve_qq_receive_hint_paths([root + "/other", paths[1]]))
+
+    def test_qq_receive_hint_allowlist_rejects_symlinked_signal_directory(self):
+        root = "/private/preboot/JBROOT/var/mobile/Library/MessageCenterReceiveHints"
+        paths = (root + "/signals/changed.json", root + "/signals")
+
+        def fake_realpath(path):
+            if path == "/var/jb":
+                return "/private/preboot/JBROOT"
+            return root if path == paths[1] else path
+
+        with patch.object(runtime.device_activity.platform, "system", return_value="Darwin"), \
+                patch.object(runtime.os.path, "realpath", side_effect=fake_realpath), \
+                patch.dict(sys.modules, {"pwd": SimpleNamespace(
+                    getpwnam=lambda _name: SimpleNamespace(pw_uid=501))}):
+            self.assertIsNone(runtime.resolve_qq_receive_hint_paths(paths))
 
     def test_dirty_scan_ack_requires_durable_scan_and_never_bypasses_existing_gates(self):
         class Watcher:

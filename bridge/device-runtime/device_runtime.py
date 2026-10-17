@@ -6,6 +6,7 @@ import hashlib
 import http.client
 import os
 import re
+import stat
 import selectors
 import signal
 import sqlite3
@@ -48,6 +49,7 @@ SOURCE_RECOVERY_FAILURE_THRESHOLD = 3
 SOURCE_RECOVERY_COOLDOWN = 300
 SOURCE_STARTUP_SETTLE = 60
 WAKE_REASON = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+QQ_RECEIVE_HINT_RELATIVE = ("signals/changed.json", "signals")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -351,6 +353,39 @@ def resolve_local_paths(config, config_path):
         if not os.path.isabs(config[key]):
             config[key] = os.path.join(base, config[key])
     return config
+
+
+def resolve_qq_receive_hint_paths(paths):
+    """Accept only the two canonical rootless signal paths with trusted metadata."""
+    if (device_activity.platform.system() != "Darwin" or
+            not isinstance(paths, (list, tuple)) or len(paths) != 2):
+        return None
+    jbroot = os.path.realpath("/var/jb")
+    if (not jbroot.startswith("/private/preboot/") or
+            not re.fullmatch(r"/private/preboot/[^/]+(?:/[^/]+)*", jbroot)):
+        return None
+    root = jbroot.rstrip("/") + "/var/mobile/Library/MessageCenterReceiveHints"
+    expected = tuple(root + "/" + item for item in QQ_RECEIVE_HINT_RELATIVE)
+    if tuple(paths) != expected:
+        return None
+    if any(os.path.realpath(path) != path for path in (root, expected[1], expected[0])):
+        return None
+    try:
+        import pwd
+        mobile_uid = pwd.getpwnam("mobile").pw_uid
+        root_info = os.lstat(root)
+        signals_info = os.lstat(expected[1])
+        changed_info = os.lstat(expected[0])
+    except (ImportError, KeyError, OSError):
+        return None
+    if (stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode) or
+            root_info.st_uid != 0 or stat.S_IMODE(root_info.st_mode) != 0o755 or
+            stat.S_ISLNK(signals_info.st_mode) or not stat.S_ISDIR(signals_info.st_mode) or
+            signals_info.st_uid != mobile_uid or stat.S_IMODE(signals_info.st_mode) != 0o700 or
+            stat.S_ISLNK(changed_info.st_mode) or not stat.S_ISREG(changed_info.st_mode) or
+            changed_info.st_uid != mobile_uid or stat.S_IMODE(changed_info.st_mode) != 0o600):
+        return None
+    return expected
 
 
 def run_adapter(path, request, timeout=30):
@@ -961,6 +996,9 @@ class Relay:
         if not isinstance(result, dict):
             raise RuntimeError("invalid_scan_result")
         receive_hint_paths = result.pop("receiveHintPaths", None)
+        validated_receive_hint_paths = None
+        if driver == "qq" and receive_hint_paths is not None:
+            validated_receive_hint_paths = resolve_qq_receive_hint_paths(receive_hint_paths)
         source_read_ok = result.get("sourceReadOk")
         if type(source_read_ok) is not bool:
             raise RuntimeError("invalid_scan_result")
@@ -1127,7 +1165,7 @@ class Relay:
             self.db.rollback()
             raise
         if driver == "qq" and receive_hint_paths is not None:
-            self.dirty_watcher.set_paths(receive_hint_paths)
+            self.dirty_watcher.set_paths(validated_receive_hint_paths or [])
         active = result.get("active") is True
         self.scan_interval[self.connector] = 15 if result.get("more") is True else (60 if active else 300)
         self.source_read_succeeded(self.connector)

@@ -9,3 +9,9 @@
 
 - Vnode notifications may be consumed before `wait()` starts; wake decisions must use current due/pending state, not require a generation edge within the current call.
 - Watcher runtime faults are transient: close stale descriptors/queue and retry on a bounded timer. Keep unsupported platform/API and malformed supplied paths as permanent disable cases.
+
+## QQ receive-hint allowlist follow-up
+
+The generic DirtyHint watcher remains path-agnostic. The QQ scan boundary now accepts only the canonical JBROOT-derived `signals/changed.json` and `signals` pair, verifies no symlink at each accepted node, and checks root-owned 0755 state plus mobile-owned 0700/0600 signal state. Invalid or missing metadata clears the watcher after a durable scan, allowing a later valid scan to restore it. The receive-hint field is removed before cursor/outbox persistence, so local paths do not enter durable state.
+
+Host evidence: `test_device_runtime.py` passed 121 tests (2 skipped); `test_device_runtime_dirty_hint.py` passed 8 tests. Added positive canonical metadata, arbitrary-path rejection/clear, and symlinked-signal-directory rejection coverage.

@@ -18,3 +18,7 @@
 - `DirtyHint.wait()` now wakes from due pending state even if the event was polled before entering `wait()`. Minimum wake spacing remains enforced.
 - Temporary queue, open, or reconcile failures now retire stale watcher descriptors and attempt reconstruction no more than once per five seconds. Permanent unavailability is reserved for unsupported APIs/platforms and malformed path input.
 - Regression coverage includes the already-due wait case and recovery after a one-shot queue error. Targeted watcher suite: 8 passed; full public test discovery: 183 passed, 2 skipped. No device/cloud operation was performed.
+
+- Implemented strict QQ canonical signal allowlist at `scan_profile` boundary.
+- Added metadata and negative-path tests; no device/cloud access.
+- Targeted host suites pass; pending commit for parent integration.
