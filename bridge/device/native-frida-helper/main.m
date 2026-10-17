@@ -814,7 +814,7 @@ main(int argc, char **argv)
     output[@"code"] = [NSString stringWithUTF8String:
         helper.error_code ?: helper.cleanup_code ?: "helper_failed"];
   }
-  output[@"cleanupIncomplete"] = @(helper.hard_timeout);
+  output[@"cleanupIncomplete"] = helper.hard_timeout ? @YES : @NO;
   if (helper.cleanup_code != NULL) {
     output[@"cleanupCode"] = [NSString stringWithUTF8String:helper.cleanup_code];
     output[@"cleanupStage"] = [NSString stringWithUTF8String:

@@ -32,7 +32,8 @@ test('helper preserves bounded cleanup stage and exact cleanup completion state'
   assert.match(source, /g_strcmp0\(helper->stage, "unload"\)/);
   assert.match(source, /g_strcmp0\(helper->stage, "detach"\)/);
   assert.match(source, /g_strcmp0\(helper->stage, "close"\)/);
-  assert.match(source, /output\[@"cleanupIncomplete"\] = @\(helper\.hard_timeout\)/);
+  assert.match(source, /output\[@"cleanupIncomplete"\] = helper\.hard_timeout \? @YES : @NO;/);
+  assert.doesNotMatch(source, /output\[@"cleanupIncomplete"\] = @\(helper\.hard_timeout\)/);
   assert.match(source, /output\[@"cleanupStage"\] = \[NSString stringWithUTF8String:\s+helper\.cleanup_stage \?: "unknown"\]/);
   const cleanupTimeout = source.match(/on_cleanup_timeout\([\s\S]*?(?=static void\nclose_manager)/)?.[0];
   assert.ok(cleanupTimeout);
@@ -96,6 +97,8 @@ test('build is manual with a narrow source trigger, pinned devkit, and artifact 
   assert.doesNotMatch(workflow, /schedule:/);
   assert.match(workflow, /C31AA39618A6996BF43A472F2F48E3E4C2CC72EEE101A1ED6820192CBF58BDEC/);
   assert.match(workflow, /actions\/upload-artifact/);
+  assert.match(workflow, /test\/device-native-helper-json-bool\.test\.m/);
+  assert.match(workflow, /Test Foundation JSON boolean encoding for gboolean values/);
   assert.match(workflow, /miphoneos-version-min=15\.0/);
   assert.match(workflow, /-framework,CoreFoundation/);
   assert.match(workflow, /permissions:\s+contents: read/);

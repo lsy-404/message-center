@@ -11,6 +11,7 @@ on:
       - "test/device-native-runtime-launcher.test.c"
       - "test/device-native-helper-binary-output.test.c"
       - "test/device-native-helper-contract.test.mjs"
+      - "test/device-native-helper-json-bool.test.m"
       - "test/device-hid-event-tree.test.c"
       - "test/device-hid-runtime-status.test.c"
 
@@ -93,6 +94,30 @@ jobs:
       - name: Test native helper lifecycle contract
         shell: bash
         run: node --test test/device-native-helper-contract.test.mjs
+
+      - name: Test Foundation JSON boolean encoding for gboolean values
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang -fobjc-arc -Wall -Wextra -Werror \
+            test/device-native-helper-json-bool.test.m \
+            -framework Foundation \
+            -o "$RUNNER_TEMP/device-native-helper-json-bool-test"
+          "$RUNNER_TEMP/device-native-helper-json-bool-test" \
+            > "$RUNNER_TEMP/device-native-helper-json-bool.jsonl"
+          python3 - "$RUNNER_TEMP/device-native-helper-json-bool.jsonl" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          lines = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+          if len(lines) != 2:
+              raise SystemExit("expected two serialized boolean values")
+          values = [json.loads(line).get("cleanupIncomplete") for line in lines]
+          if [type(value) for value in values] != [bool, bool] or values != [False, True]:
+              raise SystemExit("gboolean 0/1 did not serialize as JSON false/true")
+          print("Foundation emitted strict JSON booleans for gboolean-equivalent 0/1")
+          PY
 
       - name: Build iOS 15+ arm64 helper
         shell: bash

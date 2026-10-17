@@ -86,3 +86,5 @@
 | 223 | [Feature] device-activity-mirror | Publish the exact v4 activity lease to a validated root-readable atomic mirror for the private sender | The sender needs a durable local activity guard without access to the primary 0600 runtime state | 🔄 In progress |
 
 | 232 | [Diagnostic] Native helper cleanup stage | Preserve finite cleanup-stage and strict cleanup-completion evidence in helper failures | Generic cleanup errors hide the pending Frida cleanup step and whether forced exit occurred | ✅ Complete |
+
+| 233 | [BugFix] Native helper JSON booleans | Encode hard_timeout as an actual Foundation JSON boolean and verify the emitted JSON type | Strict Python parsing discarded cleanupIncomplete because a boxed int serialized as 0/1 | ✅ Complete |
