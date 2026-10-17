@@ -614,7 +614,8 @@ class Relay:
         try:
             descriptor = os.open(self.native_operation_state_path,
                                 os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-                                | getattr(os, "O_CLOEXEC", 0))
+                                | getattr(os, "O_CLOEXEC", 0)
+                                | (getattr(os, "O_NONBLOCK", 0) if os.name == "posix" else 0))
             metadata = os.fstat(descriptor)
             if (not stat.S_ISREG(metadata.st_mode) or
                     (os.name == "posix" and hasattr(os, "getuid")
@@ -709,6 +710,8 @@ class Relay:
             del self.native_operation_uncertain[connector_id]
             if not self._persist_native_operation_state():
                 self.native_operation_uncertain[connector_id] = previous
+                return False
+        return True
 
     def activity_state(self):
         try:
@@ -1323,8 +1326,10 @@ class Relay:
             self.dirty_watcher.set_paths(validated_receive_hint_paths or [])
         active = result.get("active") is True
         self.scan_interval[self.connector] = 15 if result.get("more") is True else (60 if active else 300)
+        if not self._clear_native_operation(self.connector):
+            self.health[self.connector] = False
+            raise SourceReadError("native_operation_state_persist_failed")
         self.source_read_succeeded(self.connector)
-        self._clear_native_operation(self.connector)
         return result.get("health") == "online"
 
     def ensure_active(self, recovery_driver=None, recovery_reason="read_failure", observed_pid=None):
