@@ -134,7 +134,7 @@ static void mc_print_status(const mc_monitor *monitor, bool ready, bool running,
     } else {
         printf("%lld", (long long)ended_at);
     }
-    printf(",\"elapsedSeconds\":%.3f,\"events\":%" PRIu64,
+    printf(",\"elapsedSeconds\":%.3f,\"events\":%" PRIu64 ",",
            elapsed, monitor->counters.events);
     mc_runtime_status_write_json(stdout, runtime_status);
     fputs(",\"rootTypes\":", stdout);
