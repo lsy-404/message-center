@@ -118,8 +118,9 @@ def _open_mirror_parent(path: str) -> int:
 
 
 def _atomic_mirror_state_write(path: str, state: dict[str, Any]) -> None:
-    parent_fd = _open_mirror_parent(path)
-    basename = os.path.basename(path)
+    publish_path = (shared_mirror_state_path() if path == SHARED_MIRROR_ALIAS else path)
+    parent_fd = _open_mirror_parent(publish_path)
+    basename = os.path.basename(publish_path)
     descriptor = -1
     temporary = None
     try:

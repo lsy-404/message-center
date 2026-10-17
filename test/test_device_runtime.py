@@ -70,12 +70,9 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_darwin_activity_uses_fixed_rootless_shared_mirror(self):
-        path = "/private/preboot/JBROOT/var/mobile/Library/MessageCenterActivity/runtime.activity.json"
+        path = runtime.device_activity.SHARED_MIRROR_ALIAS
         monitor = runtime.device_activity.InactiveHostMonitor()
         with patch.object(runtime.device_activity.platform, "system", return_value="Darwin"), \
-             patch.object(runtime.device_activity.os.path, "realpath",
-                          side_effect=lambda value: "/private/preboot/JBROOT" if value == "/var/jb"
-                          else path), \
              patch.object(runtime, "run_adapter") as adapter, \
              patch.object(runtime.device_activity, "create_monitor", return_value=monitor) as factory:
             relay = runtime.Relay(self.config, db=self.db)
@@ -86,15 +83,20 @@ class DeviceRuntimeTests(unittest.TestCase):
     def test_darwin_activity_rejects_untrusted_shared_mirror_root(self):
         with patch.object(runtime.device_activity.platform, "system", return_value="Darwin"), \
              patch.object(runtime.device_activity.os.path, "realpath", return_value="/tmp/outside"):
-            with self.assertRaisesRegex(runtime.device_activity.ActivityStateError, "mirror_root_invalid"):
-                runtime.Relay(self.config, db=self.db)
+            monitor = runtime.device_activity.InactiveHostMonitor()
+            with patch.object(runtime.device_activity, "create_monitor", return_value=monitor):
+                relay = runtime.Relay(self.config, db=self.db)
+                with self.assertRaisesRegex(runtime.device_activity.ActivityStateError, "mirror_root_invalid"):
+                    runtime.device_activity._atomic_mirror_state_write(
+                        runtime.device_activity.SHARED_MIRROR_ALIAS, {})
+                relay.close()
 
     def test_darwin_activity_rejects_shared_alias_escape(self):
-        with patch.object(runtime.device_activity.platform, "system", return_value="Darwin"), \
-             patch.object(runtime.device_activity.os.path, "realpath", side_effect=lambda value:
+        with patch.object(runtime.device_activity.os.path, "realpath", side_effect=lambda value:
                           "/private/preboot/JBROOT" if value == "/var/jb" else "/tmp/outside"):
             with self.assertRaisesRegex(runtime.device_activity.ActivityStateError, "mirror_path_invalid"):
-                runtime.Relay(self.config, db=self.db)
+                runtime.device_activity._atomic_mirror_state_write(
+                    runtime.device_activity.SHARED_MIRROR_ALIAS, {})
 
     def event(self, ident):
         return {"externalId": ident, "conversationExternalId": "conversation-aaaaaaaa",

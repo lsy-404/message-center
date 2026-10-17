@@ -259,6 +259,24 @@ class DeviceActivityPolicyTests(unittest.TestCase):
         self.assertTrue(saved["armed"])
         self.assertTrue(saved["cleanupRequired"])
 
+    def test_shared_alias_is_reported_but_resolved_before_publisher_open(self):
+        alias = device_activity.SHARED_MIRROR_ALIAS
+        canonical = "/private/preboot/JBROOT/var/mobile/Library/MessageCenterActivity/runtime.activity.json"
+        monitor = device_activity.NativeActivityMonitor(
+            self.state_path, readable_state_path=alias, iokit=object(), core_foundation=object())
+        self.assertEqual(monitor.request_fields()["activityStatePath"], alias)
+        opened = []
+
+        def capture(path):
+            opened.append(path)
+            raise RuntimeError("stop_before_io")
+
+        with patch.object(device_activity, "shared_mirror_state_path", return_value=canonical), \
+             patch.object(device_activity, "_open_mirror_parent", side_effect=capture):
+            with self.assertRaisesRegex(RuntimeError, "stop_before_io"):
+                device_activity._atomic_mirror_state_write(alias, {})
+        self.assertEqual(opened, [canonical])
+
     def test_home_and_digitizer_activity_renew_the_grace(self):
         self.clock.value += 150
         self.policy.record_activity("home")

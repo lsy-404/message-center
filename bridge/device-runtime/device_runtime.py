@@ -536,10 +536,9 @@ class Relay:
         if activity_monitor is not None:
             self.activity_monitor = activity_monitor
         elif device_activity.platform.system() == "Darwin":
-            mirror_path = device_activity.shared_mirror_state_path()
             self.activity_monitor = device_activity.create_monitor(
                 config["database"] + ".activity.json",
-                readable_state_path=mirror_path)
+                readable_state_path=device_activity.SHARED_MIRROR_ALIAS)
         else:
             self.activity_monitor = device_activity.create_monitor(
                 config["database"] + ".activity.json")
