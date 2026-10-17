@@ -69,7 +69,7 @@ class DirtyHintTests(unittest.TestCase):
         queue = FakeQueue()
         watcher = self._watcher(clock, queue)
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "source.db"
+            path = Path(temporary).resolve() / "source.db"
             path.write_bytes(b"fixture")
             self.assertTrue(watcher.set_paths([str(path)]))
             self.assertIsNone(watcher.due_generation())
@@ -96,7 +96,7 @@ class DirtyHintTests(unittest.TestCase):
         clock = FakeClock()
         watcher = self._watcher(clock, FakeQueue())
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "source.db"
+            path = Path(temporary).resolve() / "source.db"
             path.write_bytes(b"fixture")
             watcher.set_paths([str(path)])
             clock.advance(1.1)
@@ -112,7 +112,7 @@ class DirtyHintTests(unittest.TestCase):
         queue = FakeQueue()
         watcher = self._watcher(clock, queue)
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "source.db"
+            path = Path(temporary).resolve() / "source.db"
             path.write_bytes(b"fixture")
             watcher.set_paths([str(path)])
             fd = next(iter(watcher._watched))
@@ -152,7 +152,7 @@ class DirtyHintTests(unittest.TestCase):
             fstat_fn=lambda fd: descriptors[fd], close_fd=descriptors.pop,
         )
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "source.db"
+            path = Path(temporary).resolve() / "source.db"
             path.write_bytes(b"fixture")
             self.assertTrue(watcher.set_paths([str(path)]))
             watcher.poll()
@@ -171,7 +171,7 @@ class DirtyHintTests(unittest.TestCase):
         queue = FakeQueue()
         watcher = self._watcher(clock, queue)
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "source.db"
+            path = Path(temporary).resolve() / "source.db"
             path.write_bytes(b"fixture")
             watcher.set_paths([str(path)])
             clock.advance(1.1)
@@ -195,8 +195,9 @@ class DirtyHintTests(unittest.TestCase):
         queue = FakeQueue()
         watcher = self._watcher(clock, queue)
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "source.db"
-            replacement = Path(temporary) / "replacement.db"
+            temporary = Path(temporary).resolve()
+            path = temporary / "source.db"
+            replacement = temporary / "replacement.db"
             path.write_bytes(b"old")
             watcher.set_paths([str(path)])
             old_fd = next(iter(watcher._watched))
