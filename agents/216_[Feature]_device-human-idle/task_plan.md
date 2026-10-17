@@ -11,5 +11,6 @@ Implement on-device human activity gating and resume without changing message cu
 
 1. [x] Fast-forward this worktree to local main and inspect the current WebKit IOKit SPI wrapper.
 2. [x] Query Apple OSS IOHIDFamily/IOKitUser paths and the old IOHIDFamily-308 tag for the C event declaration.
-3. [x] Keep the probe root-type-only; extend the explicit diagnostic window to 300 seconds and atomically publish one-second aggregate status at a caller-specified validation path.
-4. [x] Add status writer/limit tests, record the evidence gap and primary URLs, then commit the narrow follow-up.
+3. [x] Keep the initial probe root-type-only; extend the explicit diagnostic window to 300 seconds and atomically publish one-second aggregate status at a caller-specified validation path.
+4. [x] Verify Apple user-space child-event bridging evidence and extend only the owned diagnostic to bounded, aggregate-only child-type counts.
+5. [ ] Have the parent verify the target export and run the owned probe during an explicit touch window; production classification remains unchanged pending that evidence.

@@ -1,4 +1,4 @@
-"""Bounded, root-type-only IOHID probe for explicit device validation."""
+"""Bounded, type-only IOHID event-tree probe for explicit device validation."""
 from __future__ import annotations
 
 import argparse
@@ -15,15 +15,26 @@ from typing import Callable
 TYPE_LIMIT = 64
 MAX_DURATION_SECONDS = 300.0
 MAX_EVENTS = 25000
+MAX_CHILDREN_PER_EVENT = 32
+MAX_TREE_DEPTH = 4
+MAX_TREE_NODES = 64
 
 
 class Aggregates:
     def __init__(self) -> None:
         self.root_types = [0] * TYPE_LIMIT
+        self.child_types = [0] * TYPE_LIMIT
         self.unknown_root_types = 0
+        self.unknown_child_types = 0
+        self.child_traversal_errors = 0
         self.events = 0
 
-    def add(self, root_event: int, get_type: Callable[[int], int]) -> None:
+    def add(self, root_event: int, get_type: Callable[[int], int],
+            get_children: Callable[[int], int] | None = None,
+            array_count: Callable[[int], int] | None = None,
+            array_value: Callable[[int, int], int] | None = None,
+            cf_type_id: Callable[[int], int] | None = None,
+            cf_array_type_id: int | None = None) -> None:
         self.events += 1
         root_type = int(get_type(root_event))
         if 0 <= root_type < TYPE_LIMIT:
@@ -31,15 +42,72 @@ class Aggregates:
         else:
             self.unknown_root_types += 1
 
+        if get_children is None:
+            return
+        try:
+            if any(value is None for value in
+                   (array_count, array_value, cf_type_id, cf_array_type_id)):
+                raise ValueError("incomplete_child_api")
+            local_types, local_unknown = _collect_child_types(
+                root_event, get_type, get_children, array_count, array_value,
+                cf_type_id, cf_array_type_id)
+            for event_type, count in local_types.items():
+                self.child_types[event_type] += count
+            self.unknown_child_types += local_unknown
+        except Exception:
+            self.child_traversal_errors += 1
+
     def summary(self, elapsed: float, callback_errors: int) -> dict:
         return {
             "elapsedSeconds": round(elapsed, 3),
             "events": self.events,
             "rootTypes": {str(i): count for i, count in enumerate(self.root_types) if count},
+            "childTypes": {str(i): count for i, count in enumerate(self.child_types) if count},
             "unknownRootTypes": self.unknown_root_types,
+            "unknownChildTypes": self.unknown_child_types,
+            "childTraversalErrors": self.child_traversal_errors,
             "callbackErrors": callback_errors,
         }
 
+
+def _collect_child_types(root_event: int, get_type: Callable[[int], int],
+                         get_children: Callable[[int], int],
+                         array_count: Callable[[int], int],
+                         array_value: Callable[[int, int], int],
+                         cf_type_id: Callable[[int], int],
+                         cf_array_type_id: int) -> tuple[dict[int, int], int]:
+    local_types: dict[int, int] = {}
+    unknown = 0
+    visited = 1
+
+    def visit(event: int, depth: int) -> None:
+        nonlocal visited, unknown
+        child_array = int(get_children(event) or 0)
+        if not child_array:
+            return
+        if int(cf_type_id(child_array)) != cf_array_type_id:
+            raise ValueError("children_not_cfarray")
+        count = int(array_count(child_array))
+        if count < 0 or count > MAX_CHILDREN_PER_EVENT:
+            raise ValueError("child_count_limit")
+        if count and depth >= MAX_TREE_DEPTH:
+            raise ValueError("child_depth_limit")
+        if visited + count > MAX_TREE_NODES:
+            raise ValueError("child_node_limit")
+        for index in range(count):
+            child = int(array_value(child_array, index) or 0)
+            if not child:
+                raise ValueError("null_child_event")
+            visited += 1
+            event_type = int(get_type(child))
+            if 0 <= event_type < TYPE_LIMIT:
+                local_types[event_type] = local_types.get(event_type, 0) + 1
+            else:
+                unknown += 1
+            visit(child, depth + 1)
+
+    visit(root_event, 0)
+    return local_types, unknown
 
 def _status_payload(aggregates: Aggregates, *, ready: bool, running: bool,
                     started_at: float | None, ended_at: float | None,
@@ -105,6 +173,22 @@ def run_probe(duration: float = 300.0, max_events: int = MAX_EVENTS,
 
     get_type = io.IOHIDEventGetType
     get_type.argtypes, get_type.restype = [void_p], ctypes.c_uint32
+    libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    dlsym = libsystem.dlsym
+    dlsym.argtypes, dlsym.restype = [void_p, ctypes.c_char_p], void_p
+    get_children_symbol = dlsym(io._handle, b"IOHIDEventGetChildren")
+    if not get_children_symbol:
+        raise RuntimeError("hid_event_children_export_unavailable")
+    get_children = ctypes.CFUNCTYPE(void_p, void_p)(get_children_symbol)
+    cf_get_type_id = cf.CFGetTypeID
+    cf_get_type_id.argtypes, cf_get_type_id.restype = [void_p], ctypes.c_ulong
+    cf_array_get_type_id = cf.CFArrayGetTypeID
+    cf_array_get_type_id.argtypes, cf_array_get_type_id.restype = [], ctypes.c_ulong
+    cf_array_get_count = cf.CFArrayGetCount
+    cf_array_get_count.argtypes, cf_array_get_count.restype = [void_p], ctypes.c_long
+    cf_array_get_value = cf.CFArrayGetValueAtIndex
+    cf_array_get_value.argtypes, cf_array_get_value.restype = [void_p, ctypes.c_long], void_p
+    cf_array_type_id = int(cf_array_get_type_id())
     run_loop_current = cf.CFRunLoopGetCurrent
     run_loop_current.argtypes, run_loop_current.restype = [], void_p
     run_in_mode = cf.CFRunLoopRunInMode
@@ -132,7 +216,11 @@ def run_probe(duration: float = 300.0, max_events: int = MAX_EVENTS,
             callback_limit_reached = True
             return
         try:
-            aggregates.add(int(event), lambda ptr: int(get_type(ptr)))
+            aggregates.add(int(event), lambda ptr: int(get_type(ptr)),
+                           lambda ptr: int(get_children(ptr) or 0),
+                           lambda array: int(cf_array_get_count(array)),
+                           lambda array, index: int(cf_array_get_value(array, index) or 0),
+                           lambda array: int(cf_get_type_id(array)), cf_array_type_id)
             if aggregates.events >= max_events:
                 callback_limit_reached = True
         except Exception:
