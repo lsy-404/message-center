@@ -87,13 +87,17 @@ class DeviceRuntimeTests(unittest.TestCase):
             relay.close()
 
     def test_darwin_activity_bootstrap_rejects_unavailable_or_extra_fields(self):
-        for response in ({"ok": False, "error": "unavailable"},
-                         {"ok": True, "activityMirrorPath": "/private/var/runtime.activity.json"},
-                         {"ok": True, "activityMirrorPath": None, "extra": True}):
+        cases = ((None, "activity_mirror_response_not_object"),
+                 ({"ok": False, "error": "unavailable"}, "activity_mirror_adapter_rejected"),
+                 ({"ok": True, "activityMirrorPath": None, "extra": True},
+                  "activity_mirror_response_fields_invalid"),
+                 ({"ok": True, "activityMirrorPath": "/private/var/runtime.activity.json"},
+                  "activity_mirror_path_invalid"))
+        for response, error in cases:
             with self.subTest(response=response), \
                  patch.object(runtime.device_activity.platform, "system", return_value="Darwin"), \
                  patch.object(runtime.device_activity, "create_monitor") as factory:
-                with self.assertRaisesRegex(RuntimeError, "activity_mirror_unavailable"):
+                with self.assertRaisesRegex(RuntimeError, error):
                     runtime.Relay(self.config, db=self.db, adapter_call=lambda _request: response)
                 factory.assert_not_called()
 
