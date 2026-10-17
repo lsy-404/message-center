@@ -43,7 +43,6 @@ HEARTBEAT_MIN_INTERVAL = 30
 ADAPTER_SCAN_TIMEOUT = 60
 ADAPTER_SEND_TIMEOUT = 130
 ADAPTER_WAKE_TIMEOUT = 55
-ADAPTER_ACTIVITY_MIRROR_TIMEOUT = 5
 AUTO_WAKE_INTERVAL = 60
 SOURCE_RECOVERY_FAILURE_THRESHOLD = 3
 SOURCE_RECOVERY_COOLDOWN = 300
@@ -444,23 +443,7 @@ def adapter_timeout_for_request(request):
         return ADAPTER_SEND_TIMEOUT
     if operation == "ensure-active":
         return ADAPTER_WAKE_TIMEOUT
-    if operation == "activity-mirror-path":
-        return ADAPTER_ACTIVITY_MIRROR_TIMEOUT
     raise ValueError("unsupported_adapter_operation")
-
-
-def activity_mirror_bootstrap_error(result):
-    if not isinstance(result, dict):
-        return "response_not_object"
-    if result.get("ok") is False:
-        return "adapter_rejected"
-    if set(result) != {"ok", "activityMirrorPath"}:
-        return "response_fields_invalid"
-    if result.get("ok") is not True:
-        return "adapter_rejected"
-    if not device_activity.validate_mirror_state_path(result.get("activityMirrorPath")):
-        return "path_invalid"
-    return None
 
 
 def wake_error_category(error):
@@ -553,13 +536,10 @@ class Relay:
         if activity_monitor is not None:
             self.activity_monitor = activity_monitor
         elif device_activity.platform.system() == "Darwin":
-            result = self.adapter_call({"op": "activity-mirror-path", "driver": "qq"})
-            error = activity_mirror_bootstrap_error(result)
-            if error is not None:
-                raise RuntimeError("activity_mirror_" + error)
+            mirror_path = device_activity.shared_mirror_state_path()
             self.activity_monitor = device_activity.create_monitor(
                 config["database"] + ".activity.json",
-                readable_state_path=result["activityMirrorPath"])
+                readable_state_path=mirror_path)
         else:
             self.activity_monitor = device_activity.create_monitor(
                 config["database"] + ".activity.json")

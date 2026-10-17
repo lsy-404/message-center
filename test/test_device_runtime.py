@@ -69,37 +69,32 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.db.close()
         self.temp.cleanup()
 
-    def test_darwin_activity_bootstrap_uses_only_valid_local_container_path(self):
-        path = ("/private/var/mobile/Containers/Data/Application/"
-                "00000000-0000-0000-0000-000000000000/Library/MessageCenterActivity/runtime.activity.json")
-        requests = []
+    def test_darwin_activity_uses_fixed_rootless_shared_mirror(self):
+        path = "/private/preboot/JBROOT/var/mobile/Library/MessageCenterActivity/runtime.activity.json"
         monitor = runtime.device_activity.InactiveHostMonitor()
-
-        def adapter(request):
-            requests.append(request)
-            return {"ok": True, "activityMirrorPath": path}
-
         with patch.object(runtime.device_activity.platform, "system", return_value="Darwin"), \
+             patch.object(runtime.device_activity.os.path, "realpath",
+                          side_effect=lambda value: "/private/preboot/JBROOT" if value == "/var/jb"
+                          else path), \
+             patch.object(runtime, "run_adapter") as adapter, \
              patch.object(runtime.device_activity, "create_monitor", return_value=monitor) as factory:
-            relay = runtime.Relay(self.config, db=self.db, adapter_call=adapter)
-            self.assertEqual(requests, [{"op": "activity-mirror-path", "driver": "qq"}])
+            relay = runtime.Relay(self.config, db=self.db)
             factory.assert_called_once_with(self.db_path + ".activity.json", readable_state_path=path)
+            adapter.assert_not_called()
             relay.close()
 
-    def test_darwin_activity_bootstrap_rejects_unavailable_or_extra_fields(self):
-        cases = ((None, "activity_mirror_response_not_object"),
-                 ({"ok": False, "error": "unavailable"}, "activity_mirror_adapter_rejected"),
-                 ({"ok": True, "activityMirrorPath": None, "extra": True},
-                  "activity_mirror_response_fields_invalid"),
-                 ({"ok": True, "activityMirrorPath": "/private/var/runtime.activity.json"},
-                  "activity_mirror_path_invalid"))
-        for response, error in cases:
-            with self.subTest(response=response), \
-                 patch.object(runtime.device_activity.platform, "system", return_value="Darwin"), \
-                 patch.object(runtime.device_activity, "create_monitor") as factory:
-                with self.assertRaisesRegex(RuntimeError, error):
-                    runtime.Relay(self.config, db=self.db, adapter_call=lambda _request: response)
-                factory.assert_not_called()
+    def test_darwin_activity_rejects_untrusted_shared_mirror_root(self):
+        with patch.object(runtime.device_activity.platform, "system", return_value="Darwin"), \
+             patch.object(runtime.device_activity.os.path, "realpath", return_value="/tmp/outside"):
+            with self.assertRaisesRegex(runtime.device_activity.ActivityStateError, "mirror_root_invalid"):
+                runtime.Relay(self.config, db=self.db)
+
+    def test_darwin_activity_rejects_shared_alias_escape(self):
+        with patch.object(runtime.device_activity.platform, "system", return_value="Darwin"), \
+             patch.object(runtime.device_activity.os.path, "realpath", side_effect=lambda value:
+                          "/private/preboot/JBROOT" if value == "/var/jb" else "/tmp/outside"):
+            with self.assertRaisesRegex(runtime.device_activity.ActivityStateError, "mirror_path_invalid"):
+                runtime.Relay(self.config, db=self.db)
 
     def event(self, ident):
         return {"externalId": ident, "conversationExternalId": "conversation-aaaaaaaa",
@@ -953,19 +948,6 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(request["op"], "scan")
         self.assertEqual(run.call_args.kwargs["timeout"], runtime.ADAPTER_SCAN_TIMEOUT)
         self.assertEqual(runtime.ADAPTER_SCAN_TIMEOUT, 60)
-
-    def test_default_relay_adapter_uses_activity_mirror_operation_deadline_on_darwin(self):
-        path = ("/private/var/mobile/Containers/Data/Application/"
-                "00000000-0000-0000-0000-000000000000/Library/MessageCenterActivity/runtime.activity.json")
-        result = {"ok": True, "activityMirrorPath": path}
-        with patch.object(runtime.device_activity.platform, "system", return_value="Darwin"), \
-             patch.object(runtime, "run_adapter", return_value=result) as run:
-            relay = runtime.Relay(self.config, self.db)
-            relay.close()
-        request = run.call_args.args[1]
-        self.assertEqual(request, {"op": "activity-mirror-path", "driver": "qq"})
-        self.assertEqual(run.call_args.kwargs["timeout"], runtime.ADAPTER_ACTIVITY_MIRROR_TIMEOUT)
-        self.assertEqual(runtime.ADAPTER_ACTIVITY_MIRROR_TIMEOUT, 5)
 
     def test_send_adapter_timeout_covers_private_deadline_and_remains_uncertain(self):
         self.save_cursor()

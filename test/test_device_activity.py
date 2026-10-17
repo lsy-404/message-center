@@ -259,15 +259,6 @@ class DeviceActivityPolicyTests(unittest.TestCase):
         self.assertTrue(saved["armed"])
         self.assertTrue(saved["cleanupRequired"])
 
-    def test_mirror_path_accepts_only_canonical_container_suffix(self):
-        home = "/private/var/mobile/Containers/Data/Application/00000000-0000-0000-0000-000000000000"
-        suffix = "/Library/MessageCenterActivity/runtime.activity.json"
-        self.assertTrue(device_activity.validate_mirror_state_path(home + suffix))
-        for value in (None, home + "/../" + suffix, home + suffix + ".tmp",
-                      home.replace("/private/var", "/var") + suffix,
-                      "/private/var/MessageCenterActivity/runtime.activity.json"):
-            self.assertFalse(device_activity.validate_mirror_state_path(value))
-
     def test_home_and_digitizer_activity_renew_the_grace(self):
         self.clock.value += 150
         self.policy.record_activity("home")

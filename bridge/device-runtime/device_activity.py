@@ -24,10 +24,7 @@ CONSUMER_USAGE_PAGE = 0x0C
 HOME_USAGE = 0x40
 STATE_VERSION = 4
 HEARTBEAT_SECONDS = 2.0
-MIRROR_STATE_PATH_PATTERN = re.compile(
-    r"/private/var/mobile/Containers/Data/Application/"
-    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
-    r"/Library/MessageCenterActivity/runtime\.activity\.json\Z")
+SHARED_MIRROR_ALIAS = "/var/jb/var/mobile/Library/MessageCenterActivity/runtime.activity.json"
 STATE_FIELDS = {
     "version", "monitorId", "runtimePid", "generation", "publishedAt",
     "healthy", "armed", "cleanupRequired", "lastActivityAt",
@@ -66,8 +63,18 @@ def _atomic_state_write(path: str, state: dict[str, Any]) -> None:
             os.unlink(temporary)
 
 
-def validate_mirror_state_path(path: Any) -> bool:
-    return type(path) is str and MIRROR_STATE_PATH_PATTERN.fullmatch(path) is not None
+def shared_mirror_state_path() -> str:
+    """Resolve the fixed rootless shared path while preserving the trusted alias boundary."""
+    jbroot = os.path.realpath("/var/jb")
+    if (not jbroot.startswith("/private/preboot/") or
+            jbroot == "/private/preboot/" or
+            not re.fullmatch(r"/private/preboot/[^/]+(?:/[^/]+)*", jbroot)):
+        raise ActivityStateError("mirror_root_invalid")
+    resolved = os.path.realpath(SHARED_MIRROR_ALIAS)
+    expected = jbroot.rstrip("/") + "/var/mobile/Library/MessageCenterActivity/runtime.activity.json"
+    if resolved != expected:
+        raise ActivityStateError("mirror_path_invalid")
+    return resolved
 
 
 def _open_mirror_parent(path: str) -> int:
