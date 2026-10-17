@@ -61,6 +61,15 @@ function normalizedReplyPreview(value) {
   };
 }
 
+function exactQuoteBodyUpgrade(connector, stored, item, bodyText) {
+  return connector.kind === "qq" && normalizedReplyPreview(item.reply) !== null &&
+    /^[a-zA-Z0-9_-]{1,64}:qq-message:[0-9]{1,20}$/.test(String(item.externalId)) &&
+    stored.body === `[引用消息]\n${bodyText}` &&
+    typeof item.senderId === "string" && item.senderId.length > 0 && stored.sender_id === item.senderId &&
+    Number.isFinite(Date.parse(stored.occurred_at)) &&
+    Date.parse(stored.occurred_at) === Date.parse(item.occurredAt);
+}
+
 function normalizedInboundAttachment(attachment) {
   const externalId = String(attachment?.externalId || "");
   const mimeType = String(attachment?.mimeType || "application/octet-stream").slice(0, 200);
@@ -1478,7 +1487,7 @@ async function ingestEvents(request, env) {
     let canonicalAvatarLabel = String(item.avatarLabel || item.conversationTitle[0] || "?").slice(0, 2);
     if (!count(result.meta?.changes)) {
       const existing = await env.DB.prepare(`
-        SELECT id, conversation_id, queue_class, direction, body, content_type, occurred_at, metadata_json,
+        SELECT id, conversation_id, queue_class, direction, sender_id, body, content_type, occurred_at, metadata_json,
           (SELECT COUNT(*) FROM attachments a WHERE a.message_id = messages.id) AS attachment_count
         FROM messages WHERE connector_id = ? AND external_id = ?
       `).bind(connectorId, item.externalId).first();
@@ -1502,7 +1511,8 @@ async function ingestEvents(request, env) {
         existing.direction === "inbound" && existing.content_type === "text" &&
         canonicalBody === "[类型:8]" && existing.attachment_count === 0 && previousAttachments.length === 0 &&
         upgradedBody.trim().length > 0 && upgradedBody !== "[类型:8]";
-      if (!exactGraytipPlaceholder && existing.queue_class !== "background" && canonicalBody !== upgradedBody &&
+      const quoteBodyUpgrade = exactQuoteBodyUpgrade(connector, existing, item, upgradedBody);
+      if (!exactGraytipPlaceholder && !quoteBodyUpgrade && existing.queue_class !== "background" && canonicalBody !== upgradedBody &&
           !(canonicalBody === "[file:asset]" && semanticCardBody(upgradedBody))) {
         await deleteRequestCreatedEmptyConversation(env, requestCreatedConversationId);
         throw new Error("message_external_id_conflict");
@@ -1517,6 +1527,18 @@ async function ingestEvents(request, env) {
       }
       metadata = JSON.stringify({ ...existingMetadata, ...safeJson(metadata, {}),
         attachments: canonicalAttachments });
+      if (quoteBodyUpgrade) {
+        const quoteUpdate = await env.DB.prepare(`
+          UPDATE messages SET body = ?, content_type = ?, metadata_json = ?
+          WHERE id = ? AND connector_id = ? AND external_id = ? AND conversation_id = ?
+            AND direction = ? AND sender_id = ? AND occurred_at = ? AND body = ? AND metadata_json = ?
+        `).bind(upgradedBody, incomingContentType, metadata, existing.id, connectorId, item.externalId,
+          conversation.id, existing.direction, existing.sender_id, existing.occurred_at,
+          existing.body, existing.metadata_json).run();
+        if (!count(quoteUpdate.meta?.changes)) throw new Error("message_external_id_conflict");
+        canonicalBody = upgradedBody;
+        upgraded += 1;
+      }
       canonicalConversationTitle = String(conversation.title || item.conversationTitle).slice(0, 200);
       canonicalAvatarLabel = String(conversation.avatar_label || item.avatarLabel || item.conversationTitle[0] || "?").slice(0, 2);
       if (exactGraytipPlaceholder) {
@@ -1632,6 +1654,8 @@ async function ingestGroupTextBackups(request, env) {
   const normalized = [];
   for (const item of body.messages) {
     const bodyText = String(item?.body || "").trim();
+    const replyPreview = normalizedReplyPreview(item?.reply);
+    if (item?.reply !== undefined && item?.reply !== null && !replyPreview) throw new Error("invalid_reply_preview");
     if (item?.isSelf !== undefined && typeof item.isSelf !== "boolean") {
       throw new Error("invalid_message_self_flag");
     }
@@ -1685,7 +1709,7 @@ async function ingestGroupTextBackups(request, env) {
     const placement = new Set(["normal", "folded", "message_box"]).has(String(item?.placement))
       ? String(item.placement) : "unknown";
     const occurredAt = new Date(item.occurredAt).toISOString();
-    normalized.push({ item, bodyText, placement, occurredAt, attachmentMetadata });
+    normalized.push({ item, bodyText, placement, occurredAt, attachmentMetadata, replyPreview });
     statements.push(env.DB.prepare(`
       INSERT OR IGNORE INTO group_text_backups (
         connector_id, conversation_external_id, conversation_title, external_id,
@@ -1702,14 +1726,27 @@ async function ingestGroupTextBackups(request, env) {
   for (const entry of normalized) {
     const externalId = String(entry.item.externalId).slice(0, 300);
     const expectedConversationExternalId = String(entry.item.conversationExternalId).slice(0, 500);
-    const stored = await env.DB.prepare(`
+    let stored = await env.DB.prepare(`
       SELECT conversation_external_id, conversation_title, sender_id, sender_name,
         body, placement, occurred_at
       FROM group_text_backups WHERE connector_id = ? AND external_id = ?
     `).bind(connectorId, externalId).first();
     if (!stored) throw new Error("message_not_found");
-    if (stored.conversation_external_id !== expectedConversationExternalId || stored.body !== entry.bodyText) {
+    if (stored.conversation_external_id !== expectedConversationExternalId) {
       throw new Error("message_external_id_conflict");
+    }
+    if (stored.body !== entry.bodyText) {
+      if (!exactQuoteBodyUpgrade(connector, stored, entry.item, entry.bodyText)) {
+        throw new Error("message_external_id_conflict");
+      }
+      const update = await env.DB.prepare(`
+        UPDATE group_text_backups SET body = ?
+        WHERE connector_id = ? AND external_id = ? AND conversation_external_id = ?
+          AND sender_id = ? AND occurred_at = ? AND body = ?
+      `).bind(entry.bodyText, connectorId, externalId, expectedConversationExternalId,
+        stored.sender_id, stored.occurred_at, stored.body).run();
+      if (!count(update.meta?.changes)) throw new Error("message_external_id_conflict");
+      stored = { ...stored, body: entry.bodyText };
     }
     const senderId = typeof entry.item.senderId === "string" ? entry.item.senderId : "";
     const senderName = typeof entry.item.senderName === "string" ? entry.item.senderName.trim().slice(0, 200) : "";
@@ -1727,11 +1764,12 @@ async function ingestGroupTextBackups(request, env) {
       placement: stored.placement,
       occurredAt: stored.occurred_at,
       attachmentMetadata: entry.attachmentMetadata,
+      replyPreview: entry.replyPreview,
       senderRefresh: hasSenderRefresh,
     });
   }
   let normalizedInserted = 0;
-  for (const { item, bodyText, placement, occurredAt, attachmentMetadata, senderRefresh } of canonical) {
+  for (const { item, bodyText, placement, occurredAt, attachmentMetadata, replyPreview, senderRefresh } of canonical) {
     const senderId = typeof item.senderId === "string" ? item.senderId : "";
     const senderName = typeof item.senderName === "string" ? item.senderName.trim().slice(0, 200) : "";
     const conversationExternalId = String(item.conversationExternalId).slice(0, 500);
@@ -1762,15 +1800,18 @@ async function ingestGroupTextBackups(request, env) {
       item.senderId ? String(item.senderId).slice(0, 300) : null, String(item.senderName).slice(0, 200), bodyText,
       attachmentMetadata.length ? "mixed" : "text",
       JSON.stringify({ conversationType: "group", trigger: "background", mentioned: false, placement,
-        context: [], attachments: attachmentMetadata }),
+        context: [], attachments: attachmentMetadata, ...(replyPreview ? { reply: replyPreview } : {}) }),
       occurredAt, stamp).run();
     if (count(result.meta?.changes)) normalizedInserted += 1;
     else {
       const existing = await env.DB.prepare(`
-        SELECT id, conversation_id, body, metadata_json FROM messages WHERE connector_id = ? AND external_id = ?
+        SELECT id, conversation_id, direction, sender_id, occurred_at, body, metadata_json
+        FROM messages WHERE connector_id = ? AND external_id = ?
       `).bind(connectorId, String(item.externalId).slice(0, 300)).first();
       if (!existing) throw new Error("message_not_found");
-      if (existing.conversation_id !== conversation.id || existing.body !== bodyText) {
+      const quoteBodyUpgrade = exactQuoteBodyUpgrade(connector, existing, item, bodyText);
+      if (existing.conversation_id !== conversation.id || existing.direction !== "inbound" ||
+          (existing.body !== bodyText && !quoteBodyUpgrade)) {
         // The legacy backup table is written before normalization. If an
         // external id is already bound to a different conversation, remove the
         // unnormalizable source row so later migrations/retries cannot derive a
@@ -1788,13 +1829,17 @@ async function ingestGroupTextBackups(request, env) {
       const mergedAttachments = mergeAttachmentMetadata(previousAttachments, attachmentMetadata);
       const previousIds = new Set(previousAttachments.map((attachment) => String(attachment?.externalId || "")));
       const supplementalAttachments = mergedAttachments.filter((attachment) => !previousIds.has(attachment.externalId));
-      if (supplementalAttachments.length) {
-        await env.DB.prepare(`
-          UPDATE messages SET metadata_json = ?,
-            content_type = CASE WHEN content_type = 'text' THEN 'mixed' ELSE content_type END
-          WHERE id = ? AND connector_id = ? AND external_id = ?
-        `).bind(JSON.stringify({ ...existingMetadata, attachments: mergedAttachments }),
-          existing.id, connectorId, String(item.externalId).slice(0, 300)).run();
+      if (supplementalAttachments.length || replyPreview) {
+        const metadataUpdate = await env.DB.prepare(`
+          UPDATE messages SET body = ?, metadata_json = ?,
+            content_type = CASE WHEN ? > 0 AND content_type = 'text' THEN 'mixed' ELSE content_type END
+          WHERE id = ? AND connector_id = ? AND external_id = ? AND conversation_id = ?
+            AND direction = 'inbound' AND sender_id IS ? AND occurred_at = ? AND body = ? AND metadata_json = ?
+        `).bind(bodyText, JSON.stringify({ ...existingMetadata, attachments: mergedAttachments,
+          ...(replyPreview ? { reply: replyPreview } : {}) }), mergedAttachments.length,
+          existing.id, connectorId, String(item.externalId).slice(0, 300), conversation.id,
+          existing.sender_id, existing.occurred_at, existing.body, existing.metadata_json).run();
+        if (!count(metadataUpdate.meta?.changes)) throw new Error("message_external_id_conflict");
       }
       for (const attachment of mergedAttachments) {
         await env.DB.prepare(`
