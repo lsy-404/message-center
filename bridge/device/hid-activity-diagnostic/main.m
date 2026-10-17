@@ -15,13 +15,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/codesign.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
 #define MC_MAX_SECONDS 300
 #define MC_MAX_EVENTS 25000
+#define MC_CS_OPS_STATUS 0u
 #define MC_CS_ENTITLEMENTS_VALIDATED 0x00004000u
 
 typedef void (*mc_hid_callback)(void *, void *, void *, void *);
@@ -188,7 +188,7 @@ static bool mc_query_code_signature_entitlements(void *context, bool *value) {
     mc_runtime_probe *probe = context;
     uint32_t flags = 0;
     if (probe == NULL || value == NULL || probe->csops == NULL ||
-        probe->csops(getpid(), CS_OPS_STATUS, &flags, sizeof(flags)) != 0) {
+        probe->csops(getpid(), MC_CS_OPS_STATUS, &flags, sizeof(flags)) != 0) {
         return false;
     }
     *value = (flags & MC_CS_ENTITLEMENTS_VALIDATED) != 0;
