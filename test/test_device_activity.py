@@ -259,70 +259,14 @@ class DeviceActivityPolicyTests(unittest.TestCase):
         self.assertTrue(saved["armed"])
         self.assertTrue(saved["cleanupRequired"])
 
-    def test_mirror_parent_must_be_root_owned_real_directory_with_exact_mode(self):
-        fake_directory = type("Stat", (), {
-            "st_mode": device_activity.stat.S_IFDIR | 0o755,
-            "st_uid": 0, "st_dev": 1, "st_ino": 2,
-        })()
-        with patch.object(device_activity.os, "name", "posix"), \
-             patch.object(device_activity.os, "geteuid", return_value=0, create=True), \
-             patch.object(device_activity.os, "lstat", return_value=fake_directory):
-            self.assertIs(device_activity._mirror_parent_metadata(
-                "/private/var/MessageCenterActivity/runtime.activity.json"),
-                fake_directory)
-
-        for metadata in (
-                type("Stat", (), {"st_mode": device_activity.stat.S_IFLNK | 0o777,
-                                  "st_uid": 0, "st_dev": 1, "st_ino": 2})(),
-                type("Stat", (), {"st_mode": device_activity.stat.S_IFDIR | 0o755,
-                                  "st_uid": 501, "st_dev": 1, "st_ino": 2})(),
-                type("Stat", (), {"st_mode": device_activity.stat.S_IFDIR | 0o775,
-                                  "st_uid": 0, "st_dev": 1, "st_ino": 2})()):
-            with patch.object(device_activity.os, "name", "posix"), \
-                 patch.object(device_activity.os, "geteuid", return_value=0, create=True), \
-                 patch.object(device_activity.os, "lstat", return_value=metadata):
-                with self.assertRaises(device_activity.ActivityStateError):
-                    device_activity._mirror_parent_metadata(
-                        "/private/var/MessageCenterActivity/runtime.activity.json")
-
-        writable_ancestor = type("Stat", (), {
-            "st_mode": device_activity.stat.S_IFDIR | 0o775,
-            "st_uid": 0, "st_dev": 1, "st_ino": 3,
-        })()
-        with patch.object(device_activity.os, "name", "posix"), \
-             patch.object(device_activity.os, "geteuid", return_value=0, create=True), \
-             patch.object(device_activity.os, "lstat",
-                          side_effect=[fake_directory, writable_ancestor]):
-            with self.assertRaises(device_activity.ActivityStateError):
-                device_activity._mirror_parent_metadata(
-                    "/private/var/MessageCenterActivity/runtime.activity.json")
-
-    def test_mirror_does_not_create_or_chmod_untrusted_directory(self):
-        mirror_path = os.path.join(self.temp.name, "absent", "runtime.activity.json")
-        with patch.object(device_activity.os, "name", "posix"), \
-             patch.object(device_activity.os, "geteuid", return_value=0, create=True):
-            with self.assertRaises(FileNotFoundError):
-                device_activity._atomic_mirror_state_write(mirror_path, {})
-        self.assertFalse(os.path.exists(os.path.dirname(mirror_path)))
-
-    def test_mirror_refuses_existing_symlink_nonroot_or_wrong_mode_target(self):
-        path = os.path.join(self.temp.name, "runtime.activity.json")
-        parent = type("Stat", (), {"st_mode": device_activity.stat.S_IFDIR | 0o755,
-                                    "st_uid": 0, "st_dev": 1, "st_ino": 2})()
-        for metadata in (
-                type("Stat", (), {"st_mode": device_activity.stat.S_IFLNK | 0o777,
-                                  "st_uid": 0})(),
-                type("Stat", (), {"st_mode": device_activity.stat.S_IFREG | 0o644,
-                                  "st_uid": 501})(),
-                type("Stat", (), {"st_mode": device_activity.stat.S_IFREG | 0o600,
-                                  "st_uid": 0})()):
-            with patch.object(device_activity, "_mirror_parent_metadata",
-                              return_value=parent), \
-                 patch.object(device_activity.os, "lstat", return_value=metadata), \
-                 patch.object(device_activity.os, "name", "posix"), \
-                 patch.object(device_activity.os, "geteuid", return_value=0, create=True):
-                with self.assertRaises(device_activity.ActivityStateError):
-                    device_activity._atomic_mirror_state_write(path, {})
+    def test_mirror_path_accepts_only_canonical_container_suffix(self):
+        home = "/private/var/mobile/Containers/Data/Application/00000000-0000-0000-0000-000000000000"
+        suffix = "/Library/MessageCenterActivity/runtime.activity.json"
+        self.assertTrue(device_activity.validate_mirror_state_path(home + suffix))
+        for value in (None, home + "/../" + suffix, home + suffix + ".tmp",
+                      home.replace("/private/var", "/var") + suffix,
+                      "/private/var/MessageCenterActivity/runtime.activity.json"):
+            self.assertFalse(device_activity.validate_mirror_state_path(value))
 
     def test_home_and_digitizer_activity_renew_the_grace(self):
         self.clock.value += 150

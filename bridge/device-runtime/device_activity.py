@@ -24,7 +24,10 @@ CONSUMER_USAGE_PAGE = 0x0C
 HOME_USAGE = 0x40
 STATE_VERSION = 4
 HEARTBEAT_SECONDS = 2.0
-MIRROR_STATE_PATH = "/private/var/MessageCenterActivity/runtime.activity.json"
+MIRROR_STATE_PATH_PATTERN = re.compile(
+    r"/private/var/mobile/Containers/Data/Application/"
+    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+    r"/Library/MessageCenterActivity/runtime\.activity\.json\Z")
 STATE_FIELDS = {
     "version", "monitorId", "runtimePid", "generation", "publishedAt",
     "healthy", "armed", "cleanupRequired", "lastActivityAt",
@@ -63,63 +66,89 @@ def _atomic_state_write(path: str, state: dict[str, Any]) -> None:
             os.unlink(temporary)
 
 
-def _mirror_parent_metadata(path: str) -> os.stat_result:
+def validate_mirror_state_path(path: Any) -> bool:
+    return type(path) is str and MIRROR_STATE_PATH_PATTERN.fullmatch(path) is not None
+
+
+def _open_mirror_parent(path: str) -> int:
     if os.name != "posix" or not hasattr(os, "geteuid") or os.geteuid() != 0:
         raise ActivityStateError("mirror_writer_not_root")
-    parent = os.path.dirname(os.path.abspath(path))
-    metadata = os.lstat(parent)
-    if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or
-            stat.S_IMODE(metadata.st_mode) != 0o755):
+    if (not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY") or
+            type(path) is not str or not path.startswith("/") or "\x00" in path or
+            any(part in ("", ".", "..") for part in path.split("/")[1:])):
+        raise ActivityStateError("mirror_path_invalid")
+    components = path.split("/")[1:-1]
+    if not components or components[-1] != "MessageCenterActivity":
         raise ActivityStateError("mirror_directory_invalid")
-    current = parent
-    while current != os.path.dirname(current):
-        current_metadata = os.lstat(current)
-        if (not stat.S_ISDIR(current_metadata.st_mode) or current_metadata.st_uid != 0 or
-                stat.S_IMODE(current_metadata.st_mode) & 0o022):
-            raise ActivityStateError("mirror_path_component_invalid")
-        current = os.path.dirname(current)
-    return metadata
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open("/", flags)
+    try:
+        for index, component in enumerate(components):
+            created = False
+            if index == len(components) - 1:
+                try:
+                    os.mkdir(component, mode=0o755, dir_fd=descriptor)
+                    created = True
+                except FileExistsError:
+                    pass
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+            if created:
+                if os.fstat(descriptor).st_uid != 0:
+                    raise ActivityStateError("mirror_directory_owner_changed")
+                os.fchmod(descriptor, 0o755)
+                os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or
+                stat.S_IMODE(metadata.st_mode) != 0o755):
+            raise ActivityStateError("mirror_directory_invalid")
+        result, descriptor = descriptor, -1
+        return result
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _atomic_mirror_state_write(path: str, state: dict[str, Any]) -> None:
-    parent = os.path.dirname(os.path.abspath(path))
-    before = _mirror_parent_metadata(path)
+    parent_fd = _open_mirror_parent(path)
+    basename = os.path.basename(path)
+    descriptor = -1
+    temporary = None
     try:
-        existing = os.lstat(path)
-    except FileNotFoundError:
-        existing = None
-    if existing is not None and (
-            not stat.S_ISREG(existing.st_mode) or existing.st_uid != 0 or
-            stat.S_IMODE(existing.st_mode) != 0o644):
-        raise ActivityStateError("mirror_file_invalid")
-
-    descriptor, temporary = tempfile.mkstemp(prefix=".runtime-activity-", dir=parent)
-    try:
+        try:
+            existing = os.stat(basename, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and (
+                not stat.S_ISREG(existing.st_mode) or existing.st_uid != 0 or
+                stat.S_IMODE(existing.st_mode) != 0o644):
+            raise ActivityStateError("mirror_file_invalid")
+        temporary = ".runtime-activity-" + secrets.token_hex(16)
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                             os.O_NOFOLLOW, 0o644, dir_fd=parent_fd)
         os.fchmod(descriptor, 0o644)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             descriptor = -1
             json.dump(state, stream, separators=(",", ":"))
             stream.flush()
             os.fsync(stream.fileno())
-        _mirror_parent_metadata(path)
-        os.replace(temporary, path)
-        after = _mirror_parent_metadata(path)
-        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
-            raise ActivityStateError("mirror_directory_changed")
-        published = os.lstat(path)
+        os.replace(temporary, basename, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        temporary = None
+        published = os.stat(basename, dir_fd=parent_fd, follow_symlinks=False)
         if (not stat.S_ISREG(published.st_mode) or published.st_uid != 0 or
                 stat.S_IMODE(published.st_mode) != 0o644):
             raise ActivityStateError("mirror_publish_invalid")
-        parent_fd = os.open(parent, os.O_RDONLY)
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
+        os.fsync(parent_fd)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+        if temporary is not None:
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        os.close(parent_fd)
 
 
 def _load_saved_state(path: str) -> tuple[Optional[bool], Optional[bool]]:

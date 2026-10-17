@@ -535,9 +535,14 @@ class Relay:
         if activity_monitor is not None:
             self.activity_monitor = activity_monitor
         elif device_activity.platform.system() == "Darwin":
+            result = self.adapter_call({"op": "activity-mirror-path", "driver": "qq"})
+            if (type(result) is not dict or set(result) != {"ok", "activityMirrorPath"} or
+                    result.get("ok") is not True or not device_activity.validate_mirror_state_path(
+                        result.get("activityMirrorPath"))):
+                raise RuntimeError("activity_mirror_unavailable")
             self.activity_monitor = device_activity.create_monitor(
                 config["database"] + ".activity.json",
-                readable_state_path=device_activity.MIRROR_STATE_PATH)
+                readable_state_path=result["activityMirrorPath"])
         else:
             self.activity_monitor = device_activity.create_monitor(
                 config["database"] + ".activity.json")
