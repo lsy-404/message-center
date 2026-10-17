@@ -1,88 +1,87 @@
-"""Bounded, aggregate-only IOHID event tree probe for explicit device validation."""
+"""Bounded, root-type-only IOHID probe for explicit device validation."""
 from __future__ import annotations
 
 import argparse
 import ctypes
 import json
 import math
+import os
 import sys
+import tempfile
 import time
+from pathlib import Path
 from typing import Callable
 
 TYPE_LIMIT = 64
-MAX_DEPTH = 8
-MAX_NODES_PER_EVENT = 128
-MAX_DURATION_SECONDS = 30.0
+MAX_DURATION_SECONDS = 300.0
 MAX_EVENTS = 25000
 
 
 class Aggregates:
     def __init__(self) -> None:
         self.root_types = [0] * TYPE_LIMIT
-        self.child_types = [[0] * TYPE_LIMIT for _ in range(TYPE_LIMIT)]
         self.unknown_root_types = 0
-        self.unknown_child_pairs = 0
         self.events = 0
-        self.nodes = 0
-        self.truncated_events = 0
 
-    def add(self, root_event: int, get_type: Callable[[int], int],
-            get_children: Callable[[int], list[int]]) -> None:
+    def add(self, root_event: int, get_type: Callable[[int], int]) -> None:
         self.events += 1
         root_type = int(get_type(root_event))
         if 0 <= root_type < TYPE_LIMIT:
             self.root_types[root_type] += 1
         else:
             self.unknown_root_types += 1
-        visited = {root_event}
-        self.nodes += 1
-        edge_count = 0
-        truncated = False
-        stack = [(root_event, root_type, 0)]
-        while stack:
-            parent, parent_type, depth = stack.pop()
-            if depth >= MAX_DEPTH:
-                if get_children(parent):
-                    truncated = True
-                continue
-            for child in get_children(parent):
-                edge_count += 1
-                if edge_count >= MAX_NODES_PER_EVENT or child in visited:
-                    truncated = True
-                    continue
-                visited.add(child)
-                self.nodes += 1
-                child_type = int(get_type(child))
-                if 0 <= parent_type < TYPE_LIMIT and 0 <= child_type < TYPE_LIMIT:
-                    self.child_types[parent_type][child_type] += 1
-                else:
-                    self.unknown_child_pairs += 1
-                stack.append((child, child_type, depth + 1))
-        if truncated:
-            self.truncated_events += 1
 
     def summary(self, elapsed: float, callback_errors: int) -> dict:
         return {
             "elapsedSeconds": round(elapsed, 3),
             "events": self.events,
-            "nodes": self.nodes,
             "rootTypes": {str(i): count for i, count in enumerate(self.root_types) if count},
-            "childTypePairs": [
-                {"parentType": parent, "childType": child, "count": count}
-                for parent, row in enumerate(self.child_types)
-                for child, count in enumerate(row) if count
-            ],
             "unknownRootTypes": self.unknown_root_types,
-            "unknownChildPairs": self.unknown_child_pairs,
-            "truncatedEvents": self.truncated_events,
             "callbackErrors": callback_errors,
         }
 
 
-def run_probe(duration: float = 30.0, max_events: int = MAX_EVENTS) -> dict:
+def _status_payload(aggregates: Aggregates, *, ready: bool, running: bool,
+                    started_at: float | None, ended_at: float | None,
+                    callback_errors: int, callback_limit_reached: bool,
+                    teardown_errors: list[str]) -> dict:
+    now = time.time()
+    elapsed = 0.0 if started_at is None else max(0.0, now - started_at)
+    payload = {
+        "ready": ready,
+        "running": running,
+        "startedAt": started_at,
+        "endedAt": ended_at,
+        **aggregates.summary(elapsed, callback_errors),
+        "callbackLimitReached": callback_limit_reached,
+        "teardownErrors": list(teardown_errors),
+    }
+    return payload
+
+
+def _atomic_write_status(path: str | os.PathLike[str], payload: dict) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=target.parent,
+                prefix=f".{target.name}.", suffix=".tmp", delete=False) as stream:
+            temp_name = stream.name
+            json.dump(payload, stream, separators=(",", ":"), allow_nan=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, target)
+    finally:
+        if temp_name is not None and os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
+def run_probe(duration: float = 300.0, max_events: int = MAX_EVENTS,
+              status_file: str | os.PathLike[str] | None = None) -> dict:
     if (isinstance(duration, bool) or not isinstance(duration, (int, float)) or
             not math.isfinite(float(duration)) or not 0 < duration <= MAX_DURATION_SECONDS):
-        raise ValueError("duration must be within 0..30 seconds")
+        raise ValueError("duration must be within 0..300 seconds")
     if isinstance(max_events, bool) or not isinstance(max_events, int) or not 1 <= max_events <= MAX_EVENTS:
         raise ValueError("max_events must be within 1..25000")
     if sys.platform != "darwin":
@@ -106,14 +105,6 @@ def run_probe(duration: float = 30.0, max_events: int = MAX_EVENTS) -> dict:
 
     get_type = io.IOHIDEventGetType
     get_type.argtypes, get_type.restype = [void_p], ctypes.c_uint32
-    # This C export is checked on the target device before interpreting results.
-    get_children = io.IOHIDEventGetChildren
-    get_children.argtypes, get_children.restype = [void_p], void_p
-    array_count = cf.CFArrayGetCount
-    array_count.argtypes, array_count.restype = [void_p], ctypes.c_long
-    array_value = cf.CFArrayGetValueAtIndex
-    array_value.argtypes, array_value.restype = [void_p, ctypes.c_long], void_p
-
     run_loop_current = cf.CFRunLoopGetCurrent
     run_loop_current.argtypes, run_loop_current.restype = [], void_p
     run_in_mode = cf.CFRunLoopRunInMode
@@ -131,17 +122,9 @@ def run_probe(duration: float = 30.0, max_events: int = MAX_EVENTS) -> dict:
     registered = False
     scheduled = False
     started = time.monotonic()
+    started_wall = None
     result = None
     teardown_errors = []
-
-    def children(event: int) -> list[int]:
-        array = get_children(event)
-        if not array:
-            return []
-        count = int(array_count(array))
-        if count < 0 or count > MAX_NODES_PER_EVENT:
-            raise RuntimeError("child_array_out_of_bounds")
-        return [int(array_value(array, index)) for index in range(count)]
 
     def on_event(_target, _refcon, _queue, event):
         nonlocal callback_errors, callback_limit_reached
@@ -149,7 +132,9 @@ def run_probe(duration: float = 30.0, max_events: int = MAX_EVENTS) -> dict:
             callback_limit_reached = True
             return
         try:
-            aggregates.add(int(event), lambda ptr: int(get_type(ptr)), children)
+            aggregates.add(int(event), lambda ptr: int(get_type(ptr)))
+            if aggregates.events >= max_events:
+                callback_limit_reached = True
         except Exception:
             callback_errors += 1
 
@@ -165,11 +150,28 @@ def run_probe(duration: float = 30.0, max_events: int = MAX_EVENTS) -> dict:
         registered = True
         schedule(client, loop, mode)
         scheduled = True
+        started_wall = time.time()
+        if status_file is not None:
+            _atomic_write_status(status_file, _status_payload(
+                aggregates, ready=True, running=True, started_at=started_wall,
+                ended_at=None, callback_errors=callback_errors,
+                callback_limit_reached=callback_limit_reached,
+                teardown_errors=teardown_errors))
         deadline = started + float(duration)
+        next_publish = time.monotonic() + 1.0
         while time.monotonic() < deadline and aggregates.events < max_events:
-            status = int(run_in_mode(mode, min(0.25, max(0.0, deadline - time.monotonic())), False))
+            remaining = max(0.0, deadline - time.monotonic())
+            until_publish = max(0.0, next_publish - time.monotonic())
+            status = int(run_in_mode(mode, min(1.0, remaining, until_publish or 0.001), False))
             if status == 1:
                 raise RuntimeError("run_loop_finished")
+            if status_file is not None and time.monotonic() >= next_publish:
+                _atomic_write_status(status_file, _status_payload(
+                    aggregates, ready=True, running=True, started_at=started_wall,
+                    ended_at=None, callback_errors=callback_errors,
+                    callback_limit_reached=callback_limit_reached,
+                    teardown_errors=teardown_errors))
+                next_publish = time.monotonic() + 1.0
         elapsed = time.monotonic() - started
         result = aggregates.summary(elapsed, callback_errors)
         result["callbackLimitReached"] = callback_limit_reached
@@ -193,16 +195,25 @@ def run_probe(duration: float = 30.0, max_events: int = MAX_EVENTS) -> dict:
                 teardown_errors.append("release")
         if result is not None:
             result["teardownErrors"] = teardown_errors
+        if status_file is not None:
+            _atomic_write_status(status_file, _status_payload(
+                aggregates, ready=started_wall is not None, running=False,
+                started_at=started_wall, ended_at=time.time(),
+                callback_errors=callback_errors,
+                callback_limit_reached=callback_limit_reached,
+                teardown_errors=teardown_errors))
         callback = None
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Aggregate IOHID event and child event types only")
-    parser.add_argument("--seconds", type=float, default=30.0)
+    parser = argparse.ArgumentParser(description="Aggregate IOHID callback root event types only")
+    parser.add_argument("--seconds", type=float, default=300.0)
     parser.add_argument("--max-events", type=int, default=MAX_EVENTS)
+    parser.add_argument("--status-file", required=True,
+                        help="caller-owned path for atomic one-second aggregate status")
     args = parser.parse_args()
     try:
-        print(json.dumps(run_probe(args.seconds, args.max_events), separators=(",", ":")))
+        print(json.dumps(run_probe(args.seconds, args.max_events, args.status_file), separators=(",", ":")))
         return 0
     except Exception as exc:
         print(json.dumps({"ready": False, "error": type(exc).__name__ + ":" + str(exc)}, separators=(",", ":")))

@@ -1,6 +1,9 @@
 import importlib.util
+import json
+import os
 import pathlib
 import sys
+import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent
@@ -11,38 +14,21 @@ SPEC.loader.exec_module(probe)
 
 
 class AggregateProbeTests(unittest.TestCase):
-    def test_collects_only_root_and_parent_child_type_counts(self):
-        types = {1: 11, 2: 5, 3: 5, 4: 9}
-        children = {1: [2, 3], 2: [4], 3: [], 4: []}
+    def test_collects_only_root_event_type_counts(self):
+        types = {1: 11, 2: 3, 3: 11, 4: 70}
         result = probe.Aggregates()
-        result.add(1, types.__getitem__, children.__getitem__)
+        for event in (1, 2, 3, 4):
+            result.add(event, types.__getitem__)
         summary = result.summary(0.25, 0)
-        self.assertEqual(summary["rootTypes"], {"11": 1})
-        self.assertEqual(summary["childTypePairs"], [
-            {"parentType": 5, "childType": 9, "count": 1},
-            {"parentType": 11, "childType": 5, "count": 2},
-        ])
-        self.assertEqual(summary["nodes"], 4)
+        self.assertEqual(summary["rootTypes"], {"3": 1, "11": 2})
+        self.assertEqual(summary["unknownRootTypes"], 1)
         self.assertNotIn("coordinates", summary)
         self.assertNotIn("text", summary)
 
-    def test_cycle_and_depth_are_bounded(self):
-        types = {index: index for index in range(20)}
-        children = {index: [index + 1] for index in range(19)}
-        children[19] = [1]
+    def test_aggregates_use_fixed_size_type_counters(self):
         result = probe.Aggregates()
-        result.add(0, types.__getitem__, children.__getitem__)
-        self.assertLessEqual(result.nodes, probe.MAX_DEPTH + 1)
-        self.assertEqual(result.truncated_events, 1)
-
-    def test_wide_tree_is_bounded(self):
-        children = {0: list(range(1, 200))}
-        children.update({index: [] for index in range(1, 200)})
-        types = {index: index % probe.TYPE_LIMIT for index in range(200)}
-        result = probe.Aggregates()
-        result.add(0, types.__getitem__, children.__getitem__)
-        self.assertLessEqual(result.nodes, probe.MAX_NODES_PER_EVENT)
-        self.assertEqual(result.truncated_events, 1)
+        self.assertEqual(len(result.root_types), probe.TYPE_LIMIT)
+        self.assertEqual(result.events, 0)
 
     def test_duration_and_event_limits_are_validated_before_monitoring(self):
         for duration in (0, probe.MAX_DURATION_SECONDS + 1, float("nan"), True):
@@ -51,6 +37,36 @@ class AggregateProbeTests(unittest.TestCase):
         for count in (0, probe.MAX_EVENTS + 1, True):
             with self.subTest(count=count), self.assertRaises(ValueError):
                 probe.run_probe(max_events=count)
+
+    def test_status_is_atomically_replaced_with_small_aggregate_fields(self):
+        aggregates = probe.Aggregates()
+        aggregates.root_types[11] = 4
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "status.json"
+            path.write_text('{"old":true}', encoding="utf-8")
+            payload = probe._status_payload(
+                aggregates, ready=True, running=True, started_at=123.0,
+                ended_at=None, callback_errors=0, callback_limit_reached=False,
+                teardown_errors=[])
+            probe._atomic_write_status(path, payload)
+            stored = json.loads(path.read_text(encoding="utf-8"))
+            self.assertTrue(stored["ready"])
+            self.assertTrue(stored["running"])
+            self.assertEqual(stored["rootTypes"], {"11": 4})
+            self.assertEqual(list(pathlib.Path(directory).iterdir()), [path])
+            self.assertFalse(any(key in stored for key in ("coordinates", "text", "children")))
+
+    def test_status_writer_rejects_non_finite_json_and_cleans_temp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "status.json"
+            with self.assertRaises(ValueError):
+                probe._atomic_write_status(path, {"bad": float("nan")})
+            self.assertEqual(list(pathlib.Path(directory).iterdir()), [])
+
+    def test_five_minute_window_is_the_maximum(self):
+        self.assertEqual(probe.MAX_DURATION_SECONDS, 300.0)
+        with self.assertRaises(ValueError):
+            probe.run_probe(300.1)
 
     @unittest.skipIf(sys.platform == "darwin",
                      "host device probe is intentionally not started by unit tests")

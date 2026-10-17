@@ -9,8 +9,7 @@ Implement on-device human activity gating and resume without changing message cu
 
 ## Current static investigation
 
-1. [x] Fast-forward this worktree to local main and keep it clean.
-2. [x] Inspect the existing top-level HID classifier and activity timestamp gates without changing production code.
-3. [x] Verify Apple OSS ownership of child collection and CoreFoundation array accessor ABI; record the C child getter as target-unverified.
-4. [x] Add an owned, bounded aggregate-only HID monitor probe and host tests under `/test`; do not run it on a device.
-5. [x] Send root exact target symbol/ABI validation gate and commit probe, tests, and audit records.
+1. [x] Fast-forward this worktree to local main and inspect the current WebKit IOKit SPI wrapper.
+2. [x] Query Apple OSS IOHIDFamily/IOKitUser paths and the old IOHIDFamily-308 tag for the C event declaration.
+3. [x] Keep the probe root-type-only; extend the explicit diagnostic window to 300 seconds and atomically publish one-second aggregate status at a caller-specified validation path.
+4. [x] Add status writer/limit tests, record the evidence gap and primary URLs, then commit the narrow follow-up.
