@@ -108,7 +108,10 @@ test('build is manual with a narrow source trigger, pinned devkit, and artifact 
   assert.match(workflow, /"bridge\/device\/native-frida-helper\/\*\*"/);
   assert.match(workflow, /"\.github\/workflows\/build-native-frida-helper\.yml"/);
   assert.doesNotMatch(workflow, /schedule:/);
-  assert.match(workflow, /C31AA39618A6996BF43A472F2F48E3E4C2CC72EEE101A1ED6820192CBF58BDEC/);
+  assert.match(workflow, /ref: 16\.7\.19/);
+  assert.match(workflow, /frida-core-devkit-16\.7\.19-ios-arm64\.tar\.xz/);
+  assert.match(workflow, /90BCA1AE4E8F0DE1BCD70CE9F8E4F1E4635B5D9EF1C5AF97B10880A7BC26C365/);
+  assert.doesNotMatch(workflow, /16\.3\.3/);
   assert.match(workflow, /actions\/upload-artifact/);
   assert.match(workflow, /test\/device-native-helper-json-bool\.test\.m/);
   assert.match(workflow, /Test Foundation JSON boolean encoding for gboolean values/);
