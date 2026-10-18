@@ -1978,6 +1978,134 @@ assert.equal(replayedGroupImage.inserted, 0);
 assert.equal(database.prepare(`
   SELECT count(*) AS total FROM attachments WHERE connector_id = ? AND external_id = ?
 `).get(connectorId, groupImageFileExternalId).total, 1);
+
+const attachmentBodyOriginal = '原文\n后文';
+const attachmentBodyWithLineSpace = '原文 \n后文';
+const attachmentBodyOccurredAt = new Date(stamp).toISOString();
+function seedAttachmentBodyReplay(suffix, options = {}) {
+  const conversationExternalId = `conversation-space-${suffix}`;
+  const externalId = `message-space-${suffix}`;
+  const messageId = `message-row-space-${suffix}`;
+  const senderId = 'space-sender';
+  const senderName = 'Space sender';
+  database.prepare(`
+    INSERT INTO conversations (
+      id, connector_id, external_id, title, avatar_label, trust_tier, agent_policy_json,
+      unread_count, last_message_preview, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 'untrusted', '{}', 0, ?, ?, ?)
+  `).run(`conversation-row-space-${suffix}`, connectorId, conversationExternalId,
+    `Space ${suffix}`, 'Sp', attachmentBodyOriginal, stamp, stamp);
+  database.prepare(`
+    INSERT INTO messages (
+      id, conversation_id, connector_id, external_id, direction, sender_id, sender_name, body,
+      content_type, delivery_state, queue_class, metadata_json, occurred_at, created_at
+    ) VALUES (?, ?, ?, ?, 'inbound', ?, ?, ?, 'text', 'received', 'background', ?, ?, ?)
+  `).run(messageId, `conversation-row-space-${suffix}`, connectorId, externalId,
+    senderId, senderName, attachmentBodyOriginal, JSON.stringify(options.metadata || { attachments: [] }),
+    attachmentBodyOccurredAt, stamp);
+  database.prepare(`
+    INSERT INTO group_text_backups (
+      connector_id, conversation_external_id, conversation_title, external_id,
+      sender_id, sender_name, body, placement, occurred_at, received_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'normal', ?, ?)
+  `).run(connectorId, conversationExternalId, `Space ${suffix}`, externalId,
+    senderId, senderName, attachmentBodyOriginal,
+    attachmentBodyOccurredAt.replace('Z', '+00:00'), stamp);
+  return { conversationExternalId, externalId, messageId, senderId, senderName };
+}
+
+async function requestAttachmentBodyReplay(suffix, options = {}) {
+  const seeded = seedAttachmentBodyReplay(suffix, options);
+  const requestConversationExternalId = options.conversationExternalId || seeded.conversationExternalId;
+  const fileBytes = new Uint8Array([suffix.length + 1, 12, 13, 14]);
+  const fileExternalId = `file-space-${suffix}`;
+  const digest = createHash('sha256').update(fileBytes).digest('hex');
+  if (!options.omitAttachment) {
+    const upload = await putInboundFile(`file-space-${suffix}`, fileExternalId, fileBytes,
+      requestConversationExternalId, 'image/png');
+    assert.equal(upload.status, 201);
+  }
+  const item = {
+    externalId: seeded.externalId,
+    conversationExternalId: requestConversationExternalId,
+    conversationTitle: requestConversationExternalId === seeded.conversationExternalId
+      ? `Space ${suffix}` : 'Other target',
+    senderId: options.senderId || seeded.senderId,
+    senderName: options.senderName || seeded.senderName,
+    body: options.body || attachmentBodyWithLineSpace,
+    occurredAt: options.occurredAt || attachmentBodyOccurredAt.replace('Z', '+00:00'),
+    conversationType: 'group',
+    placement: 'normal',
+    ...(options.isSelf === undefined ? {} : { isSelf: options.isSelf }),
+    ...(options.reply === undefined ? {} : { reply: options.reply }),
+    attachments: options.omitAttachment ? [] : [{ externalId: fileExternalId, fileName: 'fixture.bin', mimeType: 'image/png',
+      sizeBytes: fileBytes.byteLength, sha256: digest }],
+  };
+  return { seeded, fileExternalId, item, response: await requestBackups([item]) };
+}
+
+const validAttachmentBodyReplay = await requestAttachmentBodyReplay('valid');
+assert.equal(validAttachmentBodyReplay.response.status, 200);
+const validAttachmentBodyResult = await validAttachmentBodyReplay.response.json();
+assert.equal(validAttachmentBodyResult.inserted, 0);
+assert.equal(validAttachmentBodyResult.normalizedInserted, 0);
+assert.equal(database.prepare('SELECT body FROM group_text_backups WHERE connector_id = ? AND external_id = ?')
+  .get(connectorId, validAttachmentBodyReplay.seeded.externalId).body, attachmentBodyOriginal);
+const validAttachmentBodyMessage = database.prepare(`
+  SELECT body, metadata_json FROM messages WHERE connector_id = ? AND external_id = ?
+`).get(connectorId, validAttachmentBodyReplay.seeded.externalId);
+assert.equal(validAttachmentBodyMessage.body, attachmentBodyOriginal,
+  'the supplement must retain the canonical body instead of promoting whitespace-only drift');
+assert.deepEqual(JSON.parse(validAttachmentBodyMessage.metadata_json).attachments,
+  validAttachmentBodyReplay.item.attachments);
+assert.deepEqual({ ...database.prepare(`
+  SELECT message_id, state FROM attachments WHERE connector_id = ? AND external_id = ?
+`).get(connectorId, validAttachmentBodyReplay.fileExternalId) }, {
+  message_id: validAttachmentBodyReplay.seeded.messageId, state: 'received',
+});
+const repeatedAttachmentBodyReplay = await requestBackups([validAttachmentBodyReplay.item]);
+assert.equal(repeatedAttachmentBodyReplay.status, 200,
+  'an exact replay of the already-linked attachment must remain idempotent');
+
+for (const [suffix, body] of [
+  ['word-space', '原 文\n后文'],
+  ['non-ascii-space', '原文\u00a0\n后文'],
+  ['text-change', '改写\n后文'],
+]) {
+  const rejected = await requestAttachmentBodyReplay(suffix, { body });
+  assert.equal(rejected.response.status, 400);
+  assert.equal((await rejected.response.json()).error, 'message_external_id_conflict');
+}
+const rejectedSenderChange = await requestAttachmentBodyReplay('sender', { senderId: 'different-sender' });
+assert.equal(rejectedSenderChange.response.status, 400);
+assert.equal((await rejectedSenderChange.response.json()).error, 'message_external_id_conflict');
+const rejectedTimeChange = await requestAttachmentBodyReplay('time', {
+  occurredAt: new Date(Date.parse(attachmentBodyOccurredAt) + 1000).toISOString(),
+});
+assert.equal(rejectedTimeChange.response.status, 400);
+assert.equal((await rejectedTimeChange.response.json()).error, 'message_external_id_conflict');
+const rejectedTargetChange = await requestAttachmentBodyReplay('target', {
+  conversationExternalId: 'conversation-space-other-target',
+});
+assert.equal(rejectedTargetChange.response.status, 400);
+assert.equal((await rejectedTargetChange.response.json()).error, 'message_external_id_conflict');
+const rejectedReplyChange = await requestAttachmentBodyReplay('reply', {
+  reply: { sourceText: 'quoted source', sourceTextTruncated: false, sourceExpired: false },
+});
+assert.equal(rejectedReplyChange.response.status, 400);
+assert.equal((await rejectedReplyChange.response.json()).error, 'message_external_id_conflict');
+const rejectedStoredReply = await requestAttachmentBodyReplay('stored-reply', {
+  metadata: { attachments: [], reply: { sourceText: 'existing quote', sourceTextTruncated: false, sourceExpired: false } },
+});
+assert.equal(rejectedStoredReply.response.status, 400);
+assert.equal((await rejectedStoredReply.response.json()).error, 'message_external_id_conflict');
+const rejectedWithoutAttachment = await requestAttachmentBodyReplay('no-attachment', { omitAttachment: true });
+assert.equal(rejectedWithoutAttachment.response.status, 400);
+assert.equal((await rejectedWithoutAttachment.response.json()).error, 'message_external_id_conflict');
+const rejectedSelfMessage = await requestAttachmentBodyReplay('self', { isSelf: true });
+assert.equal(rejectedSelfMessage.response.status, 400);
+assert.equal((await rejectedSelfMessage.response.json()).error, 'self_message_requires_event_ingest');
+
 const unavailableGroupImage = await requestBackups([{
   ...groupImageMessage,
   externalId: 'message-image-not-uploaded',

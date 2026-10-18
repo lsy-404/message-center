@@ -70,6 +70,22 @@ function exactQuoteBodyUpgrade(connector, stored, item, bodyText) {
     Date.parse(stored.occurred_at) === Date.parse(item.occurredAt);
 }
 
+function hasSingleLineEndingSpaceInsertion(storedBody, incomingBody) {
+  if (incomingBody.length !== storedBody.length + 1) return false;
+  let storedIndex = 0;
+  let skipped = false;
+  for (let incomingIndex = 0; incomingIndex < incomingBody.length; incomingIndex += 1) {
+    if (!skipped && incomingBody[incomingIndex] === " " && incomingBody[incomingIndex + 1] === "\n" &&
+        storedBody[storedIndex] === "\n") {
+      skipped = true;
+      continue;
+    }
+    if (incomingBody[incomingIndex] !== storedBody[storedIndex]) return false;
+    storedIndex += 1;
+  }
+  return skipped && storedIndex === storedBody.length;
+}
+
 function normalizedInboundAttachment(attachment) {
   const externalId = String(attachment?.externalId || "");
   const mimeType = String(attachment?.mimeType || "application/octet-stream").slice(0, 200);
@@ -1735,18 +1751,60 @@ async function ingestGroupTextBackups(request, env) {
     if (stored.conversation_external_id !== expectedConversationExternalId) {
       throw new Error("message_external_id_conflict");
     }
+    let lineEndingSpaceAttachmentSupplement = false;
     if (stored.body !== entry.bodyText) {
-      if (!exactQuoteBodyUpgrade(connector, stored, entry.item, entry.bodyText)) {
+      if (exactQuoteBodyUpgrade(connector, stored, entry.item, entry.bodyText)) {
+        const update = await env.DB.prepare(`
+          UPDATE group_text_backups SET body = ?
+          WHERE connector_id = ? AND external_id = ? AND conversation_external_id = ?
+            AND sender_id = ? AND occurred_at = ? AND body = ?
+        `).bind(entry.bodyText, connectorId, externalId, expectedConversationExternalId,
+          stored.sender_id, stored.occurred_at, stored.body).run();
+        if (!count(update.meta?.changes)) throw new Error("message_external_id_conflict");
+        stored = { ...stored, body: entry.bodyText };
+      } else if (entry.attachmentMetadata.length && !entry.replyPreview &&
+          hasSingleLineEndingSpaceInsertion(stored.body, entry.bodyText)) {
+        const existing = await env.DB.prepare(`
+          SELECT m.id, m.direction, m.sender_id, m.sender_name, m.occurred_at, m.body,
+            c.external_id AS conversation_external_id,
+            (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id) AS attachment_count,
+            m.metadata_json
+          FROM messages m JOIN conversations c ON c.id = m.conversation_id
+          WHERE m.connector_id = ? AND m.external_id = ?
+        `).bind(connectorId, externalId).first();
+        const existingMetadata = safeJson(existing?.metadata_json, {});
+        const existingAttachmentFieldValid = existingMetadata.attachments === undefined ||
+          Array.isArray(existingMetadata.attachments);
+        const existingAttachments = Array.isArray(existingMetadata.attachments)
+          ? existingMetadata.attachments.slice(0, 20) : [];
+        const incomingAttachmentsById = new Map(entry.attachmentMetadata.map((attachment) =>
+          [attachment.externalId, attachment]));
+        let existingAttachmentsMatch = existingAttachmentFieldValid &&
+          Number(existing?.attachment_count) === existingAttachments.length;
+        for (const attachment of existingAttachments) {
+          const normalized = normalizedInboundAttachment(attachment);
+          const incoming = incomingAttachmentsById.get(normalized.externalId);
+          if (!incoming || JSON.stringify(normalized) !== JSON.stringify(incoming)) {
+            existingAttachmentsMatch = false;
+            break;
+          }
+        }
+        const requestSenderId = entry.item.senderId ? String(entry.item.senderId) : null;
+        const requestSenderName = String(entry.item.senderName).trim().slice(0, 200);
+        if (!existing || existing.conversation_external_id !== expectedConversationExternalId ||
+            existing.direction !== "inbound" || existing.sender_id !== stored.sender_id ||
+            existing.sender_id !== requestSenderId || existing.sender_name !== stored.sender_name ||
+            existing.sender_name !== requestSenderName ||
+            Date.parse(existing.occurred_at) !== Date.parse(stored.occurred_at) ||
+            Date.parse(stored.occurred_at) !== Date.parse(entry.occurredAt) ||
+            existing.body !== stored.body || !existingAttachmentsMatch ||
+            (existingMetadata.reply !== undefined && existingMetadata.reply !== null)) {
+          throw new Error("message_external_id_conflict");
+        }
+        lineEndingSpaceAttachmentSupplement = true;
+      } else {
         throw new Error("message_external_id_conflict");
       }
-      const update = await env.DB.prepare(`
-        UPDATE group_text_backups SET body = ?
-        WHERE connector_id = ? AND external_id = ? AND conversation_external_id = ?
-          AND sender_id = ? AND occurred_at = ? AND body = ?
-      `).bind(entry.bodyText, connectorId, externalId, expectedConversationExternalId,
-        stored.sender_id, stored.occurred_at, stored.body).run();
-      if (!count(update.meta?.changes)) throw new Error("message_external_id_conflict");
-      stored = { ...stored, body: entry.bodyText };
     }
     const senderId = typeof entry.item.senderId === "string" ? entry.item.senderId : "";
     const senderName = typeof entry.item.senderName === "string" ? entry.item.senderName.trim().slice(0, 200) : "";
@@ -1766,10 +1824,12 @@ async function ingestGroupTextBackups(request, env) {
       attachmentMetadata: entry.attachmentMetadata,
       replyPreview: entry.replyPreview,
       senderRefresh: hasSenderRefresh,
+      lineEndingSpaceAttachmentSupplement,
     });
   }
   let normalizedInserted = 0;
-  for (const { item, bodyText, placement, occurredAt, attachmentMetadata, replyPreview, senderRefresh } of canonical) {
+  for (const { item, bodyText, placement, occurredAt, attachmentMetadata, replyPreview, senderRefresh,
+    lineEndingSpaceAttachmentSupplement } of canonical) {
     const senderId = typeof item.senderId === "string" ? item.senderId : "";
     const senderName = typeof item.senderName === "string" ? item.senderName.trim().slice(0, 200) : "";
     const conversationExternalId = String(item.conversationExternalId).slice(0, 500);
@@ -1805,12 +1865,18 @@ async function ingestGroupTextBackups(request, env) {
     if (count(result.meta?.changes)) normalizedInserted += 1;
     else {
       const existing = await env.DB.prepare(`
-        SELECT id, conversation_id, direction, sender_id, occurred_at, body, metadata_json
+        SELECT id, conversation_id, direction, sender_id, sender_name, occurred_at, body, metadata_json
         FROM messages WHERE connector_id = ? AND external_id = ?
       `).bind(connectorId, String(item.externalId).slice(0, 300)).first();
       if (!existing) throw new Error("message_not_found");
       const quoteBodyUpgrade = exactQuoteBodyUpgrade(connector, existing, item, bodyText);
       if (existing.conversation_id !== conversation.id || existing.direction !== "inbound" ||
+          (lineEndingSpaceAttachmentSupplement &&
+            (existing.sender_id !== (item.senderId || null) || existing.sender_name !== item.senderName ||
+              Date.parse(existing.occurred_at) !== Date.parse(occurredAt) ||
+              existing.body !== bodyText || replyPreview ||
+              (safeJson(existing.metadata_json, {}).reply !== undefined &&
+                safeJson(existing.metadata_json, {}).reply !== null))) ||
           (existing.body !== bodyText && !quoteBodyUpgrade)) {
         // The legacy backup table is written before normalization. If an
         // external id is already bound to a different conversation, remove the

@@ -94,3 +94,4 @@
 
 | 248 | [BugFix] Confirmed native cleanup quarantine | Quarantine the exact confirmed-result unload-timeout shape by PID and reuse existing recovery budget | Prevent repeated same-PID SDK work without changing helper lifecycle or rate limits | Complete; first-fault isolation and one bounded live recovery verified |
 | 249 | [BugFix] Send retry ledger | Persist safe adapter retry results and flags consistently | Make durable command evidence reflect actual pre-dispatch retries | Locally verified |
+| 250 | [BugFix] Group backup conflict repair | Diagnose and repair the confirmed group-backup replay conflict without weakening message identity checks | A valid uploaded attachment reaches the production backup POST path but receives `message_external_id_conflict` | ✅ Locally verified; no deployment |

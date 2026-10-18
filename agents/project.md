@@ -38,3 +38,4 @@ Cloudflare Worker、D1、R2；Vue 前端与 @platform-kit/fluent；通用连接�
 - [040_[Feature]_qq_only_runtime_contract](040_[Feature]_qq_only_runtime_contract/task_plan.md)：允许 QQ 单源配置，并为原生 readiness 请求声明 QQ driver。
 
 - [050_[BugFix]_qq_priority_alias_contract](050_[BugFix]_qq_priority_alias_contract/task_plan.md)：Align confirmed-send readback registration with the canonical conversation alias passed by the Worker.
+- [250_[BugFix]_group-backup-conflict-repair](250_[BugFix]_group-backup-conflict-repair/task_plan.md)：Allow only the verified attachment replay where the updated body differs by one line-ending ASCII space, preserving canonical body and strict identity checks.
