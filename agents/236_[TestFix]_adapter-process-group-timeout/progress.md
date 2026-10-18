@@ -6,3 +6,4 @@
 - Ran `python -m py_compile test/test_device_runtime.py` successfully.
 - No production files changed.
 - Committed the test and audit update locally as `af8ad2e`.
+- Root ran the synchronized POSIX timeout/child-cleanup test on actual iPad Python three consecutive times; all passed. The full selected public suite then passed 215 tests with 2 platform skips. No production runtime change was needed.
