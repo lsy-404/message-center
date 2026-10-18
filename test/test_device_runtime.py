@@ -4,6 +4,7 @@ import http.server
 import io
 import json
 import os
+import signal
 import sqlite3
 import stat
 import tempfile
@@ -2573,26 +2574,75 @@ class DeviceRuntimeTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     runtime.run_adapter(script, {"input": "x" * (4 * 1024 * 1024)}, timeout=0.25)
                 self.assertLess(time.monotonic() - started, 3)
-        marker = os.path.join(self.temp.name, "survived")
-        child = "import time;time.sleep(.8);open(" + repr(marker) + ", 'w').close()"
-        with open(script, "w", encoding="utf-8") as output:
-            output.write("#!/usr/bin/env python3\nimport subprocess,sys\n"
-                         "subprocess.Popen([sys.executable, '-c', " + repr(child) + "])\n")
-        os.chmod(script, 0o700)
-        with self.assertRaises(RuntimeError):
-            runtime.run_adapter(script, {"input": "x"}, timeout=0.25)
-        time.sleep(1)
-        self.assertFalse(os.path.exists(marker))
-        marker = os.path.join(self.temp.name, "survived")
-        child = "import time;time.sleep(.8);open(" + repr(marker) + ", 'w').close()"
-        with open(script, "w", encoding="utf-8") as output:
-            output.write("#!/usr/bin/env python3\nimport subprocess,sys\n"
-                         "subprocess.Popen([sys.executable, '-c', " + repr(child) + "])\n")
-        os.chmod(script, 0o700)
-        with self.assertRaises(RuntimeError):
-            runtime.run_adapter(script, {"input": "x"}, timeout=0.25)
-        time.sleep(1)
-        self.assertFalse(os.path.exists(marker))
+        for parent_mode in ("exits", "waits"):
+            with self.subTest(parent_mode=parent_mode):
+                marker = os.path.join(self.temp.name, "survived-" + parent_mode)
+                child_ready = os.path.join(self.temp.name, "timeout-child-ready-" + parent_mode + ".json")
+                parent_ready = os.path.join(self.temp.name, "timeout-parent-ready-" + parent_mode + ".json")
+                release = os.path.join(self.temp.name, "timeout-child-release-" + parent_mode)
+                child = (
+                    "import json,os,time\n"
+                    "with open(" + repr(child_ready) + ", 'w', encoding='utf-8') as f:\n"
+                    " json.dump({'pid': os.getpid(), 'pgid': os.getpgrp()}, f)\n"
+                    "deadline=time.monotonic()+30\n"
+                    "while not os.path.exists(" + repr(release) + ") and time.monotonic()<deadline: time.sleep(.01)\n"
+                    "if os.path.exists(" + repr(release) + "): open(" + repr(marker) + ", 'w').close()\n"
+                )
+                parent = (
+                    "import json,os,subprocess,sys,time\n"
+                    "subprocess.Popen([sys.executable, '-c', " + repr(child) + "], stderr=subprocess.DEVNULL)\n"
+                    "deadline=time.monotonic()+10\n"
+                    "while not os.path.exists(" + repr(child_ready) + ") and time.monotonic()<deadline: time.sleep(.01)\n"
+                    "if not os.path.exists(" + repr(child_ready) + "): raise SystemExit(7)\n"
+                    "with open(" + repr(parent_ready) + ", 'w', encoding='utf-8') as f:\n"
+                    " json.dump({'pid': os.getpid(), 'pgid': os.getpgrp()}, f)\n"
+                    "if " + repr(parent_mode) + " == 'waits': time.sleep(30)\n"
+                )
+                with open(script, "w", encoding="utf-8") as output:
+                    output.write("#!/usr/bin/env python3\n" + parent)
+                os.chmod(script, 0o700)
+                child_pid = child_pgid = parent_pid = parent_pgid = None
+                try:
+                    with self.assertRaises(RuntimeError):
+                        runtime.run_adapter(script, {"input": "x"}, timeout=2)
+                    self.assertTrue(os.path.exists(child_ready), "child must be started before timeout")
+                    with open(child_ready, encoding="utf-8") as source:
+                        child_info = json.load(source)
+                    child_pid, child_pgid = child_info["pid"], child_info["pgid"]
+                    self.assertTrue(os.path.exists(parent_ready), "parent must observe child readiness")
+                    with open(parent_ready, encoding="utf-8") as source:
+                        parent_info = json.load(source)
+                    parent_pid, parent_pgid = parent_info["pid"], parent_info["pgid"]
+                    self.assertEqual(child_pgid, parent_pgid, "child must share the owned helper group")
+                    self.assertEqual(parent_pgid, parent_pid, "helper must own its new session")
+                    with open(release, "w", encoding="utf-8"):
+                        pass
+                    deadline = time.monotonic() + 0.5
+                    while not os.path.exists(marker) and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertFalse(os.path.exists(marker), "timed-out process group must not retain a live child")
+                finally:
+                    if child_pid is None and os.path.exists(child_ready):
+                        try:
+                            with open(child_ready, encoding="utf-8") as source:
+                                child_info = json.load(source)
+                            child_pid, child_pgid = child_info["pid"], child_info["pgid"]
+                        except (OSError, ValueError, KeyError):
+                            pass
+                    if parent_pid is None and os.path.exists(parent_ready):
+                        try:
+                            with open(parent_ready, encoding="utf-8") as source:
+                                parent_info = json.load(source)
+                            parent_pid, parent_pgid = parent_info["pid"], parent_info["pgid"]
+                        except (OSError, ValueError, KeyError):
+                            pass
+                    for owned_pid, owned_pgid in ((child_pid, child_pgid), (parent_pid, parent_pgid)):
+                        if owned_pid is not None:
+                            try:
+                                if os.getpgid(owned_pid) == owned_pgid:
+                                    os.kill(owned_pid, signal.SIGKILL)
+                            except OSError:
+                                pass
 
     def test_adapter_invalid_json_kills_remaining_group_children(self):
         script = os.path.join(self.temp.name, "adapter")
