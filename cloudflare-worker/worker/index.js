@@ -3190,9 +3190,7 @@ async function agentTool(env, name, args) {
     if (!row || text(row.lease_expires_at) < now()) throw new Error("invalid_message_lease");
     const scope = agentScope(row);
     if (scope.replyPolicy === "none" || scope.trustTier === "rejected") throw new Error("reply_not_allowed_by_policy");
-    if (scope.trustTier === "trusted" && !scope.allowedActions.includes("send_text")) {
-      throw new Error("reply_action_not_allowed_by_policy");
-    }
+    if (!scope.allowedActions.includes("send_text")) throw new Error("reply_action_not_allowed_by_policy");
     return queueOutbound(env, { conversationId: row.conversation_id, body: String(args.text || ""), attachmentIds: [],
       userId: `agent:${args.consumerId}`, userName: "Agent", idempotencyKey: args.clientRequestId,
       leaseGuard: { messageId: args.messageId, leaseToken: args.leaseToken, consumerId: args.consumerId } });
@@ -3220,6 +3218,17 @@ async function agentTool(env, name, args) {
       channelLabel: row.channel_label || row.kind,
       accountLabel: row.account_label, displayName: row.display_name, note: row.note, state: liveState(row),
       capabilities: safeJson(row.capabilities_json, []), lastSeenAt: row.last_seen_at })) };
+  }
+  if (name === "owner_activity") {
+    const ids = args.conversationIds ?? [];
+    if (!Array.isArray(ids) || ids.length > 50 || !ids.every(validId)) throw new Error("invalid_conversation_ids");
+    const owner = `direction = 'outbound' AND delivery_state = 'delivered' AND (created_by IS NULL OR created_by NOT LIKE 'agent:%')`;
+    const global = await env.DB.prepare(`SELECT occurred_at FROM messages WHERE ${owner} ORDER BY occurred_at DESC LIMIT 1`).first();
+    const perConversation = ids.length ? await env.DB.batch(ids.map((id) => env.DB.prepare(
+      `SELECT occurred_at FROM messages WHERE conversation_id = ? AND ${owner} ORDER BY occurred_at DESC LIMIT 1`).bind(id))) : [];
+    return { lastOutboundAt: global?.occurred_at ?? null,
+      conversations: ids.map((conversationId, index) => ({ conversationId,
+        lastOutboundAt: perConversation[index].results?.[0]?.occurred_at ?? null })) };
   }
   if (name === "list_conversation_files") {
     if (!validId(args.conversationId)) throw new Error("invalid_conversation_id");
@@ -3261,7 +3270,7 @@ const MCP_TOOLS = [
     inputSchema: { type: "object", additionalProperties: false, properties: { consumerId: { type: "string" },
       triggers: { type: "array", uniqueItems: true, maxItems: 3, items: { type: "string", enum: ["direct", "mention", "explicit_request"] } },
       conversationTypes: { type: "array", uniqueItems: true, maxItems: 2, items: { type: "string", enum: ["direct", "group"] } } }, required: ["consumerId"] } },
-  { name: "reply_message", description: "Queue an idempotent text reply when the conversation policy and connector capability allow it.",
+  { name: "reply_message", description: "Queue an idempotent text reply when the conversation policy grants send_text and the connector supports it. Replies through a device_relay connector are limited to 500 characters.",
     inputSchema: { type: "object", additionalProperties: false, properties: { consumerId: { type: "string" },
       messageId: { type: "string" }, leaseToken: { type: "string" }, clientRequestId: { type: "string" },
       text: { type: "string", minLength: 1, maxLength: 20000 } },
@@ -3273,6 +3282,9 @@ const MCP_TOOLS = [
       required: ["consumerId", "messageId", "leaseToken", "outcome"] } },
   { name: "connector_status", description: "List every connector instance with its account label, declared capabilities, and coarse status.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false } },
+  { name: "owner_activity", description: "Report when the owner last sent a message themselves, across all conversations and for the given conversations. Replies sent by agents are not counted.",
+    inputSchema: { type: "object", additionalProperties: false, properties: {
+      conversationIds: { type: "array", maxItems: 50, items: { type: "string" } } } } },
   { name: "list_conversation_files", description: "List files from a conversation only when its policy grants files_read.",
     inputSchema: { type: "object", additionalProperties: false, properties: { conversationId: { type: "string" } }, required: ["conversationId"] } },
 ];
@@ -3405,7 +3417,10 @@ export default {
       if (url.pathname === "/signed-out" && request.method === "GET") return authenticationPage("已退出 Message Center。再次访问需要登录。");
       if (url.pathname === "/api/auth/callback" && request.method === "GET") return authenticationResult(await completeOidcLogin(request, env));
       if (url.pathname === "/api/auth/logout" && request.method === "POST") return await logoutOidc(request, env);
-      if (url.pathname === "/mcp" && request.method === "POST") return await mcp(request, env);
+      if (url.pathname === "/mcp") {
+        if (request.method !== "POST") return new Response(null, { status: 405, headers: { allow: "POST" } });
+        return await mcp(request, env);
+      }
       if (url.pathname === "/api/connectors/register" && request.method === "POST") return await registerConnector(request, env);
       if (url.pathname === "/api/connectors/heartbeat" && request.method === "POST") return await heartbeatConnector(request, env);
       if (url.pathname === "/api/connectors/layout-control" && request.method === "GET") {

@@ -80,6 +80,8 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_external ON messages(connector_id, external_id);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_time ON messages(conversation_id, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_messages_queue_class ON messages(queue_class, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_messages_owner_outbound ON messages(occurred_at) WHERE direction = 'outbound';
+CREATE INDEX IF NOT EXISTS idx_messages_owner_outbound_conversation ON messages(conversation_id, occurred_at) WHERE direction = 'outbound';
 
 CREATE TABLE IF NOT EXISTS attachments (
   id TEXT PRIMARY KEY,
