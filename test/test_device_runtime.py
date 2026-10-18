@@ -1202,6 +1202,38 @@ class DeviceRuntimeTests(unittest.TestCase):
             "retry": True, "dispatched": False, "error": "native_operation_uncertain"})
         self.assertEqual(retryable, 1)
 
+    def test_pre_dispatch_retry_survives_restart_then_stops_on_terminal_rejection(self):
+        self.save_cursor()
+        command = {"id": "command-retry", "leaseToken": "lease-retry",
+                   "idempotencyKey": "key-retry",
+                   "payload": {"externalConversationId": "conversation-aaaaaaaa",
+                               "body": "synthetic"}}
+        def http_call(method, path, payload=None):
+            return {"ok": True}
+        first = runtime.Relay(self.config, self.db, lambda request: {
+            "ok": False, "dispatched": False, "retryable": True,
+            "error": "temporarily-unavailable"}, http_call=http_call)
+        first.process_command(command, "primary")
+        state, raw, retryable = self.db.execute(
+            "SELECT state,result,retryable FROM command_ledger WHERE idempotency_key=?",
+            ("key-retry",)).fetchone()
+        self.assertEqual((state, retryable), ("retry", 1))
+        self.assertEqual(json.loads(raw), {"retry": True, "error": "temporarily-unavailable"})
+        calls = []
+        def terminal_adapter(request):
+            calls.append(request)
+            return {"ok": False, "dispatched": False, "retryable": False,
+                    "error": "target-context-unverified"}
+        restarted = runtime.Relay(self.config, self.db, terminal_adapter, http_call=http_call)
+        restarted.process_command(command, "primary")
+        restarted.process_command(command, "primary")
+        self.assertEqual(len(calls), 1)
+        state, raw, retryable = self.db.execute(
+            "SELECT state,result,retryable FROM command_ledger WHERE idempotency_key=?",
+            ("key-retry",)).fetchone()
+        self.assertEqual((state, retryable), ("done", 0))
+        self.assertEqual(json.loads(raw), {"ok": False, "error": "target-context-unverified"})
+
     def test_attachment_without_staging_contract_does_not_commit_cursor(self):
         old = runtime.compact({"next": "old"})
         self.db.execute("INSERT INTO cursors(connector_id,profile,value) VALUES('connector-a','primary',?)", (old,))

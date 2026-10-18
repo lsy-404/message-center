@@ -93,3 +93,4 @@
 | 236 | [TestFix] Adapter process-group timeout fixture | Make the POSIX timeout test deterministically prove owned child cleanup | Fixed-delay child markers can race with process startup and obscure whether cleanup failed | 🔄 In progress |
 
 | 248 | [BugFix] Confirmed native cleanup quarantine | Quarantine the exact confirmed-result unload-timeout shape by PID and reuse existing recovery budget | Prevent repeated same-PID SDK work without changing helper lifecycle or rate limits | In progress |
+| 249 | [BugFix] Send retry ledger | Persist safe adapter retry results and flags consistently | Make durable command evidence reflect actual pre-dispatch retries | Locally verified |

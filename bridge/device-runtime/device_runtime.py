@@ -1821,8 +1821,9 @@ class Relay:
                     raise RuntimeError("send_result_ambiguous")
                 outcome = {"retry": True, "error": str(result.get("error", "send_failed"))[:100]}
                 retryable = 1
-                self.db.execute("UPDATE command_ledger SET state='retry' WHERE connector_id=? AND idempotency_key=?",
-                                (self.connector, key))
+                self.db.execute("UPDATE command_ledger SET state='retry',result=?,retryable=1 "
+                                "WHERE connector_id=? AND idempotency_key=?",
+                                (compact(outcome), self.connector, key))
             elif result.get("ok") is False and result.get("dispatched") is False:
                 outcome = {"ok": False, "error": str(result.get("error", "send_failed"))[:100]}
                 retryable = 0
