@@ -309,17 +309,6 @@ button { color: inherit; }
   cursor: pointer;
 }
 .quiet-button.fluent-button { min-height: 34px; padding: 0; border-color: transparent; background: transparent; box-shadow: none; }
-.quiet-button.group-helper-back-button.fluent-button {
-  display: inline-flex;
-  width: auto;
-  min-width: 0;
-  height: 34px;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 4px;
-  padding: 0 8px;
-  white-space: nowrap;
-}
 .quiet-button:hover, .quiet-button.fluent-button:hover:not(:disabled) { color: var(--text-primary); background: var(--row-hover); }
 .quiet-button:active { background: var(--subtle-pressed); }
 .refresh-button.spinning .app-icon { animation: spin .8s linear infinite; }
@@ -347,6 +336,9 @@ button { color: inherit; }
 }
 .pane-header { justify-content: space-between; gap: 10px; padding: 12px 12px 10px 18px; }
 .pane-title { min-width: 0; }
+.conversation-breadcrumb { display: flex; align-items: center; gap: 4px; margin-top: 2px; color: var(--text-tertiary); font-size: 12px; }
+.conversation-breadcrumb button { min-height: 0; padding: 0; border: 0; color: var(--text-secondary); background: transparent; cursor: pointer; }
+.conversation-breadcrumb button:hover { color: var(--text-primary); }
 .pane-header h1, .instances-header h1 {
   margin: 0;
   overflow: hidden;
@@ -477,6 +469,8 @@ button { color: inherit; }
 }
 .avatar img.is-broken { display: none; }
 .conversation-avatar { width: 44px; height: 44px; }
+.conversation-folder-row .folder-avatar { color: var(--accent-base); background: var(--subtle-secondary); }
+.conversation-folder-row .conversation-title-row > .app-icon { color: var(--text-tertiary); }
 .channel-badge {
   position: absolute;
   z-index: 1;
