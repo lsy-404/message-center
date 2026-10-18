@@ -3225,7 +3225,8 @@ async function agentTool(env, name, args) {
     const owner = `direction = 'outbound' AND delivery_state = 'delivered' AND (created_by IS NULL OR created_by NOT LIKE 'agent:%')
       AND NOT (created_by IS NULL AND EXISTS (SELECT 1 FROM messages a WHERE a.conversation_id = messages.conversation_id
         AND a.direction = 'outbound' AND a.external_id IS NULL AND a.created_by LIKE 'agent:%'
-        AND a.body = messages.body AND a.created_at <= messages.created_at))`;
+        AND a.delivery_state != 'failed' AND a.body = messages.body
+        AND a.occurred_at BETWEEN strftime('%Y-%m-%dT%H:%M:%fZ', messages.occurred_at, '-5 minutes') AND messages.occurred_at))`;
     const global = await env.DB.prepare(`SELECT occurred_at FROM messages WHERE ${owner} ORDER BY occurred_at DESC LIMIT 1`).first();
     const ownerSince = global?.occurred_at ?? "";
     const stamp = now();
