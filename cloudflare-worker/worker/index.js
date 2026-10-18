@@ -3313,7 +3313,7 @@ async function mcp(request, env) {
   if (body.jsonrpc !== "2.0" || typeof body.method !== "string") {
     return json({ jsonrpc: "2.0", id: body.id ?? null, error: { code: -32600, message: "Invalid Request" } });
   }
-  if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+  if (body.id === undefined) return new Response(null, { status: 202 });
   if (body.method === "initialize") {
     const requested = String(body.params?.protocolVersion || "");
     return json({ jsonrpc: "2.0", id: body.id, result: {
