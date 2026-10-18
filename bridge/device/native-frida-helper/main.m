@@ -55,6 +55,13 @@ typedef struct {
   gboolean binary_written;
   gboolean timed_out;
   gboolean hard_timeout;
+  gint64 started_monotonic_us;
+  gint64 result_received_us;
+  gint64 cleanup_started_us;
+  gint64 unload_finished_us;
+  gint64 detach_finished_us;
+  gint64 close_finished_us;
+  const gchar *detach_reason;
 } Helper;
 
 static void start_cleanup(Helper *helper);
@@ -89,6 +96,41 @@ static void
 set_stage(Helper *helper, const gchar *stage)
 {
   helper->stage = stage;
+}
+
+static void
+mark_phase(gint64 *phase)
+{
+  if (*phase == 0)
+    *phase = g_get_monotonic_time();
+}
+
+static NSNumber *
+phase_elapsed_ms(Helper *helper, gint64 phase)
+{
+  if (helper->started_monotonic_us == 0 || phase == 0 ||
+      phase < helper->started_monotonic_us)
+    return nil;
+  return @((guint64) ((phase - helper->started_monotonic_us) / 1000));
+}
+
+static const gchar *
+detach_reason_name(FridaSessionDetachReason reason)
+{
+  switch (reason) {
+    case FRIDA_SESSION_DETACH_REASON_APPLICATION_REQUESTED:
+      return "application_requested";
+    case FRIDA_SESSION_DETACH_REASON_PROCESS_REPLACED:
+      return "process_replaced";
+    case FRIDA_SESSION_DETACH_REASON_PROCESS_TERMINATED:
+      return "process_terminated";
+    case FRIDA_SESSION_DETACH_REASON_CONNECTION_TERMINATED:
+      return "connection_terminated";
+    case FRIDA_SESSION_DETACH_REASON_DEVICE_LOST:
+      return "device_lost";
+    default:
+      return "unknown";
+  }
 }
 
 static void
@@ -169,6 +211,7 @@ on_manager_closed(GObject *source, GAsyncResult *result, gpointer user_data)
 {
   Helper *helper = user_data;
   GError *error = NULL;
+  mark_phase(&helper->close_finished_us);
   frida_device_manager_close_finish(FRIDA_DEVICE_MANAGER(source), result, &error);
   if (error != NULL) {
     record_cleanup_failure(helper, "manager_close_failed", NULL);
@@ -194,6 +237,7 @@ on_session_detached(GObject *source, GAsyncResult *result, gpointer user_data)
 {
   Helper *helper = user_data;
   GError *error = NULL;
+  mark_phase(&helper->detach_finished_us);
   frida_session_detach_finish(FRIDA_SESSION(source), result, &error);
   if (error != NULL) {
     record_cleanup_failure(helper, "detach_failed", NULL);
@@ -251,6 +295,7 @@ on_script_unloaded(GObject *source, GAsyncResult *result, gpointer user_data)
 {
   Helper *helper = user_data;
   GError *error = NULL;
+  mark_phase(&helper->unload_finished_us);
   frida_script_unload_finish(FRIDA_SCRIPT(source), result, &error);
   if (error != NULL) {
     record_cleanup_failure(helper, "unload_failed", NULL);
@@ -282,6 +327,7 @@ start_cleanup(Helper *helper)
   if (helper->cleanup_started)
     return;
   helper->cleanup_started = TRUE;
+  mark_phase(&helper->cleanup_started_us);
   remove_source(&helper->timeout_source);
   remove_source(&helper->force_source);
   helper->cleanup_timeout_source = g_timeout_add(CLEANUP_TIMEOUT_MS,
@@ -388,6 +434,7 @@ on_script_message(FridaScript *script, const gchar *message, GBytes *data,
       }
       helper->result_json = g_strndup(payload_data.bytes, payload_data.length);
       helper->result_received = TRUE;
+      mark_phase(&helper->result_received_us);
     }
     if (!helper->operation_in_flight)
       complete_script(helper);
@@ -406,8 +453,8 @@ on_session_detached_signal(FridaSession *session, FridaSessionDetachReason reaso
 {
   Helper *helper = user_data;
   (void) session;
-  (void) reason;
   (void) crash;
+  helper->detach_reason = detach_reason_name(reason);
   if (helper->cleanup_started)
     return;
   fail(helper, helper->stage, "session_detached");
@@ -550,6 +597,7 @@ on_operation_timeout(gpointer user_data)
 static void
 begin(Helper *helper, guint timeout_ms)
 {
+  helper->started_monotonic_us = g_get_monotonic_time();
   helper->loop = g_main_loop_new(NULL, FALSE);
   helper->operation_cancel = g_cancellable_new();
   helper->cleanup_cancel = g_cancellable_new();
@@ -820,6 +868,24 @@ main(int argc, char **argv)
     output[@"cleanupStage"] = [NSString stringWithUTF8String:
         helper.cleanup_stage ?: "unknown"];
   }
+  NSMutableDictionary *phase_elapsed = [NSMutableDictionary dictionary];
+  NSNumber *elapsed = phase_elapsed_ms(&helper, helper.result_received_us);
+  if (elapsed != nil) phase_elapsed[@"resultReceivedMs"] = elapsed;
+  elapsed = phase_elapsed_ms(&helper, helper.cleanup_started_us);
+  if (elapsed != nil) phase_elapsed[@"cleanupStartedMs"] = elapsed;
+  elapsed = phase_elapsed_ms(&helper, helper.unload_finished_us);
+  if (elapsed != nil) phase_elapsed[@"unloadFinishedMs"] = elapsed;
+  elapsed = phase_elapsed_ms(&helper, helper.detach_finished_us);
+  if (elapsed != nil) phase_elapsed[@"detachFinishedMs"] = elapsed;
+  elapsed = phase_elapsed_ms(&helper, helper.close_finished_us);
+  if (elapsed != nil) phase_elapsed[@"closeFinishedMs"] = elapsed;
+  if (phase_elapsed.count > 0)
+    output[@"phaseElapsedMs"] = phase_elapsed;
+  if (helper.detach_reason != NULL)
+    output[@"detachReason"] = [NSString stringWithUTF8String:helper.detach_reason];
+  errno = 0;
+  output[@"targetAliveAtCleanup"] =
+      (kill((pid_t) helper.pid, 0) == 0 || errno == EPERM) ? @YES : @NO;
   if (helper.binary_output.enabled) {
     output[@"binaryWritten"] = (success && helper.binary_written) ? @YES : @NO;
     if (success)

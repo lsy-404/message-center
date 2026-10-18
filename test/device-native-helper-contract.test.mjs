@@ -43,6 +43,19 @@ test('helper preserves bounded cleanup stage and exact cleanup completion state'
   assert.match(docs, /boolean `cleanupIncomplete`/i);
 });
 
+test('helper emits bounded cleanup phase metadata and strict JSON booleans', () => {
+  assert.match(source, /phaseElapsedMs/);
+  assert.match(source, /resultReceivedMs/);
+  assert.match(source, /cleanupStartedMs/);
+  assert.match(source, /unloadFinishedMs/);
+  assert.match(source, /detachFinishedMs/);
+  assert.match(source, /closeFinishedMs/);
+  assert.match(source, /detachReason/);
+  assert.match(source, /targetAliveAtCleanup/);
+  assert.match(source, /\? @YES : @NO/);
+  assert.match(source, /FRIDA_SESSION_DETACH_REASON_PROCESS_TERMINATED/);
+});
+
 test('script eternalization is opt-in and follows only a valid setup result', () => {
   assert.match(source, /gboolean eternalize_requested;/);
   assert.match(source, /strcmp\(argv\[i\], "--eternalize"\)/);
