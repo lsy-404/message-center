@@ -92,5 +92,5 @@
 | 235 | [Diagnostic] Native cleanup phase telemetry | Record bounded monotonic cleanup phases, detach reason, and target liveness at cleanup completion | Distinguish script cleanup delay from process exit without recording private content | ✅ Native build and generic device phase proof passed; QQ fault diagnosis remains open |
 | 236 | [TestFix] Adapter process-group timeout fixture | Make the POSIX timeout test deterministically prove owned child cleanup | Fixed-delay child markers can race with process startup and obscure whether cleanup failed | 🔄 In progress |
 
-| 248 | [BugFix] Confirmed native cleanup quarantine | Quarantine the exact confirmed-result unload-timeout shape by PID and reuse existing recovery budget | Prevent repeated same-PID SDK work without changing helper lifecycle or rate limits | In progress |
+| 248 | [BugFix] Confirmed native cleanup quarantine | Quarantine the exact confirmed-result unload-timeout shape by PID and reuse existing recovery budget | Prevent repeated same-PID SDK work without changing helper lifecycle or rate limits | Complete; first-fault isolation and one bounded live recovery verified |
 | 249 | [BugFix] Send retry ledger | Persist safe adapter retry results and flags consistently | Make durable command evidence reflect actual pre-dispatch retries | Locally verified |
