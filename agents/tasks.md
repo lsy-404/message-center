@@ -91,3 +91,5 @@
 | 234 | [BugFix] Native operation uncertain recovery | Block repeated QQ SDK work after an uncertain result and unload timeout, then recover through the normal UI under existing limits | Preserve explicit unresolved state across receiver restarts and avoid repeated native calls | ✅ Complete |
 | 235 | [Diagnostic] Native cleanup phase telemetry | Record bounded monotonic cleanup phases, detach reason, and target liveness at cleanup completion | Distinguish script cleanup delay from process exit without recording private content | ✅ Native build and generic device phase proof passed; QQ fault diagnosis remains open |
 | 236 | [TestFix] Adapter process-group timeout fixture | Make the POSIX timeout test deterministically prove owned child cleanup | Fixed-delay child markers can race with process startup and obscure whether cleanup failed | 🔄 In progress |
+
+| 248 | [BugFix] Confirmed native cleanup quarantine | Quarantine the exact confirmed-result unload-timeout shape by PID and reuse existing recovery budget | Prevent repeated same-PID SDK work without changing helper lifecycle or rate limits | In progress |

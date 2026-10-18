@@ -647,6 +647,28 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertFalse(runtime.explicit_native_operation_uncertain(
             {**valid, "cleanupStage": "detach"}))
 
+    def test_confirmed_cleanup_timeout_requires_bounded_ordered_phase_metadata(self):
+        valid = {
+            "stage": "cleanup", "errorCode": "cleanup_timeout",
+            "cleanupCode": "cleanup_timeout", "cleanupStage": "unload",
+            "cleanupIncomplete": False,
+            "phaseElapsedMs": {"resultReceivedMs": 6440, "cleanupStartedMs": 6440,
+                                "unloadFinishedMs": 11442, "detachFinishedMs": 11444,
+                                "closeFinishedMs": 11444},
+            "dispatch": "confirmed", "processId": 94058,
+        }
+        self.assertTrue(runtime.explicit_native_cleanup_operation_uncertain(valid))
+        self.assertTrue(runtime.explicit_native_cleanup_operation_uncertain(
+            {**valid, "cleanupIncomplete": True}))
+        for invalid in (
+            {**valid, "dispatch": "unknown"},
+            {**valid, "phaseElapsedMs": {**valid["phaseElapsedMs"], "unloadFinishedMs": 11439}},
+            {**valid, "phaseElapsedMs": {**valid["phaseElapsedMs"], "closeFinishedMs": 150001}},
+            {**valid, "cleanupIncomplete": 0},
+            {**valid, "errorCode": "timeout"},
+        ):
+            self.assertFalse(runtime.explicit_native_cleanup_operation_uncertain(invalid))
+
     def test_native_operation_state_survives_relay_restart(self):
         relay = runtime.Relay(self.auto_wake_config(), self.db,
                               lambda _request: {"ok": True, "commands": []})
@@ -669,6 +691,24 @@ class DeviceRuntimeTests(unittest.TestCase):
             relay.scan_profile("primary")
         self.assertEqual(caught.exception.native_operation_blocked_pid, 12345)
         self.assertEqual(requests[0]["blockedProcessId"], 12345)
+
+    def test_confirmed_cleanup_failure_is_consumed_as_native_uncertain(self):
+        failure = {
+            "stage": "cleanup", "errorCode": "cleanup_timeout",
+            "cleanupCode": "cleanup_timeout", "cleanupStage": "unload",
+            "cleanupIncomplete": False,
+            "phaseElapsedMs": {"resultReceivedMs": 6440, "cleanupStartedMs": 6440,
+                                "unloadFinishedMs": 11442},
+            "dispatch": "confirmed", "processId": 94058,
+        }
+        relay = runtime.Relay(
+            self.config, self.db,
+            lambda _request: {"ok": False, "sourceReadOk": False,
+                               "nativeFailure": failure},
+        )
+        with self.assertRaises(runtime.SourceReadError) as caught:
+            relay.scan_profile("primary")
+        self.assertEqual(caught.exception.native_operation_uncertain_pid, 94058)
 
     def test_blocked_recovery_retries_after_cooldown(self):
         config = self.auto_wake_config()
@@ -1138,6 +1178,29 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(state, "done")
         self.assertEqual(json.loads(result), {"uncertain": True, "error": "device_send_outcome_uncertain"})
         self.assertEqual(retryable, 0)
+
+    def test_native_operation_block_quarantines_qq_send_before_adapter(self):
+        command = {"id": "command-blocked", "leaseToken": "lease-blocked",
+                   "idempotencyKey": "key-blocked",
+                   "payload": {"externalConversationId": "conversation-aaaaaaaa",
+                               "body": "blocked"}}
+        calls = []
+        relay = runtime.Relay(
+            self.config, self.db,
+            lambda request: calls.append(request),
+            http_call=lambda method, path, payload=None: {"ok": True},
+        )
+        relay._block_native_operation("connector-a", 94058)
+        relay.process_command(command, "primary")
+        self.assertEqual(calls, [])
+        state, result, retryable = self.db.execute(
+            "SELECT state,result,retryable FROM command_ledger WHERE connector_id=? AND idempotency_key=?",
+            ("connector-a", "key-blocked"),
+        ).fetchone()
+        self.assertEqual(state, "retry")
+        self.assertEqual(json.loads(result), {
+            "retry": True, "dispatched": False, "error": "native_operation_uncertain"})
+        self.assertEqual(retryable, 1)
 
     def test_attachment_without_staging_contract_does_not_commit_cursor(self):
         old = runtime.compact({"next": "old"})
