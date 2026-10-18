@@ -89,3 +89,5 @@
 
 | 233 | [BugFix] Native helper JSON booleans | Encode hard_timeout as an actual Foundation JSON boolean and verify the emitted JSON type | Strict Python parsing discarded cleanupIncomplete because a boxed int serialized as 0/1 | ✅ Complete |
 | 234 | [BugFix] Native operation uncertain recovery | Block repeated QQ SDK work after an uncertain result and unload timeout, then recover through the normal UI under existing limits | Preserve explicit unresolved state across receiver restarts and avoid repeated native calls | ✅ Complete |
+
+| 248 | [BugFix] Confirmed native cleanup quarantine | Quarantine the exact confirmed-result unload-timeout shape by PID and reuse existing recovery budget | Prevent repeated same-PID SDK work without changing helper lifecycle or rate limits | In progress |

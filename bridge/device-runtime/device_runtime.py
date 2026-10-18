@@ -110,6 +110,35 @@ def explicit_native_operation_uncertain(value):
             and type(value["processId"]) is int and value["processId"] > 1)
 
 
+def explicit_native_cleanup_operation_uncertain(value):
+    if type(value) is not dict or set(value) != {
+            "stage", "errorCode", "cleanupCode", "cleanupStage",
+            "cleanupIncomplete", "phaseElapsedMs", "dispatch", "processId"}:
+        return False
+    phase = value["phaseElapsedMs"]
+    if (value["stage"] != "cleanup" or value["errorCode"] != "cleanup_timeout"
+            or value["cleanupCode"] != "cleanup_timeout"
+            or value["cleanupStage"] != "unload"
+            or type(value["cleanupIncomplete"]) is not bool
+            or value["dispatch"] != "confirmed"
+            or type(value["processId"]) is not int or value["processId"] <= 1
+            or type(phase) is not dict
+            or set(phase) - {"resultReceivedMs", "cleanupStartedMs", "unloadFinishedMs",
+                             "detachFinishedMs", "closeFinishedMs"}
+            or not {"resultReceivedMs", "cleanupStartedMs", "unloadFinishedMs"}.issubset(phase)
+            or not all(type(item) is int and 0 <= item <= 150000
+                       for item in phase.values())):
+        return False
+    previous = -1
+    for key in ("resultReceivedMs", "cleanupStartedMs", "unloadFinishedMs",
+                "detachFinishedMs", "closeFinishedMs"):
+        if key in phase:
+            if phase[key] < previous:
+                return False
+            previous = phase[key]
+    return phase["unloadFinishedMs"] - phase["cleanupStartedMs"] >= 5000
+
+
 def explicit_native_operation_blocked(value):
     if type(value) is not dict or set(value) != {"stage", "errorCode", "dispatch", "processId"}:
         return False
@@ -1166,7 +1195,8 @@ class Relay:
                 query_gate_pending_pid=(failure["processId"]
                                         if explicit_native_query_gate_pending(failure) else None),
                 native_operation_uncertain_pid=(failure["processId"]
-                                               if explicit_native_operation_uncertain(failure) else None),
+                                               if (explicit_native_operation_uncertain(failure)
+                                                   or explicit_native_cleanup_operation_uncertain(failure)) else None),
                 native_operation_blocked_pid=(failure["processId"]
                                               if explicit_native_operation_blocked(failure) else None),
             )
@@ -1724,6 +1754,17 @@ class Relay:
             self.db.execute("INSERT INTO command_ledger(connector_id,idempotency_key,fingerprint,state) "
                             "VALUES(?,?,?,'started')", (self.connector, key, fingerprint))
             self.db.commit()
+        connector_kind = self.connector_by_id[self.connector].get("kind")
+        blocked_pid = self.native_operation_uncertain.get(self.connector)
+        if (connector_kind == "qq" and type(blocked_pid) is int and blocked_pid > 1):
+            outcome = {"retry": True, "dispatched": False,
+                       "error": "native_operation_uncertain"}
+            self.db.execute("UPDATE command_ledger SET state='retry',result=?,retryable=1 "
+                            "WHERE connector_id=? AND idempotency_key=?",
+                            (compact(outcome), self.connector, key))
+            self.db.commit()
+            self.complete(command, outcome)
+            return
         if payload.get("attachments"):
             outcome, retryable = {"ok": False, "error": "adapter_file_send_not_supported"}, 0
             self.db.execute("UPDATE command_ledger SET state='done',result=? WHERE connector_id=? AND idempotency_key=?",
