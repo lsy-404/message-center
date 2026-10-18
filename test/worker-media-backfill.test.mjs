@@ -3,6 +3,26 @@ import { readFileSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 import worker from '../cloudflare-worker/worker/index.js'
 
+const fixedLengthInboundStreams = new WeakMap()
+globalThis.FixedLengthStream = class TestFixedLengthStream {
+  constructor(expectedBytes) {
+    let receivedBytes = 0
+    const stream = new TransformStream({
+      transform(chunk, controller) {
+        receivedBytes += chunk.byteLength
+        if (receivedBytes > expectedBytes) throw new Error('fixed_length_stream_overflow')
+        controller.enqueue(chunk)
+      },
+      flush() {
+        if (receivedBytes !== expectedBytes) throw new Error('fixed_length_stream_underflow')
+      },
+    })
+    this.readable = stream.readable
+    this.writable = stream.writable
+    fixedLengthInboundStreams.set(this.readable, expectedBytes)
+  }
+}
+
 const database = new DatabaseSync(':memory:')
 database.exec(readFileSync(new URL('../cloudflare-worker/worker/schema.sql', import.meta.url), 'utf8'))
 const token = 'c'.repeat(40)
@@ -39,20 +59,28 @@ const env = {
   },
   FILES: {
     async put(key, value, options) {
+      assert.equal(Number.isSafeInteger(fixedLengthInboundStreams.get(value)), true,
+        'R2 inbound objects must receive a known-length stream')
       const bytes = new Uint8Array(await new Response(value).arrayBuffer())
+      assert.equal(fixedLengthInboundStreams.get(value), bytes.byteLength,
+        'fixed-length stream metadata matches the bytes delivered to R2')
       const digest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))]
         .map((byte) => byte.toString(16).padStart(2, '0')).join('')
       assert.equal(options.sha256, digest, 'R2 checksum must match uploaded bytes')
-      files.set(key, { bytes, customMetadata: options.customMetadata })
-      return { size: bytes.length }
+      const checksum = Uint8Array.from(digest.match(/.{2}/g), (pair) => Number.parseInt(pair, 16))
+      const checksumArrayBuffer = checksum.buffer.slice(checksum.byteOffset, checksum.byteOffset + checksum.byteLength)
+      files.set(key, { bytes, checksum: checksumArrayBuffer, customMetadata: options.customMetadata })
+      return { size: bytes.length, checksums: { sha256: checksumArrayBuffer } }
     },
     async head(key) {
       const value = files.get(key)
-      return value ? { size: value.bytes.length, customMetadata: value.customMetadata } : null
+      return value ? { size: value.bytes.length, checksums: { sha256: value.checksum },
+        customMetadata: value.customMetadata } : null
     },
     async get(key) {
       const value = files.get(key)
-      return value ? { body: new Blob([value.bytes]).stream() } : null
+      return value ? { body: new Blob([value.bytes]).stream(), size: value.bytes.length,
+        checksums: { sha256: value.checksum } } : null
     },
     async delete(key) { files.delete(key) },
   },
