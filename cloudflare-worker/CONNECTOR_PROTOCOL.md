@@ -175,8 +175,8 @@ relay 必须按 `idempotencyKey` 去重。暂时故障回执 `retry: true`，确
 - `listen_messages`：只观察可领取的即时消息，不改变队列状态；默认返回私聊、个人提及和显式请求候选，以及最多 20 条前文和 `placement`。
 - `claim_message`：按 `messageId` 原子领取候选并签发 5 分钟租约；竞争失败会返回当前状态、租约到期时间及不泄露对方身份的结构化竞态结果。
 - `consume_message`：持有有效租约的消费者可选择 `completed`、`retry` 或 `dead_letter`；租约丢失同样返回结构化竞态结果。
-- `reply_message`：持有有效租约时排队文本回复；任何信任层级都要求会话策略的 `allowedActions` 含 `send_text`；`device_relay` 连接器的回复最长 500 字符。
-- `owner_activity`：只读；输入可选 `conversationIds`（最多 50 个），返回 `{ lastOutboundAt, conversations: [{ conversationId, lastOutboundAt }] }`，时间为主人本人最近一次已送达的出站消息（不含 agent 回复），无记录时为 `null`。
+- `reply_message`：持有有效租约时排队文本回复；须为 trusted 范围、`replyPolicy` 不为 `none` 且 `allowedActions` 含 `send_text`；`device_relay` 连接器的回复最长 500 个 UTF-16 码元（JavaScript 字符串 length）。
+- `owner_activity`：只读；输入可选 `conversationIds`（最多 50 个），返回 `{ lastOutboundAt, conversations: [{ conversationId, lastOutboundAt }] }`，时间为主人本人在所有渠道最近一次已送达的出站消息（不含 agent 回复及与其正文相同的回显），无记录时为 `null`。
 - `next_message` / `complete_message`：兼容旧客户端的别名。
 - `connector_status`
 - `list_conversation_files`
