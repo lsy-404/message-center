@@ -176,7 +176,7 @@ relay 必须按 `idempotencyKey` 去重。暂时故障回执 `retry: true`，确
 - `claim_message`：按 `messageId` 原子领取候选并签发 5 分钟租约；竞争失败会返回当前状态、租约到期时间及不泄露对方身份的结构化竞态结果。
 - `consume_message`：持有有效租约的消费者可选择 `completed`、`retry` 或 `dead_letter`；租约丢失同样返回结构化竞态结果。
 - `reply_message`：持有有效租约时排队文本回复；须为 trusted 范围、`replyPolicy` 不为 `none` 且 `allowedActions` 含 `send_text`；`device_relay` 连接器的回复最长 500 个 UTF-16 码元（JavaScript 字符串 length）。
-- `owner_activity`：只读；输入可选 `conversationIds`（最多 50 个），返回 `{ lastOutboundAt, conversations: [{ conversationId, lastOutboundAt }] }`，时间为主人本人在所有渠道最近一次已送达的出站消息（不含 agent 回复及与其正文相同的回显），无记录时为 `null`。
+- `owner_activity`：只读；输入可选 `conversationIds`（最多 50 个），返回 `{ lastOutboundAt, conversations: [{ conversationId, lastOutboundAt, lastReplyAt, agentRepliesSinceOwner, activeLeases }] }`。`lastOutboundAt` 为主人本人在所有渠道（或该会话）最近一次已送达的出站消息（不含 agent 回复及与其正文相同的回显），无记录时为 `null`；`lastReplyAt` 为该会话任何未失败的出站消息（含排队中的 agent 回复）的最近时间；`agentRepliesSinceOwner` 为全局 `lastOutboundAt` 之后该会话未失败的 agent 出站消息条数；`activeLeases` 为该会话当前有效的即时队列租约数。
 - `next_message` / `complete_message`：兼容旧客户端的别名。
 - `connector_status`
 - `list_conversation_files`

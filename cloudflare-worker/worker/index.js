@@ -3227,11 +3227,23 @@ async function agentTool(env, name, args) {
         AND a.direction = 'outbound' AND a.external_id IS NULL AND a.created_by LIKE 'agent:%'
         AND a.body = messages.body AND a.created_at <= messages.created_at))`;
     const global = await env.DB.prepare(`SELECT occurred_at FROM messages WHERE ${owner} ORDER BY occurred_at DESC LIMIT 1`).first();
-    const perConversation = ids.length ? await env.DB.batch(ids.map((id) => env.DB.prepare(
-      `SELECT occurred_at FROM messages WHERE conversation_id = ? AND ${owner} ORDER BY occurred_at DESC LIMIT 1`).bind(id))) : [];
+    const ownerSince = global?.occurred_at ?? "";
+    const stamp = now();
+    const perConversation = ids.length ? await env.DB.batch(ids.map((id) => env.DB.prepare(`SELECT
+      (SELECT occurred_at FROM messages WHERE conversation_id = ? AND ${owner} ORDER BY occurred_at DESC LIMIT 1) AS last_outbound_at,
+      (SELECT occurred_at FROM messages WHERE conversation_id = ? AND direction = 'outbound' AND delivery_state != 'failed'
+        ORDER BY occurred_at DESC LIMIT 1) AS last_reply_at,
+      (SELECT COUNT(*) FROM messages WHERE conversation_id = ? AND direction = 'outbound' AND delivery_state != 'failed'
+        AND created_by LIKE 'agent:%' AND occurred_at > ?) AS agent_replies,
+      (SELECT COUNT(*) FROM agent_queue q JOIN messages m ON m.id = q.message_id
+        WHERE m.conversation_id = ? AND q.state = 'leased' AND q.lease_expires_at >= ?) AS active_leases`)
+      .bind(id, id, id, ownerSince, id, stamp))) : [];
     return { lastOutboundAt: global?.occurred_at ?? null,
-      conversations: ids.map((conversationId, index) => ({ conversationId,
-        lastOutboundAt: perConversation[index].results?.[0]?.occurred_at ?? null })) };
+      conversations: ids.map((conversationId, index) => {
+        const row = perConversation[index].results?.[0] ?? {};
+        return { conversationId, lastOutboundAt: row.last_outbound_at ?? null, lastReplyAt: row.last_reply_at ?? null,
+          agentRepliesSinceOwner: Number(row.agent_replies ?? 0), activeLeases: Number(row.active_leases ?? 0) };
+      }) };
   }
   if (name === "list_conversation_files") {
     if (!validId(args.conversationId)) throw new Error("invalid_conversation_id");
@@ -3285,7 +3297,7 @@ const MCP_TOOLS = [
       required: ["consumerId", "messageId", "leaseToken", "outcome"] } },
   { name: "connector_status", description: "List every connector instance with its account label, declared capabilities, and coarse status.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false } },
-  { name: "owner_activity", description: "Report when the owner last sent a message themselves, across all conversations and channels and for the given conversations. Replies sent by agents are not counted.",
+  { name: "owner_activity", description: "Report when the owner last sent a message themselves, across all conversations and channels and for the given conversations (agent replies not counted). Per conversation it also reports the last outbound message of anyone, agent messages since the owner last wrote anywhere, and active agent leases.",
     inputSchema: { type: "object", additionalProperties: false, properties: {
       conversationIds: { type: "array", maxItems: 50, items: { type: "string" } } } } },
   { name: "list_conversation_files", description: "List files from a conversation only when its policy grants files_read.",
