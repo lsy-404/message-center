@@ -56,6 +56,22 @@ test('helper emits bounded cleanup phase metadata and strict JSON booleans', () 
   assert.match(source, /FRIDA_SESSION_DETACH_REASON_PROCESS_TERMINATED/);
 });
 
+test('helper records a finite detach signal and suppresses a second detach request', () => {
+  assert.match(source, /gboolean detach_signal_seen;/);
+  assert.match(source, /gboolean detach_signal_during_cleanup;/);
+  assert.match(source, /gint64 detach_signal_us;/);
+  assert.match(source, /helper->detach_signal_seen = TRUE;/);
+  assert.match(source, /mark_phase\(&helper->detach_signal_us\)/);
+  assert.match(source, /helper->detach_signal_during_cleanup = helper->cleanup_started;/);
+  assert.match(source, /phase_elapsed_ms\(&helper, helper\.detach_signal_us\)/);
+  assert.match(source, /phase_elapsed\[@"detachSignalMs"\] = elapsed/);
+  assert.match(source, /output\[@"detachDuringCleanup"\] = helper\.detach_signal_during_cleanup \? @YES : @NO;/);
+  assert.match(source, /if \(helper->detach_signal_seen \|\| helper->session == NULL/);
+  assert.match(source, /helper->detach_reason = detach_reason_name\(reason\)/);
+  assert.match(source, /output\[@"detachReason"\] = \[NSString stringWithUTF8String:helper\.detach_reason\]/);
+  assert.match(docs, /detachReason.*detachSignalMs.*detachDuringCleanup/);
+});
+
 test('script eternalization is opt-in and follows only a valid setup result', () => {
   assert.match(source, /gboolean eternalize_requested;/);
   assert.match(source, /strcmp\(argv\[i\], "--eternalize"\)/);

@@ -55,9 +55,12 @@ typedef struct {
   gboolean binary_written;
   gboolean timed_out;
   gboolean hard_timeout;
+  gboolean detach_signal_seen;
+  gboolean detach_signal_during_cleanup;
   gint64 started_monotonic_us;
   gint64 result_received_us;
   gint64 cleanup_started_us;
+  gint64 detach_signal_us;
   gint64 unload_finished_us;
   gint64 detach_finished_us;
   gint64 close_finished_us;
@@ -249,7 +252,8 @@ on_session_detached(GObject *source, GAsyncResult *result, gpointer user_data)
 static void
 detach_session(Helper *helper)
 {
-  if (helper->session == NULL || frida_session_is_detached(helper->session)) {
+  if (helper->detach_signal_seen || helper->session == NULL ||
+      frida_session_is_detached(helper->session)) {
     close_manager(helper);
     return;
   }
@@ -454,6 +458,9 @@ on_session_detached_signal(FridaSession *session, FridaSessionDetachReason reaso
   Helper *helper = user_data;
   (void) session;
   (void) crash;
+  helper->detach_signal_seen = TRUE;
+  mark_phase(&helper->detach_signal_us);
+  helper->detach_signal_during_cleanup = helper->cleanup_started;
   helper->detach_reason = detach_reason_name(reason);
   if (helper->cleanup_started)
     return;
@@ -873,6 +880,8 @@ main(int argc, char **argv)
   if (elapsed != nil) phase_elapsed[@"resultReceivedMs"] = elapsed;
   elapsed = phase_elapsed_ms(&helper, helper.cleanup_started_us);
   if (elapsed != nil) phase_elapsed[@"cleanupStartedMs"] = elapsed;
+  elapsed = phase_elapsed_ms(&helper, helper.detach_signal_us);
+  if (elapsed != nil) phase_elapsed[@"detachSignalMs"] = elapsed;
   elapsed = phase_elapsed_ms(&helper, helper.unload_finished_us);
   if (elapsed != nil) phase_elapsed[@"unloadFinishedMs"] = elapsed;
   elapsed = phase_elapsed_ms(&helper, helper.detach_finished_us);
@@ -883,6 +892,8 @@ main(int argc, char **argv)
     output[@"phaseElapsedMs"] = phase_elapsed;
   if (helper.detach_reason != NULL)
     output[@"detachReason"] = [NSString stringWithUTF8String:helper.detach_reason];
+  if (helper.detach_signal_seen)
+    output[@"detachDuringCleanup"] = helper.detach_signal_during_cleanup ? @YES : @NO;
   errno = 0;
   output[@"targetAliveAtCleanup"] =
       (kill((pid_t) helper.pid, 0) == 0 || errno == EPERM) ? @YES : @NO;
