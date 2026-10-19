@@ -4,4 +4,4 @@
 - [x] Add a post-signal detach guard that prevents a second detach request.
 - [x] Add meaningful source-contract tests for signal ordering and strict metadata.
 - [x] Run targeted tests and record limitations.
-- [ ] Commit the public changes and report the private wrapper field contract.
+- [x] Commit the public changes and report the private wrapper field contract.
