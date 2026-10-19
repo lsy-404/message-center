@@ -244,6 +244,11 @@ assert.match(workerSource, /device_action_revision = revision \+ 1/);
 assert.match(workerSource, /reported_revision IS NULL OR reported_revision < revision/);
 assert.match(vueSource, /supportsLayoutAutoRecovery\(connector\)/);
 assert.match(vueSource, /mergeConnectorLayoutControls/);
+assert.match(vueSource, /type ConnectorState = 'online' \| 'offline' \| 'degraded'/);
+assert.match(vueSource, /部分同步/);
+assert.match(vueSource, /connectorReachable/);
+assert.match(uiStyles, /\.presence-dot\.degraded/);
+assert.match(uiStyles, /\.status-pill\.degraded/);
 
 const staticAsset = await worker.fetch(new Request('https://message.example.com/assets/app.js', {
   headers: auth.headers,
