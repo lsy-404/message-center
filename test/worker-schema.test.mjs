@@ -389,6 +389,11 @@ assert.equal((await heartbeat('degraded')).status, 200);
 const invalidConnectorState = await heartbeat('maintenance');
 assert.equal(invalidConnectorState.status, 400);
 assert.equal((await invalidConnectorState.json()).error, 'invalid_connector_state');
+for (const state of [undefined, null, 1]) {
+  const invalid = await heartbeat(state);
+  assert.equal(invalid.status, 400);
+  assert.equal((await invalid.json()).error, 'invalid_connector_state');
+}
 assert.equal((await heartbeat('offline')).status, 200);
 const crossConnectorLayoutResponse = await worker.fetch(new Request(
   'https://message.example.com/api/connectors/layout-control?connectorId=instance-other-device',
@@ -1556,7 +1561,19 @@ database.prepare('UPDATE connector_instances SET state = ?, last_seen_at = ? WHE
 const staleDegradedInbox = await worker.fetch(new Request('https://message.example.com/api/inbox', {
   headers: { ...auth.headers },
 }), workerEnv, {});
-assert.equal((await staleDegradedInbox.json()).connectors.find((item) => item.id === connectorId).state, 'degraded');
+assert.equal((await staleDegradedInbox.json()).connectors.find((item) => item.id === connectorId).state, 'offline');
+database.prepare('UPDATE connector_instances SET state = ?, last_seen_at = ? WHERE id = ?')
+  .run('degraded', new Date().toISOString(), connectorId);
+const freshDegradedInbox = await worker.fetch(new Request('https://message.example.com/api/inbox', {
+  headers: { ...auth.headers },
+}), workerEnv, {});
+assert.equal((await freshDegradedInbox.json()).connectors.find((item) => item.id === connectorId).state, 'degraded');
+database.prepare('UPDATE connector_instances SET state = ?, last_seen_at = ? WHERE id = ?')
+  .run('degraded', null, connectorId);
+const missingSeenDegradedInbox = await worker.fetch(new Request('https://message.example.com/api/inbox', {
+  headers: { ...auth.headers },
+}), workerEnv, {});
+assert.equal((await missingSeenDegradedInbox.json()).connectors.find((item) => item.id === connectorId).state, 'offline');
 database.prepare('UPDATE connector_instances SET state = ?, last_seen_at = ? WHERE id = ?')
   .run('invalid-state', new Date().toISOString(), connectorId);
 const invalidStoredStateInbox = await worker.fetch(new Request('https://message.example.com/api/inbox', {

@@ -390,9 +390,8 @@ const CONNECTOR_STATES = new Set(["online", "offline", "degraded"]);
 function liveState(row) {
   const state = text(row?.state);
   if (!CONNECTOR_STATES.has(state)) return "offline";
-  if (state !== "online") return state;
   const seen = Date.parse(text(row.last_seen_at));
-  return Number.isFinite(seen) && Date.now() - seen <= 90_000 ? "online" : "offline";
+  return Number.isFinite(seen) && Date.now() - seen <= 90_000 ? state : "offline";
 }
 
 function capabilitySet(row) { return new Set(safeJson(row.capabilities_json, [])); }
@@ -517,8 +516,10 @@ async function heartbeatConnector(request, env) {
   const connectorId = String(body.connectorId || "");
   if (connectorId !== authenticatedConnectorId) return fail("connector_id_mismatch", 403);
   if (!validId(connectorId)) throw new Error("invalid_connector_id");
-  const connectorState = body.state === undefined ? "online" : String(body.state);
-  if (!CONNECTOR_STATES.has(connectorState)) throw new Error("invalid_connector_state");
+  const connectorState = body.state;
+  if (typeof connectorState !== "string" || !CONNECTOR_STATES.has(connectorState)) {
+    throw new Error("invalid_connector_state");
+  }
   const stamp = now();
   const result = await env.DB.prepare(`
     UPDATE connector_instances SET state = ?, last_seen_at = ?, configuration_json = ?, updated_at = ?

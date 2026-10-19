@@ -8,3 +8,4 @@
 - Added Worker schema coverage for degraded, invalid, offline, stale online, stale degraded, and invalid persisted state.
 - Added UI source/style assertions to the Worker smoke fixture.
 - Worker schema and smoke tests pass using existing local dependency fixtures; UI vue-tsc and Vite build pass using existing local UI dependency fixture. No wrangler, cloud, device, or send operation was run.
+- Follow-up: changed degraded freshness and strict heartbeat primitive validation; added stale/fresh/missing-seen and missing/non-string heartbeat tests.
