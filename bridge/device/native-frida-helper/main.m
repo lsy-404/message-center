@@ -57,6 +57,7 @@ typedef struct {
   gboolean hard_timeout;
   gboolean detach_signal_seen;
   gboolean detach_signal_during_cleanup;
+  gboolean detach_crash_reported;
   gint64 started_monotonic_us;
   gint64 result_received_us;
   gint64 cleanup_started_us;
@@ -457,10 +458,10 @@ on_session_detached_signal(FridaSession *session, FridaSessionDetachReason reaso
 {
   Helper *helper = user_data;
   (void) session;
-  (void) crash;
   helper->detach_signal_seen = TRUE;
   mark_phase(&helper->detach_signal_us);
   helper->detach_signal_during_cleanup = helper->cleanup_started;
+  helper->detach_crash_reported = crash != NULL;
   helper->detach_reason = detach_reason_name(reason);
   if (helper->cleanup_started)
     return;
@@ -881,7 +882,7 @@ main(int argc, char **argv)
   elapsed = phase_elapsed_ms(&helper, helper.cleanup_started_us);
   if (elapsed != nil) phase_elapsed[@"cleanupStartedMs"] = elapsed;
   elapsed = phase_elapsed_ms(&helper, helper.detach_signal_us);
-  if (elapsed != nil) phase_elapsed[@"detachSignalMs"] = elapsed;
+  if (elapsed != nil) phase_elapsed[@"firstDetachSignalMs"] = elapsed;
   elapsed = phase_elapsed_ms(&helper, helper.unload_finished_us);
   if (elapsed != nil) phase_elapsed[@"unloadFinishedMs"] = elapsed;
   elapsed = phase_elapsed_ms(&helper, helper.detach_finished_us);
@@ -893,7 +894,9 @@ main(int argc, char **argv)
   if (helper.detach_reason != NULL)
     output[@"detachReason"] = [NSString stringWithUTF8String:helper.detach_reason];
   if (helper.detach_signal_seen)
-    output[@"detachDuringCleanup"] = helper.detach_signal_during_cleanup ? @YES : @NO;
+    output[@"cleanupBegunAtDetach"] = helper.detach_signal_during_cleanup ? @YES : @NO;
+  if (helper.detach_signal_seen)
+    output[@"crashReported"] = helper.detach_crash_reported ? @YES : @NO;
   errno = 0;
   output[@"targetAliveAtCleanup"] =
       (kill((pid_t) helper.pid, 0) == 0 || errno == EPERM) ? @YES : @NO;
