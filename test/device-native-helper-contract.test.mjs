@@ -68,6 +68,8 @@ test('helper records a finite detach signal and suppresses a second detach reque
   assert.match(source, /output\[@"cleanupBegunAtDetach"\] = helper\.detach_signal_during_cleanup \? @YES : @NO;/);
   assert.match(source, /output\[@"crashReported"\] = helper\.detach_crash_reported \? @YES : @NO;/);
   assert.match(source, /helper->detach_crash_reported = crash != NULL;/);
+  assert.match(source, /if \(!helper->detach_signal_seen\) \{[\s\S]*?helper->detach_reason = detach_reason_name\(reason\);[\s\S]*?\}/);
+  assert.match(source, /if \(helper->cleanup_started\)\s+return;/);
   assert.match(source, /if \(helper->detach_signal_seen \|\| helper->session == NULL/);
   assert.match(source, /helper->detach_reason = detach_reason_name\(reason\)/);
   assert.match(source, /output\[@"detachReason"\] = \[NSString stringWithUTF8String:helper\.detach_reason\]/);

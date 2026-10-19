@@ -458,11 +458,13 @@ on_session_detached_signal(FridaSession *session, FridaSessionDetachReason reaso
 {
   Helper *helper = user_data;
   (void) session;
-  helper->detach_signal_seen = TRUE;
-  mark_phase(&helper->detach_signal_us);
-  helper->detach_signal_during_cleanup = helper->cleanup_started;
-  helper->detach_crash_reported = crash != NULL;
-  helper->detach_reason = detach_reason_name(reason);
+  if (!helper->detach_signal_seen) {
+    helper->detach_signal_seen = TRUE;
+    mark_phase(&helper->detach_signal_us);
+    helper->detach_signal_during_cleanup = helper->cleanup_started;
+    helper->detach_crash_reported = crash != NULL;
+    helper->detach_reason = detach_reason_name(reason);
+  }
   if (helper->cleanup_started)
     return;
   fail(helper, helper->stage, "session_detached");
