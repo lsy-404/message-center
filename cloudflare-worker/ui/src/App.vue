@@ -10,16 +10,20 @@ import {
   isAcceptedSendResponse,
 } from './send-request-key.mjs'
 import {
+  buildConversationListModel,
+  canEnterConversationListFolder,
   CONVERSATION_PAGE_SIZE,
   conversationPageCount,
+  enterConversationListFolder,
   filterConversations,
-  filterQQGroupAssistantConversations,
+  isQQGroupAssistantConversation,
+  MAX_CONVERSATION_LIST_LEVELS,
   normalizeChannelLabel,
   nextConversationPage,
   pageConversations,
   previousConversationPage,
+  QQ_GROUP_ASSISTANT_FOLDER_ID,
   resolveConversationSelection,
-  resolveQQGroupAssistantInboxSelection,
 } from './conversation-list.mjs'
 import {
   avatarTone,
@@ -150,7 +154,7 @@ const snapshot = ref<Snapshot>(emptySnapshot())
 const selectedId = ref('')
 const activeFilter = ref('all')
 const activeConnectorId = ref('')
-const showQQGroupAssistant = ref(false)
+const conversationListPath = ref<string[]>([])
 const conversationSearch = ref('')
 const unreadOnly = ref(false)
 const manualRefreshing = ref(false)
@@ -211,10 +215,8 @@ const filters = computed(() => {
     })),
   ]
 })
-const totalUnread = computed(() => filters.value[0]?.unread ?? 0)
 const onlineConnectorCount = computed(() => snapshot.value.connectors.filter((item) => item.state === 'online').length)
 const activeFilterLabel = computed(() => {
-  if (showQQGroupAssistant.value) return '群助手'
   if (activeFilter.value === 'protocol:qq') return 'QQ'
   if (activeConnectorId.value) {
     const connector = snapshot.value.connectors.find((item) => item.id === activeConnectorId.value)
@@ -222,7 +224,10 @@ const activeFilterLabel = computed(() => {
   }
   return activeFilter.value === 'all' ? '收件箱' : activeFilter.value.slice('channel:'.length)
 })
-const filteredConversations = computed(() => filterConversations(snapshot.value.conversations, {
+const isQQRootScope = computed(() => activeFilter.value === 'protocol:qq'
+  || (activeFilter.value.startsWith('channel:')
+    && normalizeChannelLabel(activeFilter.value.slice('channel:'.length)) === 'QQ'))
+const conversationFilterOptions = () => ({
   connectorKind: activeFilter.value === 'protocol:qq' ? 'qq' : undefined,
   connectorId: activeConnectorId.value,
   channelLabel: activeFilter.value === 'all' || activeFilter.value === 'protocol:qq'
@@ -230,23 +235,27 @@ const filteredConversations = computed(() => filterConversations(snapshot.value.
   query: conversationSearch.value,
   unreadOnly: unreadOnly.value,
   getChannelLabel: channelLabel,
-}))
-const qqGroupAssistantConversations = computed(() =>
-  filterQQGroupAssistantConversations(snapshot.value.conversations),
-)
-const filteredQQGroupAssistantConversations = computed(() => filterQQGroupAssistantConversations(
-  filterConversations(snapshot.value.conversations, {
-    query: conversationSearch.value,
-    unreadOnly: unreadOnly.value,
-    getChannelLabel: channelLabel,
-  }),
+})
+const filteredConversations = computed(() => filterConversations(
+  snapshot.value.conversations, conversationFilterOptions(),
 ))
-const displayedConversations = computed(() => showQQGroupAssistant.value
-  ? filteredQQGroupAssistantConversations.value : filteredConversations.value)
-const displayedUnread = computed(() => displayedConversations.value
+const conversationListModel = computed(() => buildConversationListModel(filteredConversations.value, {
+  path: conversationListPath.value,
+  qqRoot: isQQRootScope.value,
+  selectedId: selectedId.value,
+  rootTitle: activeFilterLabel.value,
+}))
+const displayedConversations = computed(() => conversationListModel.value.conversations)
+const displayedUnread = computed(() => conversationListModel.value.scopeConversations
   .reduce((total, item) => total + Math.max(0, Number(item.unreadCount) || 0), 0))
-const qqGroupAssistantUnread = computed(() => qqGroupAssistantConversations.value
-  .reduce((total, item) => total + Math.max(0, Number(item.unreadCount) || 0), 0))
+const displayedConversationCount = computed(() => conversationListModel.value.scopeConversations.length)
+const groupAssistantFolder = computed(() => conversationListModel.value.folder)
+const conversationListTitle = computed(() => conversationListPath.value.length
+  ? '群助手' : activeFilterLabel.value)
+const conversationListBreadcrumbs = computed(() => [
+  activeFilterLabel.value,
+  ...conversationListPath.value.map((folderId) => folderId === QQ_GROUP_ASSISTANT_FOLDER_ID ? '群助手' : ''),
+].filter(Boolean))
 const visibleConversations = computed(() => pageConversations(
   displayedConversations.value,
   conversationPage.value,
@@ -273,12 +282,12 @@ const conversationRows = computed<ConversationListItem[]>(() => visibleConversat
   channel: channelLabel(conversation),
 })))
 
-watch([activeFilter, activeConnectorId, conversationSearch, unreadOnly, showQQGroupAssistant], async () => {
+watch([activeFilter, activeConnectorId, conversationSearch, unreadOnly, conversationListPath], async () => {
   conversationPage.value = 0
   await nextTick()
   conversationListElement.value?.scrollTo(0, 0)
-  if (showQQGroupAssistant.value) {
-    applyConversationSelection(filteredQQGroupAssistantConversations.value)
+  if (conversationListPath.value.length) {
+    applyConversationSelection(conversationListModel.value.selectionConversations)
   }
 })
 
@@ -743,17 +752,21 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
     const body = await api<Snapshot & { ok: boolean }>(`/api/inbox?${query}`, { signal: request.controller.signal })
     if (!inboxReads.isCurrent(request, selectedId.value)) return
     let reloadConversationId = ''
-    if (showQQGroupAssistant.value) {
-      const selection = resolveQQGroupAssistantInboxSelection(
-        body.conversations,
-        selectedId.value,
-        request.conversationId,
-        conversationSearch.value,
-        unreadOnly.value,
-      )
-      body.selectedConversationId = selection.selectedConversationId
-      reloadConversationId = selection.reloadConversationId
-      if (reloadConversationId || !selection.selectedConversationId) body.messages = []
+    if (conversationListPath.value.length) {
+      const scopedConversations = filterConversations(body.conversations, conversationFilterOptions())
+      const listModel = buildConversationListModel(scopedConversations, {
+        path: conversationListPath.value,
+        qqRoot: isQQRootScope.value,
+        selectedId: selectedId.value,
+      })
+      const selection = resolveConversationSelection(listModel.selectionConversations, selectedId.value)
+      const selectedConversationId = selection.action === 'keep'
+        ? selectedId.value
+        : selection.action === 'select' ? selection.conversation?.id || '' : ''
+      body.selectedConversationId = selectedConversationId
+      reloadConversationId = selectedConversationId && selectedConversationId !== request.conversationId
+        ? selectedConversationId : ''
+      if (reloadConversationId || !selectedConversationId) body.messages = []
     }
     const priorThread = document.querySelector<HTMLElement>('.message-scroll')
     const priorSelectedId = selectedId.value
@@ -812,6 +825,9 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
 }
 
 async function selectConversation(conversation: Conversation, openMobileThread = true) {
+  if (isQQRootScope.value && isQQGroupAssistantConversation(conversation) && !conversationListPath.value.length) {
+    conversationListPath.value = enterConversationListFolder([], QQ_GROUP_ASSISTANT_FOLDER_ID)
+  }
   cancelInboxRead()
   storeComposer()
   if (conversation.id !== selectedId.value) pendingScrollToBottomId = null
@@ -859,21 +875,26 @@ function selectConversationById(conversationId: string) {
 }
 
 function selectFilter(id: string, connectorId = '') {
-  showQQGroupAssistant.value = false
+  conversationListPath.value = []
   activeFilter.value = id
   activeConnectorId.value = connectorId
   showInstances.value = false
   mobileThread.value = false
-  applyConversationSelection(filteredConversations.value)
+  applyConversationSelection(conversationListModel.value.selectionConversations)
 }
 
-function showQQGroups() {
-  showQQGroupAssistant.value = true
-  activeFilter.value = 'protocol:qq'
-  activeConnectorId.value = ''
-  showInstances.value = false
+function enterQQGroupAssistant() {
+  const folder = conversationListModel.value.folder
+  if (!isQQRootScope.value || !folder || !canEnterConversationListFolder(conversationListPath.value)) return
+  conversationListPath.value = enterConversationListFolder(conversationListPath.value, folder.id)
   mobileThread.value = false
-  applyConversationSelection(filteredQQGroupAssistantConversations.value)
+  applyConversationSelection(conversationListModel.value.selectionConversations)
+}
+
+function navigateConversationListTo(level: number) {
+  const targetLength = Math.max(0, Math.min(MAX_CONVERSATION_LIST_LEVELS - 1, Math.floor(level) - 1))
+  conversationListPath.value = conversationListPath.value.slice(0, targetLength)
+  applyConversationSelection(conversationListModel.value.selectionConversations)
 }
 
 function applyConversationSelection(conversations: Conversation[]) {
@@ -1199,10 +1220,10 @@ onUnmounted(() => {
             v-for="filter in filters"
             :key="filter.id"
             class="nav-item"
-            :class="{ active: activeFilter === filter.id && !showInstances && !showQQGroupAssistant }"
+            :class="{ active: activeFilter === filter.id && !showInstances }"
             type="button"
             :title="filter.label"
-            :aria-current="activeFilter === filter.id && !showInstances && !showQQGroupAssistant ? 'page' : undefined"
+            :aria-current="activeFilter === filter.id && !showInstances ? 'page' : undefined"
             :data-channel="filter.channel || undefined"
             :data-unread-count="filter.unread"
             @click="selectFilter(filter.id)"
@@ -1220,24 +1241,6 @@ onUnmounted(() => {
             <span v-if="filter.unread" class="nav-count is-unread" aria-hidden="true">{{ filter.unread > 99 ? '99+' : filter.unread }}</span>
             <span v-else class="nav-count" aria-hidden="true">{{ filter.count }}</span>
             <span class="sr-only">，{{ filter.count }} 个会话，{{ filter.unread }} 条未读</span>
-          </button>
-          <button
-            v-if="qqGroupAssistantConversations.length"
-            class="nav-item"
-            :class="{ active: showQQGroupAssistant && !showInstances }"
-            type="button"
-            title="群助手"
-            :aria-current="showQQGroupAssistant && !showInstances ? 'page' : undefined"
-            :data-unread-count="qqGroupAssistantUnread"
-            @click="showQQGroups"
-          >
-            <span class="nav-glyph is-system" :data-unread="qqGroupAssistantUnread > 0 || undefined" aria-hidden="true">
-              <AppIcon name="group" :size="16" />
-            </span>
-            <span class="nav-copy">群助手</span>
-            <span v-if="qqGroupAssistantUnread" class="nav-count is-unread" aria-hidden="true">{{ qqGroupAssistantUnread > 99 ? '99+' : qqGroupAssistantUnread }}</span>
-            <span v-else class="nav-count" aria-hidden="true">{{ qqGroupAssistantConversations.length }}</span>
-            <span class="sr-only">，{{ qqGroupAssistantConversations.length }} 个群，{{ qqGroupAssistantUnread }} 条未读</span>
           </button>
         </div>
 
@@ -1278,19 +1281,23 @@ onUnmounted(() => {
     <section v-if="!showInstances" class="conversation-pane" aria-label="会话列表">
       <header class="pane-header">
         <div class="pane-title">
-          <h1>{{ activeFilterLabel }}</h1>
+          <h1>{{ conversationListTitle }}</h1>
+          <nav v-if="conversationListPath.length" class="conversation-breadcrumb" aria-label="会话列表路径">
+            <template v-for="(crumb, index) in conversationListBreadcrumbs" :key="`${index}:${crumb}`">
+              <button
+                v-if="index < conversationListBreadcrumbs.length - 1"
+                type="button"
+                :aria-label="`返回${crumb}列表`"
+                @click="navigateConversationListTo(index + 1)"
+              >{{ crumb }}</button>
+              <span v-else aria-current="page">{{ crumb }}</span>
+              <AppIcon v-if="index < conversationListBreadcrumbs.length - 1" name="arrowRight" :size="12" aria-hidden="true" />
+            </template>
+          </nav>
           <p aria-live="polite">
-            {{ displayedConversations.length }} 个会话<template v-if="displayedUnread"> · <strong>{{ displayedUnread }}</strong> 条未读</template>
+            {{ displayedConversationCount }} 个会话<template v-if="displayedUnread"> · <strong>{{ displayedUnread }}</strong> 条未读</template>
           </p>
         </div>
-        <FluentButton
-          v-if="showQQGroupAssistant"
-          class="quiet-button group-helper-back-button"
-          type="button"
-          aria-label="返回 QQ 总列表"
-          title="返回 QQ 总列表"
-          @click="selectFilter('protocol:qq')"
-        ><AppIcon name="back" :size="14" />返回 QQ</FluentButton>
         <FluentButton
           class="quiet-button refresh-button"
           :class="{ spinning: manualRefreshing }"
@@ -1326,11 +1333,40 @@ onUnmounted(() => {
               :aria-pressed="unreadOnly"
               title="仅显示未读会话"
               @click="unreadOnly = true"
-            >未读<span v-if="totalUnread" class="segmented-dot" aria-hidden="true" /></button>
+            >未读<span v-if="displayedUnread" class="segmented-dot" aria-hidden="true" /></button>
           </div>
         </div>
 
         <ul class="conversation-items">
+          <li v-if="groupAssistantFolder" :key="groupAssistantFolder.id">
+            <button
+              class="conversation-row conversation-folder-row"
+              :class="{ active: groupAssistantFolder.active, unread: groupAssistantFolder.unreadCount > 0 }"
+              type="button"
+              :aria-label="`群助手，${groupAssistantFolder.count} 个群聊，${groupAssistantFolder.unreadCount} 条未读`"
+              :aria-current="groupAssistantFolder.active ? 'true' : undefined"
+              :data-list-folder="groupAssistantFolder.id"
+              :data-folder-count="groupAssistantFolder.count"
+              :data-unread-count="groupAssistantFolder.unreadCount"
+              @click="enterQQGroupAssistant"
+            >
+              <span class="avatar conversation-avatar folder-avatar" aria-hidden="true">
+                <AppIcon name="group" :size="18" />
+              </span>
+              <span class="conversation-copy">
+                <span class="conversation-title-row">
+                  <strong><span class="conversation-title">群助手</span></strong>
+                  <AppIcon name="arrowRight" :size="14" aria-hidden="true" />
+                </span>
+                <span class="conversation-meta-row">
+                  <span class="conversation-preview">{{ groupAssistantFolder.count }} 个群聊</span>
+                  <span v-if="groupAssistantFolder.unreadCount" class="unread-count" aria-hidden="true">
+                    {{ groupAssistantFolder.unreadCount > 99 ? '99+' : groupAssistantFolder.unreadCount }}
+                  </span>
+                </span>
+              </span>
+            </button>
+          </li>
           <li v-for="conversation in conversationRows" :key="conversation.id">
             <button
               class="conversation-row"

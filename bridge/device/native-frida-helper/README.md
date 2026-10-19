@@ -1,8 +1,8 @@
 # Native Frida session helper
 
-This iOS arm64 command-line helper owns one bounded Frida client session to the Frida 16.3.3 server already listening on the same device at `127.0.0.1:27042`. It does not start a server, keep a background process alive, read app data by itself, or connect to a remote host. The caller supplies a PID and JavaScript that performs its explicitly authorized operation.
+This iOS arm64 command-line helper owns one bounded Frida client session to the Frida 16.7.19 server already listening on the same device at `127.0.0.1:27042`. It does not start a server, keep a background process alive, read app data by itself, or connect to a remote host. The caller supplies a PID and JavaScript that performs its explicitly authorized operation.
 
-Builds target iOS 15.0 or newer. Run the `Build native Frida session helper` workflow manually, or let its narrowly scoped source-change trigger validate a helper change. The workflow verifies the official Frida 16.3.3 iOS arm64 devkit SHA-256 before linking it. The artifact contains the executable, its object file and source, build provenance, and Frida's upstream license notice; it is not committed to the repository.
+Builds target iOS 15.0 or newer. Run the `Build native Frida session helper` workflow manually, or let its narrowly scoped source-change trigger validate a helper change. The workflow verifies the official Frida 16.7.19 iOS arm64 devkit SHA-256 before linking it. The artifact contains the executable, its object file and source, build provenance, and Frida's upstream license notice; it is not committed to the repository.
 
 ## Invocation
 

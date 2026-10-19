@@ -1,4 +1,6 @@
 export const CONVERSATION_PAGE_SIZE = 100
+export const MAX_CONVERSATION_LIST_LEVELS = 3
+export const QQ_GROUP_ASSISTANT_FOLDER_ID = 'qq-group-assistant'
 
 export function normalizeChannelLabel(value) {
   const label = String(value || '')
@@ -18,6 +20,73 @@ export function filterQQGroupAssistantConversations(conversations) {
   return conversations.filter(isQQGroupAssistantConversation)
 }
 
+export function normalizeConversationListPath(path) {
+  if (!Array.isArray(path)) return []
+  return path.slice(0, MAX_CONVERSATION_LIST_LEVELS - 1)
+    .filter((segment) => typeof segment === 'string' && segment.trim().length > 0 && segment.length <= 128)
+}
+
+export function canEnterConversationListFolder(path) {
+  return normalizeConversationListPath(path).length + 2 <= MAX_CONVERSATION_LIST_LEVELS
+}
+
+export function enterConversationListFolder(path, folderId) {
+  const currentPath = normalizeConversationListPath(path)
+  const id = typeof folderId === 'string' ? folderId.trim() : ''
+  if (!id || id.length > 128 || !canEnterConversationListFolder(currentPath)) return currentPath
+  return [...currentPath, id]
+}
+
+export function buildConversationListModel(conversations, options = {}) {
+  const items = Array.isArray(conversations) ? conversations : []
+  const path = normalizeConversationListPath(options.path)
+  const assistantConversations = filterQQGroupAssistantConversations(items)
+  const inGroupAssistant = path[0] === QQ_GROUP_ASSISTANT_FOLDER_ID
+
+  if (inGroupAssistant) {
+    return {
+      path: [QQ_GROUP_ASSISTANT_FOLDER_ID],
+      level: 2,
+      title: '群助手',
+      conversations: assistantConversations,
+      scopeConversations: assistantConversations,
+      selectionConversations: assistantConversations,
+      folder: null,
+    }
+  }
+
+  const qqRoot = options.qqRoot === true
+  const rootConversations = qqRoot
+    ? items.filter((conversation) => !isQQGroupAssistantConversation(conversation))
+    : items
+  const selectedAssistant = options.selectedId
+    ? assistantConversations.find((conversation) => conversation.id === options.selectedId)
+    : null
+  const selectionConversations = selectedAssistant
+    ? [...rootConversations, selectedAssistant]
+    : rootConversations
+  const unreadCount = assistantConversations.reduce(
+    (total, conversation) => total + Math.max(0, Number(conversation.unreadCount) || 0), 0,
+  )
+
+  return {
+    path: [],
+    level: 1,
+    title: options.rootTitle || '',
+    conversations: rootConversations,
+    scopeConversations: items,
+    selectionConversations,
+    folder: qqRoot && assistantConversations.length ? {
+      kind: 'folder',
+      id: QQ_GROUP_ASSISTANT_FOLDER_ID,
+      title: '群助手',
+      count: assistantConversations.length,
+      unreadCount,
+      active: Boolean(selectedAssistant),
+    } : null,
+  }
+}
+
 export function resolveConversationSelection(conversations, selectedId) {
   if (conversations.some((conversation) => conversation.id === selectedId)) {
     return { action: 'keep', conversation: null }
@@ -26,21 +95,6 @@ export function resolveConversationSelection(conversations, selectedId) {
   return conversation
     ? { action: 'select', conversation }
     : { action: 'clear', conversation: null }
-}
-
-export function resolveQQGroupAssistantInboxSelection(
-  conversations, selectedId, requestedId, query = '', unreadOnly = false,
-) {
-  const candidates = filterQQGroupAssistantConversations(filterConversations(conversations, { query, unreadOnly }))
-  const selection = resolveConversationSelection(candidates, selectedId)
-  const selectedConversationId = selection.action === 'keep'
-    ? selectedId
-    : selection.action === 'select' ? selection.conversation.id : ''
-  return {
-    selectedConversationId,
-    reloadConversationId: selectedConversationId && selectedConversationId !== requestedId
-      ? selectedConversationId : '',
-  }
 }
 
 export function filterConversations(conversations, options = {}) {
