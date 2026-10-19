@@ -903,6 +903,14 @@ class Relay:
         self.source_last_success[connector_id] = time.time()
         self.persist_source_state(connector_id)
 
+    def source_read_partial(self, connector_id, completed_pages):
+        self.source_failures[connector_id] = 0
+        self.attach_failure_streak[connector_id] = (None, 0)
+        self.query_gate_failure_streak[connector_id] = (None, 0)
+        if completed_pages > 0:
+            self.source_last_success[connector_id] = time.time()
+        self.persist_source_state(connector_id)
+
     def recover_source_after_failures(self, connector_id):
         now = time.time()
         if (not self.auto_wake
@@ -1182,10 +1190,14 @@ class Relay:
         validated_receive_hint_paths = None
         if driver == "qq" and receive_hint_paths is not None:
             validated_receive_hint_paths = resolve_qq_receive_hint_paths(receive_hint_paths)
-        source_read_ok = result.get("sourceReadOk")
-        if type(source_read_ok) is not bool:
+        source_read_status = result.get("sourceReadStatus")
+        if ("sourceReadOk" in result
+                or type(source_read_status) is not str
+                or source_read_status not in {"complete", "partial", "failed"}):
             raise RuntimeError("invalid_scan_result")
-        if source_read_ok is False:
+        if source_read_status == "failed":
+            if result.get("ok") is not False:
+                raise RuntimeError("invalid_scan_result")
             failure = result.get("nativeFailure")
             raise SourceReadError(
                 "source_read_failed",
@@ -1206,6 +1218,23 @@ class Relay:
         health = result.get("health")
         if not isinstance(health, str) or health not in {"online", "degraded"}:
             raise RuntimeError("invalid_scan_health")
+        partial_completed_pages = None
+        if source_read_status == "partial":
+            statistics = result.get("readStatistics")
+            if (driver != "qq" or health != "degraded"
+                    or type(statistics) is not dict
+                    or set(statistics) != {"attemptedPages", "completedPages", "failedPages"}):
+                raise RuntimeError("invalid_scan_partial")
+            attempted_pages = statistics["attemptedPages"]
+            partial_completed_pages = statistics["completedPages"]
+            failed_pages = statistics["failedPages"]
+            if (any(isinstance(value, bool) or type(value) is not int
+                    for value in (attempted_pages, partial_completed_pages, failed_pages))
+                    or not 1 <= attempted_pages <= 2
+                    or not 0 <= partial_completed_pages <= 2
+                    or not 1 <= failed_pages <= 2
+                    or partial_completed_pages + failed_pages != attempted_pages):
+                raise RuntimeError("invalid_scan_partial")
         if len(compact(result).encode("utf-8")) > MAX_SCAN_RESPONSE:
             raise RuntimeError("scan_response_too_large")
         messages = result["messages"]
@@ -1359,7 +1388,10 @@ class Relay:
         if not self._clear_native_operation(self.connector):
             self.health[self.connector] = False
             raise SourceReadError("native_operation_state_persist_failed")
-        self.source_read_succeeded(self.connector)
+        if source_read_status == "partial":
+            self.source_read_partial(self.connector, partial_completed_pages)
+        else:
+            self.source_read_succeeded(self.connector)
         return result.get("health") == "online"
 
     def ensure_active(self, recovery_driver=None, recovery_reason="read_failure", observed_pid=None):
