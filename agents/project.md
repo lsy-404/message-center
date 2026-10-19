@@ -31,6 +31,7 @@ Cloudflare Worker、D1、R2；Vue 前端与 @platform-kit/fluent；通用连接�
 - 自动唤醒公开 runtime 已安装；协调任务报告 iPad 端 73 项 runtime/outbox 测试在 9.176 秒内通过且无跳过，Windows 端 73 项通过、1 项平台跳过。短窗口自主运行中，QQ/微信源游标均前进，独立云端读取确认新增记录；22:57:21 两端均 online。约 22:57 的只读 SpringBoard 检查确认已保存 Split View 有效、两端进程前台运行、屏幕解锁且无覆盖层；接收器随后恢复，未执行 app activation。短窗口源到云同步已验证；锁定、重启和长期行为仍未验证，早先 heartbeat 间隙原因未明。
 
 ## 当前任务
+- [257_[BugFix]_partial-command-readiness](257_[BugFix]_partial-command-readiness/task_plan.md)：新鲜 partial QQ scan 可进入原有命令门控及逐目标校验；本地测试通过，未部署。
 - [036_[Feature]_device-auto-wake](036_[Feature]_device-auto-wake/task_plan.md)：公开设备 runtime 的 opt-in 自动唤醒编排。
 - [037_[BugFix]_auto-wake-diagnostics](037_[BugFix]_auto-wake-diagnostics/task_plan.md)：为自动唤醒状态变化增加有界诊断日志。
 - [038_[BugFix]_wake-pipe-reliability](038_[BugFix]_wake-pipe-reliability/task_plan.md)：适配器管道就绪竞态与脱敏唤醒错误分类已本地修复并验证；未据此认定实机根因。
