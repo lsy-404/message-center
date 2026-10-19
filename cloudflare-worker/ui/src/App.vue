@@ -57,6 +57,8 @@ type LayoutControl = {
   synchronized: boolean
 }
 
+type ConnectorState = 'online' | 'offline' | 'degraded'
+
 type Connector = {
   id: string
   kind: string
@@ -64,7 +66,7 @@ type Connector = {
   accountLabel: string
   displayName: string
   mode: string
-  state: string
+  state: ConnectorState
   capabilities: string[]
   lastSeenAt?: string | null
   layoutControl?: LayoutControl
@@ -84,7 +86,7 @@ type Conversation = {
   unreadCount: number
   lastMessagePreview?: string | null
   lastMessageAt?: string | null
-  connectorState: string
+  connectorState: ConnectorState
   capabilities: string[]
 }
 
@@ -216,6 +218,7 @@ const filters = computed(() => {
   ]
 })
 const onlineConnectorCount = computed(() => snapshot.value.connectors.filter((item) => item.state === 'online').length)
+const degradedConnectorCount = computed(() => snapshot.value.connectors.filter((item) => item.state === 'degraded').length)
 const activeFilterLabel = computed(() => {
   if (activeFilter.value === 'protocol:qq') return 'QQ'
   if (activeConnectorId.value) {
@@ -321,10 +324,13 @@ const hasKnownConversationActivity = computed(() => Boolean(
   selectedConversation.value?.lastMessageAt || selectedConversation.value?.lastMessagePreview?.trim(),
 ))
 
-const canSendText = computed(() => selectedConversation.value?.capabilities.includes('send_text') ?? false)
+const connectorReachable = computed(() => selectedConversationConnector.value?.state === 'online'
+  || selectedConversationConnector.value?.state === 'degraded')
+const canSendText = computed(() => Boolean(connectorReachable.value && selectedConversation.value?.capabilities.includes('send_text')))
 const deviceConversation = computed(() => selectedConversationConnector.value?.mode === 'device_relay')
 const maxTextLength = computed(() => deviceConversation.value ? 500 : 20_000)
 const canSendFiles = computed(() => {
+  if (!connectorReachable.value) return false
   if (selectedConversationConnector.value?.mode === 'device_relay'
       && selectedConversation.value?.conversationType !== 'group') return false
   const capabilities = selectedConversation.value?.capabilities ?? []
@@ -413,7 +419,13 @@ function initials(value?: string | null) {
 }
 
 function statusLabel(state?: string | null) {
-  return state === 'online' ? '在线' : '离线'
+  if (state === 'online') return '在线'
+  if (state === 'degraded') return '部分同步'
+  return '离线'
+}
+
+function statusIcon(state: ConnectorState) {
+  return state === 'online' ? 'plugConnected' : state === 'degraded' ? 'warning' : 'plugDisconnected'
 }
 
 function deliveryStateInfo(message: Message): StatusInfo | null {
@@ -1209,7 +1221,7 @@ onUnmounted(() => {
         <span class="brand-mark" aria-hidden="true"><AppIcon name="brand" :size="18" /></span>
         <span class="brand-copy">
           <strong>Message Center</strong>
-          <small><span class="presence-dot" :class="onlineConnectorCount ? 'online' : 'offline'" />{{ onlineConnectorCount }}/{{ snapshot.connectors.length }} 接入在线</small>
+          <small><span class="presence-dot" :class="onlineConnectorCount ? 'online' : degradedConnectorCount ? 'degraded' : 'offline'" />{{ onlineConnectorCount }} 在线<span v-if="degradedConnectorCount"> · {{ degradedConnectorCount }} 部分同步</span><span v-if="snapshot.connectors.length"> / {{ snapshot.connectors.length }} 接入</span></small>
         </span>
       </div>
 
@@ -1263,7 +1275,7 @@ onUnmounted(() => {
               class="nav-count"
               :class="{ 'is-alert': onlineConnectorCount < snapshot.connectors.length }"
               aria-hidden="true"
-            >{{ onlineConnectorCount }}/{{ snapshot.connectors.length }}</span>
+            >{{ onlineConnectorCount + degradedConnectorCount }}/{{ snapshot.connectors.length }}</span>
           </button>
         </div>
       </nav>
@@ -1689,7 +1701,7 @@ onUnmounted(() => {
         </button>
         <div>
           <h1>接入管理</h1>
-          <p>{{ snapshot.connectors.length }} 个账号 · {{ onlineConnectorCount }} 个在线</p>
+          <p>{{ snapshot.connectors.length }} 个账号 · {{ onlineConnectorCount }} 个在线<span v-if="degradedConnectorCount"> · {{ degradedConnectorCount }} 个部分同步</span></p>
         </div>
       </header>
       <div class="instance-grid">
@@ -1712,7 +1724,7 @@ onUnmounted(() => {
             </span>
           </header>
           <p v-if="connector.lastSeenAt" class="instance-seen">
-            <AppIcon :name="connector.state === 'online' ? 'plugConnected' : 'plugDisconnected'" :size="14" />
+            <AppIcon :name="statusIcon(connector.state)" :size="14" />
             最近活动
             <time :datetime="isoTime(connector.lastSeenAt)" :title="formatFullStamp(connector.lastSeenAt)">{{ relativeAge(connector.lastSeenAt) }}</time>
           </p>

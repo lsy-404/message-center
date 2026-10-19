@@ -102,7 +102,7 @@ relay 每 5 分钟把未触发即时事件的普通群聊纯文本批量提交�
 
 ## 心跳与下行命令
 
-- `POST /api/connectors/heartbeat`：更新实例状态；请求可显式携带 `state: "offline"`，否则记为在线；90 秒无心跳时网页显示离线。多实例 relay 应分别提交每个实例的扫描健康状态。
+- `POST /api/connectors/heartbeat`：更新实例状态；`state` 只能是 `"online"`、`"offline"` 或 `"degraded"`（省略时按在线处理）；90 秒无心跳时网页将在线状态显示为离线，受限状态保持为部分同步。多实例 relay 应分别提交每个实例的扫描健康状态。
 - `GET /api/connectors/commands?connectorId=<id>&limit=10`：领取最多 25 个下行命令；查询参数必须是 token 所属实例。
 - `POST /api/connectors/commands/<commandId>/lease`：续租时请求头与 body 使用相同实例 ID。
 - `POST /api/connectors/commands/<commandId>/complete`：使用命令返回的 `leaseToken` 回执，请求头与 body 使用相同实例 ID。

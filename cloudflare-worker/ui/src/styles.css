@@ -290,6 +290,7 @@ button { color: inherit; }
   background: var(--text-disabled);
 }
 .presence-dot.online { background: var(--presence-online); box-shadow: 0 0 0 2px var(--presence-online-ring); }
+.presence-dot.degraded { background: var(--warning-text); box-shadow: 0 0 0 2px var(--warning-bg); }
 .presence-dot.offline { background: var(--text-disabled); opacity: .7; }
 
 .nav-footer { display: flex; flex: 0 0 auto; margin-top: 9px; align-items: center; justify-content: space-between; padding: 9px 3px 0; border-top: 1px solid var(--stroke-divider); }
@@ -546,6 +547,7 @@ button { color: inherit; }
 .channel-tag { padding: 1px 6px; border-radius: 4px; font-size: 11px; font-weight: 600; line-height: 16px; }
 .presence { display: inline-flex; align-items: center; gap: 5px; }
 .presence.online { color: var(--success-text); }
+.presence.degraded { color: var(--warning-text); }
 .mobile-back { display: none; }
 
 .status-chip {
@@ -887,6 +889,7 @@ button { color: inherit; }
 .instance-card > header { display: flex; align-items: center; gap: 12px; padding: 16px 16px 10px; }
 .instance-glyph { display: grid; width: 38px; height: 38px; flex: 0 0 auto; place-items: center; border-radius: 9px; font-size: 14px; font-weight: 700; }
 .instance-card.offline .instance-glyph { opacity: .55; }
+.instance-card.degraded .instance-glyph { color: var(--warning-text); }
 .instance-heading { min-width: 0; flex: 1; }
 .instance-heading p { margin: 0 0 1px; color: var(--text-tertiary); font-size: 12px; }
 .instance-heading h2 { margin: 0; overflow: hidden; font-size: 16px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
@@ -903,6 +906,7 @@ button { color: inherit; }
   white-space: nowrap;
 }
 .status-pill.online { color: var(--success-text); background: var(--success-bg); }
+.status-pill.degraded { color: var(--warning-text); background: var(--warning-bg); }
 .instance-seen { display: flex; align-items: center; gap: 6px; margin: 0; padding: 0 16px 12px; color: var(--text-tertiary); font-size: 12px; }
 .instance-seen time { color: var(--text-secondary); }
 .instance-card dl {

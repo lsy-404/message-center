@@ -379,6 +379,17 @@ const connectorLayoutHeaders = {
   authorization: `Bearer ${connectorToken}`,
   'x-connector-id': connectorId,
 };
+async function heartbeat(state) {
+  return worker.fetch(new Request('https://message.example.com/api/connectors/heartbeat', {
+    method: 'POST', headers: { ...connectorLayoutHeaders, 'content-type': 'application/json' },
+    body: JSON.stringify({ connectorId, state }),
+  }), workerEnv, {});
+}
+assert.equal((await heartbeat('degraded')).status, 200);
+const invalidConnectorState = await heartbeat('maintenance');
+assert.equal(invalidConnectorState.status, 400);
+assert.equal((await invalidConnectorState.json()).error, 'invalid_connector_state');
+assert.equal((await heartbeat('offline')).status, 200);
 const crossConnectorLayoutResponse = await worker.fetch(new Request(
   'https://message.example.com/api/connectors/layout-control?connectorId=instance-other-device',
   { headers: connectorLayoutHeaders },
@@ -1533,6 +1544,27 @@ assert.equal(inboxProfile.conversationType, 'direct');
 assert.equal(inboxProfile.placement, 'normal');
 assert.equal(inboxProfile.pinned, true);
 const inboxConnector = inboxBody.connectors.find((item) => item.id === connectorId);
+assert.equal(inboxConnector.state, 'offline');
+database.prepare('UPDATE connector_instances SET state = ?, last_seen_at = ? WHERE id = ?')
+  .run('online', new Date(Date.now() - 91_000).toISOString(), connectorId);
+const staleOnlineInbox = await worker.fetch(new Request('https://message.example.com/api/inbox', {
+  headers: { ...auth.headers },
+}), workerEnv, {});
+assert.equal((await staleOnlineInbox.json()).connectors.find((item) => item.id === connectorId).state, 'offline');
+database.prepare('UPDATE connector_instances SET state = ?, last_seen_at = ? WHERE id = ?')
+  .run('degraded', new Date(Date.now() - 91_000).toISOString(), connectorId);
+const staleDegradedInbox = await worker.fetch(new Request('https://message.example.com/api/inbox', {
+  headers: { ...auth.headers },
+}), workerEnv, {});
+assert.equal((await staleDegradedInbox.json()).connectors.find((item) => item.id === connectorId).state, 'degraded');
+database.prepare('UPDATE connector_instances SET state = ?, last_seen_at = ? WHERE id = ?')
+  .run('invalid-state', new Date().toISOString(), connectorId);
+const invalidStoredStateInbox = await worker.fetch(new Request('https://message.example.com/api/inbox', {
+  headers: { ...auth.headers },
+}), workerEnv, {});
+assert.equal((await invalidStoredStateInbox.json()).connectors.find((item) => item.id === connectorId).state, 'offline');
+database.prepare('UPDATE connector_instances SET state = ?, last_seen_at = ? WHERE id = ?')
+  .run('offline', null, connectorId);
 assert.deepEqual({ enabled: inboxConnector.layoutControl.enabled, revision: inboxConnector.layoutControl.revision,
   synchronized: inboxConnector.layoutControl.synchronized,
   deviceActionRevision: inboxConnector.layoutControl.deviceActionRevision,
@@ -1842,6 +1874,8 @@ const promoted = await postEvents([{
 assert.equal(promoted.promoted, 1);
 assert.equal(database.prepare("SELECT queue_class FROM messages WHERE id = 'message-promotion-row'").get().queue_class, 'immediate');
 assert.equal(database.prepare("SELECT COUNT(*) AS total FROM agent_queue WHERE message_id = 'message-promotion-row'").get().total, 1);
+database.prepare('UPDATE connector_instances SET state = ?, last_seen_at = ?, updated_at = ? WHERE id = ?')
+  .run('offline', authoritativeLastSeen, authoritativeUpdatedAt, connectorId);
 assert.deepEqual({ ...database.prepare(`
   SELECT state, last_seen_at, updated_at FROM connector_instances WHERE id = ?
 `).get(connectorId) }, { state: 'offline', last_seen_at: authoritativeLastSeen, updated_at: authoritativeUpdatedAt });
