@@ -2034,9 +2034,10 @@ class Relay:
             self.select_connector(connector)
             connector_id = self.connector
             ready = self.ensure_active()
+            source_read_ready = (self.health.get(connector_id) or self.partial_read.get(connector_id))
             if (self.activity_paused() or not ready or connector.get("receiveOnly") is True or
                     not self.eligible(connector_id) or
-                    not self.health.get(connector_id) or
+                    not source_read_ready or connector_id in self.activity_fresh_required or
                     time.time() < self.source_settle_until[connector_id] or
                     time.monotonic() - self.last_scan[connector_id] > self.scan_interval[connector_id] + 30):
                 continue

@@ -523,6 +523,87 @@ class DeviceRuntimeTests(unittest.TestCase):
 
         self.assertEqual(heartbeats, ["degraded", "degraded"])
 
+    def test_fresh_partial_read_reaches_one_command_and_preserves_send_preflight_result(self):
+        self.save_cursor()
+        command = {"id": "partial-command", "leaseToken": "lease-partial",
+                   "idempotencyKey": "key-partial",
+                   "payload": {"externalConversationId": "conversation-aaaaaaaa",
+                               "body": "synthetic"}}
+        requests = []
+        http_calls = []
+
+        def adapter(request):
+            requests.append(dict(request))
+            if request["op"] == "send":
+                return {"ok": False, "dispatched": False,
+                        "error": "target_preflight_rejected"}
+            return {"ok": True, "sourceReadStatus": "complete", "health": "online",
+                    "cursor": {"version": 1, "conversations": {}}, "messages": []}
+
+        def http_call(method, path, payload=None):
+            http_calls.append((method, path, payload))
+            if path.startswith("/api/connectors/commands?"):
+                return {"commands": [command]}
+            return {"ok": True}
+
+        relay = runtime.Relay(self.config, self.db, adapter, http_call)
+        relay.partial_read["connector-a"] = True
+        relay.health["connector-a"] = False
+        relay.last_scan["connector-a"] = time.monotonic()
+        relay.scan_interval["connector-a"] = 60
+        relay.ensure_active = lambda: True
+
+        relay.pass_once()
+
+        polls = [call for call in http_calls if call[0] == "GET" and call[1].startswith("/api/connectors/commands?")]
+        sends = [request for request in requests if request.get("op") == "send"]
+        self.assertEqual(len(polls), 1)
+        self.assertTrue(polls[0][1].endswith("&limit=1"))
+        self.assertEqual(len(sends), 1)
+        self.assertTrue(sends[0]["confirmed"])
+        self.assertTrue(sends[0]["targetConfirmed"])
+        complete = next(payload for method, path, payload in http_calls
+                        if method == "POST" and path.endswith("/commands/partial-command/complete"))
+        self.assertEqual(complete["ok"], False)
+        self.assertEqual(complete["error"], "target_preflight_rejected")
+
+    def test_partial_command_gate_blocks_stale_paused_failed_and_ineligible_sources(self):
+        cases = ("stale", "paused", "failed", "ineligible", "fresh_required", "settling",
+                 "receive_only")
+        for case in cases:
+            with self.subTest(case=case):
+                calls = []
+                relay = runtime.Relay(
+                    self.config, self.db, lambda _request: {},
+                    lambda method, path, payload=None: calls.append((method, path, payload)) or
+                    {"ok": True, "commands": []},
+                )
+                now = time.monotonic()
+                relay.partial_read["connector-a"] = True
+                relay.health["connector-a"] = False
+                relay.last_scan["connector-a"] = now
+                relay.scan_interval["connector-a"] = 60
+                relay.ensure_active = lambda: True
+                if case == "stale":
+                    relay.last_scan["connector-a"] = now - relay.scan_interval["connector-a"] - 31
+                elif case == "paused":
+                    relay.activity_paused = lambda: True
+                elif case == "failed":
+                    relay.source_read_failed("connector-a")
+                elif case == "ineligible":
+                    relay.retry_at["connector-a"] = now + 60
+                elif case == "fresh_required":
+                    relay.activity_fresh_required.add("connector-a")
+                elif case == "settling":
+                    relay.source_settle_until["connector-a"] = time.time() + 60
+                elif case == "receive_only":
+                    relay.connector_by_id["connector-a"]["receiveOnly"] = True
+
+                relay.pass_once()
+
+                self.assertFalse(any(method == "GET" and path.startswith("/api/connectors/commands?")
+                                     for method, path, _payload in calls))
+
     def test_partial_heartbeat_is_offline_when_stale_unready_or_human_paused(self):
         relay = runtime.Relay(self.config, self.db, lambda _request: {})
         relay.partial_read["connector-a"] = True
@@ -552,6 +633,7 @@ class DeviceRuntimeTests(unittest.TestCase):
              "cursor": {"next": "complete"}, "messages": []},
         ))
         relay = runtime.Relay(self.config, self.db, lambda _request: next(responses))
+        relay.http_call = lambda *_args: {"ok": True, "commands": []}
         relay.ensure_active = lambda: True
         relay.flush_one = lambda: None
         heartbeats = []
