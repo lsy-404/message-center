@@ -610,6 +610,7 @@ class Relay:
         self.source_state_durable = {item["id"]: True for item in self.connectors}
         self.connector = self.connectors[0]["id"]
         self.health = {item["id"]: False for item in self.connectors}
+        self.partial_read = {item["id"]: False for item in self.connectors}
         self.last_scan = {item["id"]: float("-inf") for item in self.connectors}
         self.scan_interval = {item["id"]: 300 for item in self.connectors}
         self.registered = set()
@@ -881,6 +882,7 @@ class Relay:
         return True
 
     def source_read_failed(self, connector_id, attach_failure_pid=None, query_gate_pending_pid=None):
+        self.partial_read[connector_id] = False
         self.source_failures[connector_id] += 1
         current_pid, count = self.attach_failure_streak[connector_id]
         if self.auto_wake and type(attach_failure_pid) is int and attach_failure_pid > 1:
@@ -897,6 +899,7 @@ class Relay:
         return self.persist_source_state(connector_id)
 
     def source_read_succeeded(self, connector_id):
+        self.partial_read[connector_id] = False
         self.source_failures[connector_id] = 0
         self.attach_failure_streak[connector_id] = (None, 0)
         self.query_gate_failure_streak[connector_id] = (None, 0)
@@ -904,6 +907,7 @@ class Relay:
         self.persist_source_state(connector_id)
 
     def source_read_partial(self, connector_id, completed_pages):
+        self.partial_read[connector_id] = True
         self.source_failures[connector_id] = 0
         self.attach_failure_streak[connector_id] = (None, 0)
         self.query_gate_failure_streak[connector_id] = (None, 0)
@@ -1021,6 +1025,15 @@ class Relay:
         self.heartbeat_last_state[connector_id] = state
         self.heartbeat_last_sent[connector_id] = time.monotonic()
         return True
+
+    def connector_heartbeat_state(self, connector_id, ready):
+        if (self.activity_paused() or not ready or not self.wake_readiness_current()
+                or connector_id in self.activity_fresh_required
+                or time.monotonic() - self.last_scan[connector_id] > self.scan_interval[connector_id] + 30):
+            return "offline"
+        if self.partial_read[connector_id]:
+            return "degraded"
+        return "online" if self.health[connector_id] else "offline"
 
     def select_connector(self, connector):
         self.connector = connector["id"]
@@ -1194,6 +1207,8 @@ class Relay:
         if ("sourceReadOk" in result
                 or type(source_read_status) is not str
                 or source_read_status not in {"complete", "partial", "failed"}):
+            raise RuntimeError("invalid_scan_result")
+        if source_read_status != "partial" and "readStatistics" in result:
             raise RuntimeError("invalid_scan_result")
         if source_read_status == "failed":
             if result.get("ok") is not False:
@@ -1896,16 +1911,13 @@ class Relay:
 
     def pass_once(self):
         self.activity_state()
-        self.ensure_active()
-        delivered_connectors = set()
+        initial_ready = self.ensure_active()
         for _ in range(MAX_DELIVERIES_PER_PASS):
             try:
                 connector_id = self.flush_one()
                 if not connector_id:
                     break
-                delivered_connectors.add(connector_id)
-                heartbeat_state = ("offline" if self.activity_paused() or
-                                   connector_id in self.activity_fresh_required else "online")
+                heartbeat_state = self.connector_heartbeat_state(connector_id, initial_ready)
                 self.send_heartbeat(connector_id, heartbeat_state)
             except Exception:
                 break
@@ -2002,6 +2014,7 @@ class Relay:
                     else:
                         self.failed(connector_id)
                 except Exception:
+                    self.partial_read[connector_id] = False
                     self.health[connector_id] = False
                     self.attach_failure_streak[connector_id] = (None, 0)
                     self.query_gate_failure_streak[connector_id] = (None, 0)
@@ -2015,14 +2028,7 @@ class Relay:
                         self.wake_scan_pending.discard(connector_id)
                     self.cleanup_unreferenced_media()
             ready = self.ensure_active()
-            activity_paused = self.activity_paused()
-            source_fresh = (ready and self.health[connector_id] and
-                            time.monotonic() - self.last_scan[connector_id] <=
-                            self.scan_interval[connector_id] + 30)
-            heartbeat_state = ("online" if not activity_paused and
-                               connector_id not in self.activity_fresh_required and
-                               (connector_id in delivered_connectors or source_fresh)
-                               else "offline")
+            heartbeat_state = self.connector_heartbeat_state(connector_id, ready)
             self.send_heartbeat(connector_id, heartbeat_state)
         for connector in self.connectors:
             self.select_connector(connector)

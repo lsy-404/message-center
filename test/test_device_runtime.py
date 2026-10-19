@@ -439,6 +439,13 @@ class DeviceRuntimeTests(unittest.TestCase):
         relay = runtime.Relay(self.config, self.db, lambda _request: legacy_result)
         with self.assertRaisesRegex(RuntimeError, "invalid_scan_result"):
             relay.scan_profile("primary")
+        unexpected_statistics = {"ok": True, "sourceReadStatus": "complete", "health": "online",
+                                 "readStatistics": {"attemptedPages": 1, "completedPages": 1,
+                                                    "failedPages": 0},
+                                 "cursor": {"next": "new"}, "messages": []}
+        relay = runtime.Relay(self.config, self.db, lambda _request: unexpected_statistics)
+        with self.assertRaisesRegex(RuntimeError, "invalid_scan_result"):
+            relay.scan_profile("primary")
         self.assertIsNone(self.db.execute("SELECT value FROM cursors WHERE connector_id='connector-a' "
                                           "AND profile='primary'").fetchone())
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
@@ -497,7 +504,73 @@ class DeviceRuntimeTests(unittest.TestCase):
         relay.pass_once()
 
         self.assertFalse(relay.health["connector-a"])
-        self.assertIn("offline", heartbeats)
+        self.assertEqual(heartbeats[-1], "degraded")
+        self.assertTrue(relay.partial_read["connector-a"])
+
+    def test_flush_ack_keeps_fresh_partial_scan_degraded(self):
+        relay = runtime.Relay(self.config, self.db, lambda _request: {})
+        relay.partial_read["connector-a"] = True
+        relay.last_scan["connector-a"] = time.monotonic()
+        relay.scan_interval["connector-a"] = 60
+        relay.ensure_active = lambda: True
+        relay.activity_paused = lambda: False
+        flush_ids = iter(("connector-a", None))
+        relay.flush_one = lambda: next(flush_ids)
+        heartbeats = []
+        relay.send_heartbeat = lambda _connector, state: heartbeats.append(state)
+
+        relay.pass_once()
+
+        self.assertEqual(heartbeats, ["degraded", "degraded"])
+
+    def test_partial_heartbeat_is_offline_when_stale_unready_or_human_paused(self):
+        relay = runtime.Relay(self.config, self.db, lambda _request: {})
+        relay.partial_read["connector-a"] = True
+        relay.last_scan["connector-a"] = 100.0
+        relay.scan_interval["connector-a"] = 60
+        relay.activity_paused = lambda: False
+        with patch.object(runtime.time, "monotonic", return_value=151.0):
+            self.assertEqual(relay.connector_heartbeat_state("connector-a", True), "degraded")
+        with patch.object(runtime.time, "monotonic", return_value=191.0):
+            self.assertEqual(relay.connector_heartbeat_state("connector-a", True), "offline")
+            self.assertEqual(relay.connector_heartbeat_state("connector-a", False), "offline")
+        relay.last_scan["connector-a"] = 151.0
+        relay.activity_fresh_required.add("connector-a")
+        with patch.object(runtime.time, "monotonic", return_value=151.0):
+            self.assertEqual(relay.connector_heartbeat_state("connector-a", True), "offline")
+        relay.activity_fresh_required.clear()
+        relay.activity_paused = lambda: True
+        with patch.object(runtime.time, "monotonic", return_value=151.0):
+            self.assertEqual(relay.connector_heartbeat_state("connector-a", True), "offline")
+
+    def test_complete_scan_clears_partial_health_and_returns_heartbeat_online(self):
+        responses = iter((
+            {"ok": True, "sourceReadStatus": "partial", "health": "degraded",
+             "readStatistics": {"attemptedPages": 2, "completedPages": 1, "failedPages": 1},
+             "cursor": {"next": "partial"}, "messages": []},
+            {"ok": True, "sourceReadStatus": "complete", "health": "online",
+             "cursor": {"next": "complete"}, "messages": []},
+        ))
+        relay = runtime.Relay(self.config, self.db, lambda _request: next(responses))
+        relay.ensure_active = lambda: True
+        relay.flush_one = lambda: None
+        heartbeats = []
+        relay.send_heartbeat = lambda _connector, state: heartbeats.append(state)
+
+        relay.pass_once()
+        self.assertTrue(relay.partial_read["connector-a"])
+        relay.last_scan["connector-a"] = float("-inf")
+        relay.pass_once()
+
+        self.assertFalse(relay.partial_read["connector-a"])
+        self.assertTrue(relay.health["connector-a"])
+        self.assertEqual(heartbeats[-1], "online")
+
+    def test_global_source_failure_clears_partial_heartbeat_state(self):
+        relay = runtime.Relay(self.config, self.db, lambda _request: {})
+        relay.partial_read["connector-a"] = True
+        relay.source_read_failed("connector-a")
+        self.assertFalse(relay.partial_read["connector-a"])
 
     def test_partial_result_schema_is_strict_and_qq_only(self):
         base = {"ok": True, "sourceReadStatus": "partial", "health": "degraded",
@@ -2941,7 +3014,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         self.assertEqual(len(heartbeat_payloads), 1)
         self.assertTrue(all(item["state"] == "offline" for item in heartbeat_payloads))
 
-    def test_outbox_ack_keeps_heartbeat_online_without_opening_command_gate(self):
+    def test_outbox_ack_does_not_mark_stale_source_online_or_open_command_gate(self):
         for index in range(runtime.MAX_DELIVERIES_PER_PASS * runtime.MAX_OUTBOX_BATCH_MESSAGES + 1):
             message = self.event("queued-" + str(index))
             self.db.execute(
@@ -2962,7 +3035,7 @@ class DeviceRuntimeTests(unittest.TestCase):
             relay.pass_once()
 
         heartbeat = next(payload for _method, path, payload in calls if path.endswith("/heartbeat"))
-        self.assertEqual(heartbeat["state"], "online")
+        self.assertEqual(heartbeat["state"], "offline")
         self.assertFalse(relay.health["connector-a"])
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
         self.assertFalse(any(method == "GET" and path.startswith("/api/connectors/commands")
@@ -2994,12 +3067,12 @@ class DeviceRuntimeTests(unittest.TestCase):
         heartbeat_rows = [row for row in calls if row[2].endswith("/heartbeat")]
         event_rows = [row for row in calls if row[2].endswith("/events")]
         self.assertEqual(len(event_rows), 3)
-        self.assertEqual([row[3]["state"] for row in heartbeat_rows], ["online"] * 3)
+        self.assertEqual([row[3]["state"] for row in heartbeat_rows], ["offline"] * 3)
         for index, event_row in enumerate(event_rows):
             following = [row for row in calls if row[0] >= event_row[0] + 60]
             self.assertTrue(following)
             self.assertTrue(following[0][2].endswith("/heartbeat"))
-            self.assertEqual(following[0][3]["state"], "online")
+            self.assertEqual(following[0][3]["state"], "offline")
         self.assertFalse(any(row[1] == "GET" and "/commands?" in row[2] for row in calls))
 
     def test_slow_profile_and_avatar_acks_keep_heartbeat_progress_bounded(self):
@@ -3188,7 +3261,7 @@ class DeviceRuntimeTests(unittest.TestCase):
         with patch.object(runtime.time, "monotonic", return_value=1000.0):
             relay.pass_once()
 
-        self.assertEqual(heartbeats, {"connector-a": "online", "connector-b": "offline"})
+        self.assertEqual(heartbeats, {"connector-a": "offline", "connector-b": "offline"})
         self.assertFalse(relay.health["connector-a"])
         self.assertFalse(relay.health["connector-b"])
 

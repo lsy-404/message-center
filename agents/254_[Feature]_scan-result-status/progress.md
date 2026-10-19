@@ -5,3 +5,5 @@
 - Implemented strict `sourceReadStatus` validation, QQ-only partial statistics, partial recovery-counter persistence, contract documentation, and regression tests. Rejected the legacy `sourceReadOk` field explicitly.
 - Fast-forwarded the task worktree to public main `06c3cba` to preserve the unrelated owner-activity changes already present there.
 - Verification passed after fast-forward: `test/test_device_runtime.py` (136 tests, 3 skipped), `test/test_device_runtime_outbox_batch.py` (10), `test/test_device_runtime_dirty_hint.py` (8), and `git diff --check`.
+- Root review identified that delivery ACK heartbeats could overwrite partial status with online. Added a separate in-memory partial marker, readiness/lease/freshness-gated heartbeat mapping, strict rejection of stats on non-partial statuses, and regression tests for ACK retention, offline gates, source failure, and complete recovery.
+- Follow-up verification passed: `test/test_device_runtime.py` (140 tests, 3 skipped), outbox-batch (10), dirty-hint (8), and `git diff --check`.

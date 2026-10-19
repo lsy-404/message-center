@@ -11,3 +11,4 @@ Public Python runtime, its host tests, and adapter contract documentation. No Wo
 - [x] Replace the boolean scan field with strict complete/partial/failed validation and persist partial source state correctly.
 - [x] Add complete/partial/failed contract tests, including all-pages-failed cursor scheduling and degraded health.
 - [x] Run the focused runtime suites, review the diff, and commit the isolated branch.
+- [x] Keep partial status in heartbeats across outbox delivery, while requiring readiness, a fresh scan, and an unpaused activity lease.
