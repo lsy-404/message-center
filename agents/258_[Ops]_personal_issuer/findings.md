@@ -1,0 +1,3 @@
+# Findings
+
+Message Center运行在message.leisiyu.dev，OIDC_ISSUER仍为产品域。业务身份使用oidc:sub；新身份中心两个issuer对同一账号提供相同public sub，不需重建账户或变更业务数据。metadata缓存已按issuer索引，token envelope内绑定issuer；旧issuer的应用session会在首次读取时失效并删除，需重新登录。源码OIDC配置由env提供，无硬编码产品issuer，公开wrangler.jsonc是可分发模板，不填入具体生产账户配置。主worktree存在device/manager/script/session四个未跟踪文件，本任务不读不改不提交。

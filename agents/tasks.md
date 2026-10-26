@@ -102,3 +102,5 @@
 | 255 | [Feature] Connector degraded state | Preserve strict online/offline/degraded heartbeat state through Worker snapshots, send reachability, and QQ UI status | Partial native page failures must be visible without claiming full online health | ✅ Locally verified; awaiting deployment |
 | 256 | [Diagnostic] Native detach signal telemetry | Record finite Frida detach signal timing and cleanup overlap, and avoid duplicate detach requests after a known signal | Cleanup failures need bounded ordering evidence while preserving existing deadlines and fail-closed results | ✅ Built and installed; device evidence pending |
 | 257 | [BugFix] Partial command readiness | Permit command polling after a fresh partial QQ scan while retaining all existing readiness and per-target send checks | Partial reads should not suppress otherwise safe queued commands when the source remains fresh | ✅ Locally verified; no deployment |
+
+| 258 | [Ops] 个人域issuer | 对齐Message Center身份入口与域名 | 个人域服务使用个人issuer | ✅ 完成 |
