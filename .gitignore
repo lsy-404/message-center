@@ -20,3 +20,4 @@
 id_*
 bridge/local-adapters/
 cloudflare-worker/wrangler.local.jsonc
+/agents
