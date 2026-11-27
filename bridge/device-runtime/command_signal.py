@@ -12,8 +12,9 @@ import time
 import urllib.parse
 
 
-PING_INTERVAL = 30
-DEAD_AFTER = 75
+# The edge closes a WebSocket idle for 100 seconds.
+PING_INTERVAL = 60
+DEAD_AFTER = 150
 CONNECT_TIMEOUT = 20
 MAX_FRAME = 64 * 1024
 MAX_BACKOFF = 60

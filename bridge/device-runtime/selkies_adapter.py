@@ -4,7 +4,8 @@
 The runtime runs this executable once per request with one JSON object on stdin. Each profile names a container in
 ``selkies_adapter.json`` beside this file and a file holding the container's Selkies master token. A scan reads the
 client's chat list, and the chats folded into 群助手 / 折叠的聊天, through the container's Pelorus accessibility API and
-reports every chat whose last message changed. Scans never open a chat, so nothing is marked read. A send opens the
+reports every chat whose last message changed. Input goes in with xdotool through ``docker exec``, since Pelorus pauses
+about a second after every action it performs. Scans never open a chat, so nothing is marked read. A send opens the
 chat, sends each file through the client's file picker and then the text, and checks the message list after each one
 before it reports a receipt.
 """
@@ -18,6 +19,7 @@ import re
 import secrets
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -60,7 +62,8 @@ TIME_LABEL = re.compile(r"^(\d{1,4}[:/]\d{1,2}(/\d{1,2})?|昨天|前天|星期.)
 ROW_MARKERS = re.compile(r"^(\[(有人@我|有新文件|有人@你|草稿)\])+")
 SENDER = re.compile(r"^([^:：\[\]\n]{1,64})(?:: |：)(.*)$", re.S)
 # Typing these produces 〈〉 in the container, so they are pressed as keysyms instead.
-TYPED_AS_KEYS = {"「": "U300C", "」": "U300D"}
+CONTAINER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+INPUT_TIMEOUT = 20
 IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 SAFE_FILE_NAME = re.compile(r"^[^/\\\x00-\x1f]{1,200}$")
 
@@ -156,7 +159,11 @@ def container(config, profile):
         raise AdapterError("token_missing")
     if not token:
         raise AdapterError("token_missing")
-    return Desktop(url, "Bearer " + token), entry
+    name, docker = entry.get("container"), config.get("docker")
+    if not isinstance(name, str) or not CONTAINER_NAME.match(name) or not isinstance(docker, str) \
+            or not os.path.isabs(docker):
+        raise AdapterError("profile_invalid")
+    return Desktop(url, "Bearer " + token, docker, name), entry
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -165,11 +172,13 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class Desktop:
-    """The container's Pelorus API: window list, accessibility trees and input actions."""
+    """The container's Pelorus API for windows, accessibility trees and pictures, and xdotool for input."""
 
-    def __init__(self, url, authorization):
+    def __init__(self, url, authorization, docker, name):
         self.url = url
         self.authorization = authorization
+        self.docker = docker
+        self.name = name
 
     def call(self, path, method="GET", payload=None):
         data = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -196,18 +205,47 @@ class Desktop:
             raise AdapterError("desktop_action_failed")
         return result.get("text") or ""
 
-    def ref(self, window_id, pattern):
-        """The `look` reference of the first control whose outline line matches `pattern`."""
-        match = re.search(r"\[(e\d+)\] " + pattern, self.tool("look", window=window_id))
-        return match.group(1) if match else None
+    def xdotool(self, *arguments):
+        try:
+            subprocess.run([self.docker, "exec", self.name, "env", "DISPLAY=:20", "xdotool"] + list(arguments),
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=INPUT_TIMEOUT, check=True)
+        except (OSError, subprocess.SubprocessError):
+            raise AdapterError("desktop_input_failed")
 
-    def click(self, bounds):
-        self.tool("click", at=[int(bounds["x"] + bounds["w"] / 2), int(bounds["y"] + bounds["h"] / 2)])
+    def control(self, window_id, pattern):
+        """The first control in the window's tree whose ``role "name"`` line matches `pattern`, as `look` writes it."""
+        for node in walk(self.tree(window_id)):
+            name = node.get("name")
+            line = "{} \"{}\"".format(node.get("role"), name) if name else str(node.get("role"))
+            if node.get("bounds") and re.match(pattern, line):
+                return node
+        return None
+
+    def press(self, control):
+        self.click(control["bounds"])
+
+    def click(self, bounds, button="left"):
+        x, y = int(bounds["x"] + bounds["w"] / 2), int(bounds["y"] + bounds["h"] / 2)
+        self.xdotool("mousemove", str(x), str(y), "click", "3" if button == "right" else "1")
+
+    def point(self, x, y):
+        self.xdotool("mousemove", str(int(x)), str(int(y)))
+
+    def scroll(self, at, direction, amount):
+        self.xdotool("mousemove", str(int(at[0])), str(int(at[1])),
+                     "click", "--repeat", str(amount), "--delay", "15", "4" if direction == "up" else "5")
+
+    def key(self, keys):
+        self.xdotool("key", "--clearmodifiers", keys)
+
+    def write(self, text):
+        self.xdotool("type", "--delay", "8", "--", text)
 
     def activate(self, window_id):
         # Clicks and scrolls land on whatever window is on top at that point, so raise the target first.
         self.call("/window/{}/activate".format(window_id), "POST")
-        time.sleep(0.3)
+        time.sleep(0.2)
 
     def windows(self):
         return self.call("/desktop").get("windows") or []
@@ -228,7 +266,7 @@ class Desktop:
         window = next((w for w in self.windows() if int(w.get("id", -1)) == window_id), None)
         if window and window.get("rect"):
             x, y, w, _ = window["rect"]
-            self.tool("scroll", at=[int(x + w / 2), int(y + 12)], direction="up", amount=1)
+            self.point(x + w / 2, y + 12)
 
 
 def walk(node):
@@ -245,28 +283,14 @@ def find(tree, predicate):
     return next((node for node in walk(tree) if predicate(node)), None)
 
 
-def type_chars(desktop, text, ref=None, replace=False):
-    """Types `text` where the keyboard focus is, or into `ref`, first clearing the field with `replace`; TYPED_AS_KEYS
-    characters are pressed as keysyms. Pelorus settles for about a second after each action, so the click, the
-    clearing and the first run of plain text go in one call."""
-    parts = [part for part in re.split("([{}])".format("".join(TYPED_AS_KEYS)), text) if part]
-    if parts and parts[0] not in TYPED_AS_KEYS:
-        arguments = {"text": parts.pop(0)}
-        if ref:
-            arguments["ref"] = ref
-        if replace:
-            arguments["replace"] = True
-        desktop.tool("type", **arguments)
-    else:
-        if ref:
-            desktop.tool("click", ref=ref)
-        if replace:
-            clear_input(desktop)
-    for part in parts:
-        if part in TYPED_AS_KEYS:
-            desktop.tool("key", keys=TYPED_AS_KEYS[part])
-        else:
-            desktop.tool("type", text=part)
+def type_into(desktop, text, control=None, replace=False):
+    """Types `text` where the keyboard focus is, or into `control` after clicking it, first clearing the field with
+    `replace`."""
+    if control is not None:
+        desktop.press(control)
+    if replace:
+        clear_input(desktop)
+    desktop.write(text)
 
 
 def png_left_columns(png, columns):
@@ -425,8 +449,7 @@ def qq_scroll_top(desktop, window_id, tree):
         first = next((c for c in chats.get("children") or [] if c.get("bounds")), None)
         if first and first["bounds"]["y"] >= bounds["y"]:
             return tree
-        desktop.tool("scroll", at=[int(bounds["x"] + bounds["w"] / 2), int(bounds["y"] + bounds["h"] / 2)],
-                     direction="up", amount=30)
+        desktop.scroll([bounds["x"] + bounds["w"] / 2, bounds["y"] + bounds["h"] / 2], "up", 30)
         time.sleep(0.3)
         tree = desktop.tree(window_id)
     return tree
@@ -498,9 +521,9 @@ def in_folder(driver, tree):
 
 def leave_folder(desktop, driver, window_id, tree):
     if driver == "wechat":
-        ref = desktop.ref(window_id, r'button "返回"')
-        if ref:
-            desktop.tool("click", ref=ref)
+        back = desktop.control(window_id, r'button "返回"')
+        if back:
+            desktop.press(back)
     else:
         back = find(tree, lambda n: n.get("role") == "static" and n.get("name") == "返回")
         if back and back.get("bounds"):
@@ -532,10 +555,10 @@ def open_client(desktop, driver):
         if any(text_of(node).startswith(app["sign_in"]) for node in walk(tree)):
             raise AdapterError("client_signed_out")
         if main_rows(driver, tree) is None and not in_folder(driver, tree):
-            tab = desktop.ref(window_id, r'toggle button "消息"' if driver == "qq" else r'button "(WeChat|微信)"')
+            tab = desktop.control(window_id, r'toggle button "消息"' if driver == "qq" else r'button "(WeChat|微信)"')
             if not tab:
                 continue
-            desktop.tool("click", ref=tab)
+            desktop.press(tab)
             time.sleep(1)
             tree = desktop.tree(window_id)
             if main_rows(driver, tree) is None:
@@ -566,7 +589,8 @@ def wechat_find_row(desktop, window_id, list_name, name):
     center = wechat_list_center(tree, list_name)
     if not center:
         return None
-    desktop.tool("scroll", at=center, direction="up", amount=30)
+    desktop.scroll(center, "up", 30)
+    time.sleep(0.4)
     previous = None
     for _ in range(SCROLL_PAGES):
         tree = desktop.tree(window_id)
@@ -579,7 +603,7 @@ def wechat_find_row(desktop, window_id, list_name, name):
         if names == previous:
             return None
         previous = names
-        desktop.tool("scroll", at=center, direction="down", amount=5)
+        desktop.scroll(center, "down", 5)
         time.sleep(0.5)
     return None
 
@@ -618,7 +642,7 @@ def row_locator(driver, list_name, name, placement="normal"):
 def wechat_scroll_top(desktop, window_id):
     center = wechat_list_center(desktop.tree(window_id), "会话")
     if center:
-        desktop.tool("scroll", at=center, direction="up", amount=30)
+        desktop.scroll(center, "up", 30)
 
 
 def read_folder(desktop, driver, window_id, rows):
@@ -885,30 +909,29 @@ def open_conversation(desktop, driver, window_id, tree, name, folded):
     else:
         # QQ's search results hold still while the chat list reorders, so chats are always opened from search.
         # The search box is QQ's only entry; it loses its "搜索" name once text has been typed and cleared.
-        ref = desktop.ref(window_id, r'entry\b')
-        if not ref:
+        search = desktop.control(window_id, r'entry\b')
+        if not search:
             raise AdapterError("conversation_not_found")
-        type_chars(desktop, name, ref=ref, replace=True)
+        type_into(desktop, name, search, replace=True)
         results = []
 
         def exact_listed():
             results[:] = [n for n in walk(desktop.tree(window_id)) if n.get("role") == "list item" and n.get("bounds")]
             return any(qq_result_match(n, name) == "exact" for n in results)
-        wait_for(exact_listed, 1.5)
+        wait_for(exact_listed, 3, every=0.1)
         exact = [n for n in results if qq_result_match(n, name) == "exact"]
         truncated = [n for n in results if qq_result_match(n, name) == "truncated"]
         match = exact[0] if exact else (truncated[0] if len(truncated) == 1 else None)
         if match is None:
             # Escape would hide the client to the tray, so the search text is cleared by hand.
-            desktop.tool("key", keys="ctrl+a")
-            desktop.tool("key", keys="BackSpace")
+            clear_input(desktop)
             raise AdapterError("conversation_not_found")
         desktop.click(match["bounds"])
 
     def opened():
         tree = desktop.tree(window_id)
         return tree if chat_input(driver, tree, name, loose=True)[0] is not None else None
-    tree = wait_for(opened, 4)
+    tree = wait_for(opened, 4, every=0.1)
     if tree is None:
         raise AdapterError("conversation_open_failed")
     return tree
@@ -919,23 +942,18 @@ def type_text(desktop, driver, window_id, tree, name, body):
     node, _ = chat_input(driver, tree, name, loose=True)
     if node is None:
         raise AdapterError("input_not_found")
-    if driver == "wechat":
-        ref = desktop.ref(window_id, r'text "{}"'.format(re.escape(node.get("name") or name)))
-        if not ref:
-            raise AdapterError("input_not_found")
-        type_chars(desktop, lines[0], ref=ref)
-    else:
-        desktop.click(node["bounds"])
-        type_chars(desktop, lines[0])
+    if not node.get("bounds"):
+        raise AdapterError("input_not_found")
+    type_into(desktop, lines[0], node)
     for line in lines[1:]:
-        desktop.tool("key", keys="shift+Return")
+        desktop.key("shift+Return")
         if line:
-            type_chars(desktop, line)
+            desktop.write(line)
 
 
 def clear_input(desktop):
-    desktop.tool("key", keys="ctrl+a")
-    desktop.tool("key", keys="BackSpace")
+    desktop.key("ctrl+a")
+    desktop.key("BackSpace")
 
 
 def outgoing_files(entry, attachments, command_id):
@@ -972,11 +990,11 @@ def dialog_windows(desktop):
 def pick_file(desktop, driver, window_id, button, path):
     """Opens the chat's file picker with the toolbar `button` and chooses `path` in it. WeChat's picker is a Qt dialog
     with an accessible file name field; QQ's is a GTK dialog without accessibility, driven from its location bar."""
-    ref = desktop.ref(window_id, r'button "{}"'.format(re.escape(button)))
-    if not ref:
+    control = desktop.control(window_id, r'button "{}"'.format(re.escape(button)))
+    if not control:
         raise AdapterError("file_button_not_found")
     before = set(dialog_windows(desktop))
-    desktop.tool("click", ref=ref)
+    desktop.press(control)
     dialog = None
     for _ in range(10):
         time.sleep(0.5)
@@ -987,17 +1005,17 @@ def pick_file(desktop, driver, window_id, button, path):
     if dialog is None:
         raise AdapterError("file_dialog_missing")
     if driver == "wechat":
-        field = desktop.ref(dialog, r'text "文件名称')
+        field = desktop.control(dialog, r'text "文件名称')
         if field:
-            type_chars(desktop, path, ref=field, replace=True)
-            desktop.tool("key", keys="Return")
+            type_into(desktop, path, field, replace=True)
+            desktop.key("Return")
     else:
         desktop.activate(dialog)
-        desktop.tool("key", keys="ctrl+l")
+        desktop.key("ctrl+l")
         time.sleep(0.4)
-        type_chars(desktop, path)
+        desktop.write(path)
         time.sleep(0.3)
-        desktop.tool("key", keys="Return")
+        desktop.key("Return")
     for _ in range(10):
         time.sleep(0.5)
         if dialog not in dialog_windows(desktop):
@@ -1058,9 +1076,9 @@ def send_file(desktop, driver, window_id, name, attachment, path):
         if node is None or collapse(held) != "￼":
             clear_input(desktop)
             raise AdapterError("input_mismatch")
-        desktop.tool("key", keys="Return")
+        desktop.key("Return")
         return before, as_image
-    image_button = as_image and desktop.ref(window_id, r'button "图片"')
+    image_button = as_image and desktop.control(window_id, r'button "图片"')
     if image_button:
         pick_file(desktop, driver, window_id, "图片", path)
         time.sleep(0.8)
@@ -1070,22 +1088,22 @@ def send_file(desktop, driver, window_id, name, attachment, path):
         if node is None or re.sub(r"[\s​]", "", held) != "￼":
             clear_input(desktop)
             raise AdapterError("input_mismatch")
-        ref = desktop.ref(window_id, r'button "发送"')
-        if not ref:
+        send_button = desktop.control(window_id, r'button "发送"')
+        if not send_button:
             clear_input(desktop)
             raise AdapterError("send_button_not_found")
-        desktop.tool("click", ref=ref)
+        desktop.press(send_button)
         return before, True
     pick_file(desktop, driver, window_id, "文件", path)
     time.sleep(1)
     tree = desktop.tree(window_id)
-    ref = desktop.ref(window_id, r'button "发送\(\d+\)"')
-    if not ref or not qq_file_confirmation(tree, name, attachment["fileName"]):
-        close = desktop.ref(window_id, r'button "关闭"')
+    send_button = desktop.control(window_id, r'button "发送\(\d+\)"')
+    if not send_button or not qq_file_confirmation(tree, name, attachment["fileName"]):
+        close = desktop.control(window_id, r'button "关闭"')
         if close:
-            desktop.tool("click", ref=close)
+            desktop.press(close)
         raise AdapterError("file_confirmation_mismatch")
-    desktop.tool("click", ref=ref)
+    desktop.press(send_button)
     return before, False
 
 
@@ -1175,7 +1193,7 @@ def send(request, config):
         def typed_in():
             node, typed = chat_input(driver, desktop.tree(window_id), name, loose=True)
             return node is not None and collapse(typed) == collapse(body)
-        if not wait_for(typed_in, 2, every=0.2):
+        if not wait_for(typed_in, 2, every=0.1):
             clear_input(desktop)
             return refused("input_mismatch")
     except AdapterError as error:
@@ -1184,17 +1202,14 @@ def send(request, config):
         return refused("attachment_staging_failed")
 
     try:
-        if driver == "qq":
-            ref = desktop.ref(window_id, r'button "发送"')
-            if ref:
-                desktop.tool("click", ref=ref)
-            else:
-                desktop.tool("key", keys="Return")
+        send_button = desktop.control(window_id, r'button "发送"') if driver == "qq" else None
+        if send_button:
+            desktop.press(send_button)
         else:
-            desktop.tool("key", keys="Return")
+            desktop.key("Return")
         deadline = time.time() + 5
         while time.time() < deadline:
-            time.sleep(0.3)
+            time.sleep(0.1)
             tree = desktop.tree(window_id)
             node, remaining = chat_input(driver, tree, name, loose=True)
             last, count = last_message(driver, tree)
@@ -1283,15 +1298,15 @@ def save_file_as(desktop, driver, window_id, node, entry, file_name):
     os.chmod(os.path.join(host, folder), 0o777)
     bounds = node["bounds"]
     before = set(dialog_windows(desktop))
-    desktop.tool("click", at=[int(bounds["x"] + bounds["w"] / 2), int(bounds["y"] + bounds["h"] / 2)], button="right")
+    desktop.click(bounds, button="right")
     time.sleep(0.8)
     # Only this exact item is ever clicked; the same menu holds 撤回 and 删除.
-    ref = desktop.ref(window_id, r'menu item "另存为(\.\.\.|…)?"')
-    if not ref:
+    save_item = desktop.control(window_id, r'menu item "另存为(\.\.\.|…)?"')
+    if not save_item:
         desktop.park_pointer(window_id)
-        desktop.tool("click", at=[int(bounds["x"] + bounds["w"] / 2), 18])
+        desktop.click({"x": bounds["x"] + bounds["w"] / 2, "y": 18, "w": 0, "h": 0})
         raise AdapterError("save_menu_missing")
-    desktop.tool("click", ref=ref)
+    desktop.press(save_item)
     dialog = None
     for _ in range(10):
         time.sleep(0.5)
@@ -1304,11 +1319,11 @@ def save_file_as(desktop, driver, window_id, node, entry, file_name):
     target = "{}/{}/{}".format(inside, folder, file_name)
     field = None
     if driver == "wechat":
-        field = desktop.ref(dialog, r'text "文件名')
+        field = desktop.control(dialog, r'text "文件名')
     else:
         desktop.activate(dialog)
-    type_chars(desktop, target, ref=field, replace=True)
-    desktop.tool("key", keys="Return")
+    type_into(desktop, target, field, replace=True)
+    desktop.key("Return")
     path = os.path.join(host, folder, file_name)
     previous = -1
     for _ in range(120):

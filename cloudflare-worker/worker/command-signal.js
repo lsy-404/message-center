@@ -1,4 +1,7 @@
 // The socket only says "command"; the device leases commands over HTTP, so a missed signal waits for its next poll.
+// Devices ping every 60 seconds, under the edge's 100-second idle limit.
+const SIGNAL_LIVE_MS = 150_000;
+
 export class CommandSignal {
   constructor(state) {
     this.state = state;
@@ -7,6 +10,7 @@ export class CommandSignal {
   }
 
   async fetch(request) {
+    if (new URL(request.url).pathname === "/live") return Response.json({ connectors: [...this.live()] });
     const connectorId = request.headers.get("x-connector-id") || "";
     if (request.method === "POST") {
       for (const socket of this.state.getWebSockets(connectorId)) {
@@ -23,7 +27,21 @@ export class CommandSignal {
     }
     const [client, server] = Object.values(new WebSocketPair());
     this.state.acceptWebSocket(server, [connectorId]);
+    server.serializeAttachment({ acceptedAt: Date.now() });
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  // Connectors whose socket was opened or answered a ping within SIGNAL_LIVE_MS.
+  live() {
+    const connectors = new Set();
+    for (const socket of this.state.getWebSockets()) {
+      const pinged = this.state.getWebSocketAutoResponseTimestamp(socket)?.getTime() || 0;
+      const accepted = socket.deserializeAttachment()?.acceptedAt || 0;
+      if (Date.now() - Math.max(pinged, accepted) <= SIGNAL_LIVE_MS) {
+        for (const tag of this.state.getTags(socket)) connectors.add(tag);
+      }
+    }
+    return connectors;
   }
 
   webSocketMessage() {}
@@ -58,5 +76,17 @@ export async function signalCommand(env, connectorId) {
   } catch (error) {
     console.error(JSON.stringify({ event: "command_signal_failed",
       message: error instanceof Error ? error.message : String(error) }));
+  }
+}
+
+export async function liveSignals(env) {
+  if (!env.COMMAND_SIGNAL) return new Set();
+  try {
+    const response = await signalStub(env).fetch("https://command-signal/live");
+    return new Set((await response.json()).connectors || []);
+  } catch (error) {
+    console.error(JSON.stringify({ event: "command_signal_live_failed",
+      message: error instanceof Error ? error.message : String(error) }));
+    return new Set();
   }
 }

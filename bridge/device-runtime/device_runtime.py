@@ -38,7 +38,8 @@ IMAGE_MIME = re.compile(r"^image/[a-z0-9.+-]{1,100}$", re.IGNORECASE)
 DEFAULT_OUTBOX_BYTES = 128 * 1024 * 1024
 MAX_DELIVERIES_PER_PASS = 5
 HEARTBEAT_MIN_INTERVAL = 30
-COMMAND_POLL_FALLBACK = 60
+HEARTBEAT_SIGNAL_INTERVAL = 600
+COMMAND_POLL_FALLBACK = 600
 ADAPTER_SCAN_TIMEOUT = 60
 ADAPTER_SEND_TIMEOUT = 130
 ADAPTER_FETCH_TIMEOUT = 180
@@ -372,8 +373,11 @@ class Relay:
         now = time.monotonic()
         if now < self.heartbeat_retry_at[connector_id]:
             return False
+        signal_thread = self.signals.get(connector_id)
+        # The Worker counts a live signal socket as presence, so heartbeats then only need to carry state changes.
+        interval = HEARTBEAT_SIGNAL_INTERVAL if signal_thread is not None and signal_thread.connected else HEARTBEAT_MIN_INTERVAL
         if (self.heartbeat_last_state[connector_id] == state and
-                now - self.heartbeat_last_sent[connector_id] < HEARTBEAT_MIN_INTERVAL):
+                now - self.heartbeat_last_sent[connector_id] < interval):
             return False
         self.select_connector(self.connector_by_id[connector_id])
         try:

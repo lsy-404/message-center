@@ -1,5 +1,5 @@
 import PostalMime from "postal-mime";
-import { openCommandSignal, signalCommand } from "./command-signal.js";
+import { liveSignals, openCommandSignal, signalCommand } from "./command-signal.js";
 import { evaluateMessageFilter, normalizeFilterSettings, parseFilterSettings } from "./message-filter.js";
 import { normalizeContactName, suggestContactMatches } from "./contacts.js";
 import { handleStickerPackRoute, stickerPackObjectKeys } from "./sticker-packs.js";
@@ -303,11 +303,13 @@ async function connectorRow(env, connectorId) {
 
 const CONNECTOR_STATES = new Set(["online", "offline", "degraded"]);
 
-function liveState(row) {
+// A device with a live signal socket heartbeats every 10 minutes instead of every 30 seconds.
+function liveState(row, live = new Set()) {
   const state = text(row?.state);
   if (!CONNECTOR_STATES.has(state)) return "offline";
   const seen = Date.parse(text(row.last_seen_at));
-  return Number.isFinite(seen) && Date.now() - seen <= 90_000 ? state : "offline";
+  const freshFor = live.has(row.id) ? 15 * 60_000 : 90_000;
+  return Number.isFinite(seen) && Date.now() - seen <= freshFor ? state : "offline";
 }
 
 function capabilitySet(row) { return new Set(safeJson(row.capabilities_json, [])); }
@@ -1958,10 +1960,11 @@ async function readInbox(env, selectedConversationId, selectedContactId) {
     ORDER BY COALESCE(p.is_pinned, 0) DESC, COALESCE(c.last_message_at, c.created_at) DESC LIMIT 512
   `).all();
   const desktops = nativeDesktops(env);
+  const live = await liveSignals(env);
   const connectors = (connectorsResult.results || []).map((row) => ({
     id: row.id, kind: row.kind, channelLabel: row.channel_label || row.kind,
     accountLabel: row.account_label, displayName: row.display_name,
-    note: row.note, mode: row.mode, state: liveState(row), capabilities: safeJson(row.capabilities_json, []),
+    note: row.note, mode: row.mode, state: liveState(row, live), capabilities: safeJson(row.capabilities_json, []),
     lastSeenAt: row.last_seen_at,
     native: Boolean(row.native_desktop && desktops.has(row.native_desktop)),
     nativeDesktop: row.native_desktop || null,
@@ -1978,7 +1981,7 @@ async function readInbox(env, selectedConversationId, selectedContactId) {
     avatarPath: row.avatar_object_key
       ? `/api/avatars/${encodeURIComponent(row.connector_id)}/${encodeURIComponent(row.external_id)}?v=${encodeURIComponent(row.avatar_sha256 || "")}` : null,
     lastMessagePreview: row.last_message_preview, lastMessageAt: row.last_message_at,
-    connectorState: liveState({ state: row.connector_state, last_seen_at: row.connector_last_seen }),
+    connectorState: liveState({ id: row.connector_id, state: row.connector_state, last_seen_at: row.connector_last_seen }, live),
     capabilities: safeJson(row.capabilities_json, []),
   }));
   const contacts = await readContacts(env);
@@ -3300,9 +3303,10 @@ async function agentTool(env, name, args) {
   }
   if (name === "connector_status") {
     const rows = await env.DB.prepare("SELECT * FROM connector_instances ORDER BY kind, display_name").all();
+    const live = await liveSignals(env);
     return { connectors: (rows.results || []).map((row) => ({ id: row.id, kind: row.kind,
       channelLabel: row.channel_label || row.kind,
-      accountLabel: row.account_label, displayName: row.display_name, note: row.note, state: liveState(row),
+      accountLabel: row.account_label, displayName: row.display_name, note: row.note, state: liveState(row, live),
       capabilities: safeJson(row.capabilities_json, []), lastSeenAt: row.last_seen_at,
       agentAccess: row.agent_access })) };
   }

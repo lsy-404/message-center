@@ -37,9 +37,11 @@ Use a real HTTPS origin and keep each bearer token private; the sample values ar
 
 ```json
 {
+  "docker": "/opt/homebrew/bin/docker",
   "profiles": {
     "wechat-a": {
       "desktopUrl": "http://127.0.0.1:13000",
+      "container": "selkies-wechat-a",
       "tokenFile": "~/.local/share/wechat-selkies/wechat-a/master-token",
       "readFolders": false,
       "outgoingDirectory": "~/.local/share/wechat-selkies/wechat-a/config/message-center-outgoing",
@@ -47,6 +49,7 @@ Use a real HTTPS origin and keep each bearer token private; the sample values ar
     },
     "qq-a": {
       "desktopUrl": "http://127.0.0.1:13001",
+      "container": "selkies-qq-a",
       "tokenFile": "~/.local/share/wechat-selkies/qq-a/master-token",
       "outgoingDirectory": "~/.local/share/wechat-selkies/qq-a/config/message-center-outgoing",
       "containerOutgoingDirectory": "/config/message-center-outgoing"
@@ -54,6 +57,8 @@ Use a real HTTPS origin and keep each bearer token private; the sample values ar
   }
 }
 ```
+
+The adapter reads windows, accessibility trees and screenshots through Pelorus at `desktopUrl`, and sends clicks, keys and text with `xdotool` inside `container` through `docker exec`, using the absolute `docker` path (launchd gives the runtime a minimal `PATH`): Pelorus pauses about a second after every action it performs, while `docker exec xdotool` takes about 0.1 second, and `xdotool type` enters CJK text and 「」 as they are.
 
 `outgoingDirectory` is a folder inside the container's mounted config volume and `containerOutgoingDirectory` is the same folder as the container sees it; files to send are copied there under their own names (recipients see them) and removed after a day. Without both, sends with files are refused before anything is sent. `tokenFile` holds the container's Selkies master token (`SELKIES_MASTER_TOKEN`), which the adapter sends as `Authorization: Bearer`; it stays outside the repository. The runtime starts the adapter directly, so keep it executable (`chmod 755 selkies_adapter.py`). Run one container per client account (`AUTO_START_WECHAT` / `AUTO_START_QQ` pick the client), so each desktop has one client to restore, maximize and read, and a second account is one more container. A container costs about 0.3 GB for the desktop and streaming stack (with audio, printing and the TURN server turned off as below) plus 0.4–1 GB for its client, which grows the longer it runs. The adapter keeps each profile's chat names and recent sends, and nothing else, in `selkies_adapter.<profile>.state.json` beside itself (mode `0600`), so two accounts in the same group do not take each other's messages for their own.
 
@@ -112,7 +117,7 @@ A scan may also return `conversationProfiles`, with at most 20 entries. Each ent
 - It opens the chat: WeChat by scrolling the chat list (or 折叠的聊天) to the row and clicking it once two reads agree, QQ through the search box, whose results do not reorder.
 - It checks that the input box belongs to that chat and holds no draft.
 - Each file goes in first, one at a time, through the client's own file picker: WeChat's 发送文件 (images arrive as 图片, GIFs as 动画表情), QQ's 图片 button for images (or 文件 where the chat has none, such as 我的手机) and 文件 for other files, whose confirmation must name the chat and the file before the adapter presses 发送(n). After sending, it waits up to 90 seconds for the file to appear as the last message (QQ files: until they show 已发送).
-- Then it types the text (new lines with Shift+Enter; 「 and 」 are pressed as keysyms because typing them produces 〈〉) and reads the input back; any mismatch clears the input and refuses with `dispatched: false`, or, once a file already went out, reports an uncertain result.
+- Then it types the text (new lines with Shift+Enter) and reads the input back; any mismatch clears the input and refuses with `dispatched: false`, or, once a file already went out, reports an uncertain result.
 - It sends (WeChat with Enter, QQ with the 发送 button), then waits until the input is empty and the last message in the chat equals the text. Only then does it answer with a receipt. A result it cannot confirm carries no `dispatched: false`, so the runtime records it as uncertain for manual review and never sends it again.
 - The next scans recognise the chat-list preview of a message the adapter just sent and do not report it as an incoming message; the outbound message already exists in Message Center.
 
@@ -127,6 +132,6 @@ It answers `{"ok":true,"attachment":{externalId,fileName,mimeType,sizeBytes,sha2
 
 ## Runtime limits
 
-The single process scans configured profiles sequentially, one page of at most 20 messages each, every 2 seconds while a page reports `more`, 5 seconds while `active`, and 300 seconds otherwise; each connector that can send also keeps a WebSocket open to `/api/connectors/signal` (`command_signal.py`, standard library only, a `ping` every 30 seconds). The Worker's `CommandSignal` Durable Object holds these sockets hibernated and writes `command` to a connector's sockets when a command is queued for it; the runtime then leases it at once over the usual HTTP route. While a socket is connected the runtime still polls each connector every 60 seconds in case a signal was lost, and every pass (about 5 seconds) while it is not. A failed scan marks the source offline and backs off with bounded exponential delay up to 300 seconds. Normal event responses with `suppressed > 0` do not acknowledge or remove the outbox record. The outbox has a byte ceiling; pending records are drained before new scans, and a full queue stops collection so the source cursor cannot move past unspooled messages. Delivery rotates fairly across connectors and removes a record only after a successful Worker response. A failed connector is skipped while other connectors continue draining.
+The single process scans configured profiles sequentially, one page of at most 20 messages each, every 2 seconds while a page reports `more`, 5 seconds while `active`, and 300 seconds otherwise; each connector that can send also keeps a WebSocket open to `/api/connectors/signal` (`command_signal.py`, standard library only, a `ping` every 60 seconds, under the edge's 100-second idle limit). The Worker's `CommandSignal` Durable Object holds these sockets hibernated and writes `command` to a connector's sockets when a command is queued for it; the runtime then leases it at once over the usual HTTP route. While a socket is connected the runtime polls each connector every 10 minutes in case a signal was lost and sends its heartbeat every 10 minutes or on a state change, since the Worker counts a socket that answered a ping within 150 seconds as presence (a connector then stays online for 15 minutes after its last heartbeat instead of 90 seconds). Without a socket it polls on every pass (about 5 seconds) and heartbeats every 30 seconds. A failed scan marks the source offline and backs off with bounded exponential delay up to 300 seconds. Normal event responses with `suppressed > 0` do not acknowledge or remove the outbox record. The outbox has a byte ceiling; pending records are drained before new scans, and a full queue stops collection so the source cursor cannot move past unspooled messages. Delivery rotates fairly across connectors and removes a record only after a successful Worker response. A failed connector is skipped while other connectors continue draining.
 
 An optional macOS launchd sample is provided in `launchd.plist.example`; replace every placeholder path before enabling it. It keeps `/usr/bin/python3 device_runtime.py <config>` running. This package does not install or activate a background service automatically.
