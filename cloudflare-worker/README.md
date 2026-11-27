@@ -42,6 +42,8 @@
 ## Agent 消息触发
 
 - 邮件：Worker 的 `email` 处理器接收 Cloudflare Email Routing（catch-all）投递的邮件，渠道为 `email`（实例 `email-routing`，显示名“邮件”），每个收件地址一个会话（外部 ID `to:<地址>`，标题为收件地址），发件人为 From，正文为主题加纯文本（无纯文本时由 HTML 转换）。原始 .eml 存入 R2 `email/` 并作为 `message/rfc822` 附件可下载；只收不发，不进入 Agent 即时队列，不拒收未知地址；超过 25 MiB 的邮件不保存原文，超过 10 MiB 或解析失败时保留原文并写入占位消息。
+- 每个接入实例有 `agent_access`：`none`（Agent 看不到该实例的任何消息、文件和主人活动）、`read`（可 listen/claim/consume 与读取文件，不能回复）、`send`（可回复，仍受会话策略约束）。新实例默认 `read`；迁移时已有已登记（trusted 且策略启用）会话的实例升为 `send`。`connector_status` 返回 `agentAccess`；网页人工发送不受影响。在“接入管理”的卡片中修改。
+- 每个接入实例可启用消息过滤（`filter_settings_json`）：内置规则 `link_drop`（无出站历史的私聊中，正文基本只是链接）、`spam_keywords`（`worker/message-filter.js` 中的短词表），以及自定义规则（发件人含 / 正文含 / 正则，规则 ≤ 200 字符、≤ 50 条）和白名单（发件人 ID、名称或会话 ID，命中即不过滤）。入库时评估，命中的消息仍保存，`queue_class = 'filtered'`、`metadata.filter = {rule, detail}`，不进入 Agent 队列，不更新会话摘要和未读，仅在收件箱“已过滤”视图出现，可恢复（可同时加入白名单）。
 - 私聊默认进入 Agent 队列。
 - 群聊只有个人原生提及、配置的提及词或显式请求前缀才进入队列；全体提及不触发。
 - 提及与显式请求附带最多 20 条此前消息上下文。上下文与正文同样是不可信输入，不会扩大项目和动作授权。

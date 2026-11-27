@@ -1152,6 +1152,158 @@ def send(request, config):
     return {"ok": False, "error": "send_unverified"}
 
 
+def png_encode(rows, width, bpp):
+    """An 8-bit PNG (RGB or RGBA) from raw rows, unfiltered."""
+    def chunk(kind, data):
+        return len(data).to_bytes(4, "big") + kind + data + (zlib.crc32(kind + data) & 0xffffffff).to_bytes(4, "big")
+    header = width.to_bytes(4, "big") + len(rows).to_bytes(4, "big") + bytes([8, 6 if bpp == 4 else 2, 0, 0, 0])
+    raw = b"".join(b"\x00" + row for row in rows)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b"")
+
+
+def crop_window(desktop, window_id, bounds):
+    """PNG bytes of the screen rectangle `bounds` inside the window, cut from a screenshot."""
+    png, (left, top, scale) = desktop.screenshot(window_id)
+    x0, y0 = max(0, int((bounds["x"] - left) * scale)), max(0, int((bounds["y"] - top) * scale))
+    x1, y1 = int((bounds["x"] + bounds["w"] - left) * scale), int((bounds["y"] + bounds["h"] - top) * scale)
+    rows, bpp = png_left_columns(png, x1)
+    y1 = min(y1, len(rows))
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        raise AdapterError("media_not_visible")
+    return png_encode([row[x0 * bpp:x1 * bpp] for row in rows[y0:y1]], x1 - x0, bpp)
+
+
+def stage_media(request, data, file_name, mime_type):
+    """Writes fetched bytes under the runtime's media directory and returns the attachment entry for them."""
+    directory = request.get("mediaDirectory")
+    if not isinstance(directory, str) or not os.path.isdir(directory):
+        raise AdapterError("media_directory_missing")
+    if len(data) > int(request.get("maxMediaBytes") or 0):
+        raise AdapterError("media_too_large")
+    sha256 = hashlib.sha256(data).hexdigest()
+    key = "fetch-{}-{}".format(sha256[:24], secrets.token_hex(4))
+    descriptor, temporary = tempfile.mkstemp(prefix=".fetch-", dir=directory)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(data)
+    os.replace(temporary, os.path.join(directory, key))
+    return {"externalId": "{}:{}".format(request.get("profile"), sha256), "fileName": file_name,
+            "mimeType": mime_type, "sizeBytes": len(data), "sha256": sha256, "stagingKey": key}
+
+
+def media_nodes(driver, tree, kind, file_name):
+    """On-screen message elements of `kind` in the open chat, oldest first."""
+    if driver == "wechat":
+        messages = find(tree, lambda n: n.get("role") == "list" and n.get("name") == "消息")
+        items = [n for n in (messages.get("children") or []) if n.get("role") == "list item" and n.get("bounds")] \
+            if messages else []
+        if kind == "file":
+            return [n for n in items if (n.get("name") or "").startswith("文件\n" + file_name + "\n")]
+        found = []
+        for item in items:
+            if item.get("name") in ("图片", "动画表情"):
+                image = find(item, lambda n: n is not item and n.get("role") == "image" and n.get("bounds"))
+                found.append(image or item)
+        return found
+    messages = find(tree, lambda n: n.get("name") == "消息列表")
+    if messages is None:
+        return []
+    if kind == "file":
+        return [n for n in walk(messages) if n.get("role") == "paragraph" and n.get("bounds")
+                and "".join(text_of(c) for c in walk(n) if c is not n) == file_name]
+    return [n for n in walk(messages) if n.get("role") == "image" and n.get("bounds")
+            and n["bounds"]["w"] >= 24 and n["bounds"]["h"] >= 24]
+
+
+def save_file_as(desktop, driver, window_id, node, entry, file_name):
+    """Saves a file message through its context menu's 另存为 into the outgoing folder; returns the host path."""
+    host = os.path.expanduser(str(entry.get("outgoingDirectory") or ""))
+    inside = str(entry.get("containerOutgoingDirectory") or "").rstrip("/")
+    if not host or not os.path.isabs(host) or not inside.startswith("/"):
+        raise AdapterError("attachments_unconfigured")
+    folder = "fetch-" + secrets.token_hex(6)
+    os.makedirs(os.path.join(host, folder), mode=0o777)
+    os.chmod(os.path.join(host, folder), 0o777)
+    bounds = node["bounds"]
+    before = set(dialog_windows(desktop))
+    desktop.tool("click", at=[int(bounds["x"] + bounds["w"] / 2), int(bounds["y"] + bounds["h"] / 2)], button="right")
+    time.sleep(0.8)
+    # Only this exact item is ever clicked; the same menu holds 撤回 and 删除.
+    ref = desktop.ref(window_id, r'menu item "另存为(\.\.\.|…)?"')
+    if not ref:
+        desktop.park_pointer(window_id)
+        desktop.tool("click", at=[int(bounds["x"] + bounds["w"] / 2), 18])
+        raise AdapterError("save_menu_missing")
+    desktop.tool("click", ref=ref)
+    dialog = None
+    for _ in range(10):
+        time.sleep(0.5)
+        opened = [key for key in dialog_windows(desktop) if key not in before]
+        if opened:
+            dialog = opened[0]
+            break
+    if dialog is None:
+        raise AdapterError("file_dialog_missing")
+    target = "{}/{}/{}".format(inside, folder, file_name)
+    if driver == "wechat":
+        field = desktop.ref(dialog, r'text "文件名')
+        if field:
+            desktop.tool("click", ref=field)
+    else:
+        desktop.activate(dialog)
+    clear_input(desktop)
+    type_chars(desktop, target)
+    desktop.tool("key", keys="Return")
+    path = os.path.join(host, folder, file_name)
+    previous = -1
+    for _ in range(120):
+        time.sleep(0.5)
+        if dialog in dialog_windows(desktop) and _ == 10:
+            desktop.tool("window", action="close", window=dialog)
+            raise AdapterError("file_not_saved")
+        if os.path.isfile(path):
+            size = os.path.getsize(path)
+            if size > 0 and size == previous:
+                return path
+            previous = size
+    raise AdapterError("file_not_saved")
+
+
+def fetch(request, config):
+    """Fetches the last on-screen image, sticker or named file of a chat (opening it, which marks it read) and stages
+    it for upload. Images and stickers are cut from a screenshot; files are saved through the client's 另存为."""
+    driver, kind = request.get("driver"), request.get("kind")
+    file_name = request.get("fileName") if isinstance(request.get("fileName"), str) else ""
+    if driver not in APPS or kind not in ("image", "file") or (kind == "file" and not SAFE_FILE_NAME.match(file_name)):
+        return {"ok": False, "error": "invalid_fetch"}
+    try:
+        desktop, entry = container(config, request.get("profile"))
+        state = load_state(request.get("profile"))
+        target = state["conversations"].get(request.get("conversationExternalId"))
+        if not target:
+            return {"ok": False, "error": "conversation_unknown"}
+        window_id, tree = open_client(desktop, driver)
+        desktop.activate(window_id)
+        tree = open_conversation(desktop, driver, window_id, tree, target["name"], bool(target.get("folder")))
+        desktop.park_pointer(window_id)
+        time.sleep(0.5)
+        nodes = media_nodes(driver, desktop.tree(window_id), kind, file_name)
+        if not nodes:
+            return {"ok": False, "error": "media_not_visible"}
+        if kind == "image":
+            data, name, mime = crop_window(desktop, window_id, nodes[-1]["bounds"]), "image.png", "image/png"
+        else:
+            path = save_file_as(desktop, driver, window_id, nodes[-1], entry, file_name)
+            with open(path, "rb") as handle:
+                data = handle.read()
+            shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+            name, mime = file_name, "application/octet-stream"
+        return {"ok": True, "attachment": stage_media(request, data, name, mime)}
+    except AdapterError as error:
+        return {"ok": False, "error": str(error)}
+    except OSError:
+        return {"ok": False, "error": "media_staging_failed"}
+
+
 def handle(request):
     operation = request.get("op") if isinstance(request, dict) else None
     try:
@@ -1162,6 +1314,8 @@ def handle(request):
         return {"ok": False, "sourceReadStatus": "failed", "error": str(error)}
     if operation == "send":
         return send(request, config)
+    if operation == "fetch":
+        return fetch(request, config)
     if operation != "scan":
         return {"ok": False, "error": "operation_unsupported"}
     try:

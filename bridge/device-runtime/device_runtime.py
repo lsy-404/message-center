@@ -38,6 +38,7 @@ MAX_DELIVERIES_PER_PASS = 5
 HEARTBEAT_MIN_INTERVAL = 30
 ADAPTER_SCAN_TIMEOUT = 60
 ADAPTER_SEND_TIMEOUT = 130
+ADAPTER_FETCH_TIMEOUT = 180
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -231,6 +232,8 @@ def adapter_timeout_for_request(request):
     if operation == "send":
         # Each file goes through the client's picker and upload before the next one.
         return ADAPTER_SEND_TIMEOUT + 120 * len(request.get("attachments") or [])
+    if operation == "fetch":
+        return ADAPTER_FETCH_TIMEOUT
     raise ValueError("unsupported_adapter_operation")
 
 
@@ -665,7 +668,7 @@ class Relay:
         self.scan_interval[self.connector] = 15 if result.get("more") is True else (60 if active else 300)
         return result.get("health") == "online"
 
-    def validate_staged_attachment(self, attachment):
+    def validate_staged_attachment(self, attachment, any_type=False):
         if not isinstance(attachment, dict):
             raise RuntimeError("invalid_attachment")
         key = attachment.get("stagingKey")
@@ -679,7 +682,7 @@ class Relay:
         if (not isinstance(external_id, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._:-]{0,199}", external_id) or
                 not isinstance(file_name, str) or not file_name or len(file_name) > 255 or
                 any(ord(character) < 32 or ord(character) == 127 for character in file_name) or
-                not isinstance(mime_type, str) or not IMAGE_MIME.fullmatch(mime_type) or
+                not isinstance(mime_type, str) or not (IMAGE_MIME.fullmatch(mime_type) or (any_type and mime_type == "application/octet-stream")) or
                 not isinstance(size, int) or isinstance(size, bool) or size < 1 or size > MAX_ATTACHMENT_BYTES or
                 not isinstance(expected_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", expected_hash)):
             raise RuntimeError("invalid_attachment_metadata")
@@ -802,7 +805,42 @@ class Relay:
         self.http_call("POST", "/api/connectors/commands/" + urllib.parse.quote(command["id"], safe="") + "/complete",
                        {"connectorId": self.connector, "leaseToken": command["leaseToken"], **result})
 
+    def fetch_media(self, command, profile):
+        """Runs an owner-requested fetch of a chat's image or file and uploads it for the target message. Fetching
+        sends nothing, so a failure is final and never ambiguous."""
+        payload = command.get("payload") or {}
+        try:
+            self.http_call("POST", "/api/connectors/commands/" + urllib.parse.quote(command["id"], safe="") + "/lease",
+                           {"connectorId": self.connector, "leaseToken": command["leaseToken"]})
+        except Exception:
+            return False
+        outcome = {"ok": False, "error": "fetch_failed"}
+        try:
+            connector = self.connector_by_id[self.connector]
+            result = self.adapter_call({
+                "op": "fetch", "driver": connector.get("kind"), "profile": profile,
+                "conversationExternalId": payload.get("externalConversationId"),
+                "kind": payload.get("kind"), "fileName": payload.get("fileName"),
+                "mediaDirectory": self.media_directory_for(self.connector),
+                "maxMediaBytes": MAX_ATTACHMENT_BYTES})
+            if result.get("ok") is True:
+                attachment = self.validate_staged_attachment(result.get("attachment"), any_type=True)
+                self.upload_attachment({"conversationExternalId": payload.get("externalConversationId")}, attachment)
+                outcome = {"ok": True, "result": {"attachment": {key: value for key, value in attachment.items()
+                                                                 if key != "stagingKey"}}}
+                try:
+                    os.unlink(os.path.join(self.media_directory_for(self.connector), attachment["stagingKey"]))
+                except OSError:
+                    pass
+            else:
+                outcome = {"ok": False, "error": str(result.get("error", "fetch_failed"))[:100]}
+        except Exception as error:
+            outcome = {"ok": False, "error": str(error)[:100] or "fetch_failed"}
+        self.complete(command, outcome)
+
     def process_command(self, command, profile):
+        if command.get("kind") == "fetch_media":
+            return self.fetch_media(command, profile)
         key = command.get("idempotencyKey")
         if not key:
             self.complete(command, {"ok": False, "error": "invalid_idempotency_key"})
@@ -949,7 +987,8 @@ class Relay:
             try:
                 capabilities = ["receive_text", "receive_images"]
                 if connector.get("receiveOnly") is not True:
-                    capabilities.extend(["send_text", "send_files", "send_images"])
+                    # Files arrive only through owner-requested fetches, which are commands.
+                    capabilities.extend(["send_text", "send_files", "send_images", "receive_files"])
                 payload = {
                     "id": connector["id"], "kind": connector["kind"],
                     "accountLabel": connector["accountLabel"], "displayName": connector["displayName"],

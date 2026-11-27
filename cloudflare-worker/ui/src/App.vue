@@ -40,6 +40,33 @@ import { parseMessageBody, previewText, type CardKind, type MediaKind, type Mone
 
 type ConnectorState = 'online' | 'offline' | 'degraded'
 
+type AgentAccess = 'none' | 'read' | 'send'
+
+type FilterRule = { type: 'sender' | 'body' | 'regex', pattern: string }
+
+type FilterSettings = {
+  enabled: boolean
+  linkDrop: boolean
+  spamKeywords: boolean
+  customRules: FilterRule[]
+  allowlist: string[]
+}
+
+type FilterDraft = Omit<FilterSettings, 'allowlist'> & { allowlistText: string, dirty: boolean }
+
+type FilteredMessage = {
+  id: string
+  connectorId: string
+  channelLabel: string
+  accountLabel: string
+  conversationTitle: string
+  senderName: string
+  body: string
+  occurredAt: string
+  rule: string
+  detail: string
+}
+
 type Connector = {
   id: string
   kind: string
@@ -52,6 +79,8 @@ type Connector = {
   lastSeenAt?: string | null
   native: boolean
   nativeDesktop: string | null
+  agentAccess: AgentAccess
+  filter: FilterSettings
 }
 
 type Conversation = {
@@ -117,6 +146,7 @@ type Snapshot = {
   conversations: Conversation[]
   messages: Message[]
   selectedConversationId: string | null
+  filteredCount: number
 }
 
 type StagedAttachment = Attachment & { sha256?: string }
@@ -134,7 +164,7 @@ type MessageScrollState = {
   anchorOffset: number
 }
 
-const emptySnapshot = (): Snapshot => ({ connectors: [], conversations: [], messages: [], selectedConversationId: null })
+const emptySnapshot = (): Snapshot => ({ connectors: [], conversations: [], messages: [], selectedConversationId: null, filteredCount: 0 })
 const snapshot = ref<Snapshot>(emptySnapshot())
 const selectedId = ref('')
 const activeFilter = ref('all')
@@ -147,6 +177,11 @@ const nowTick = ref(Date.now())
 const conversationPage = ref(0)
 const conversationListElement = ref<HTMLElement | null>(null)
 const showInstances = ref(false)
+const showFiltered = ref(false)
+const filteredMessages = ref<FilteredMessage[]>([])
+const filteredLoading = ref(false)
+const filterDrafts = ref<Record<string, FilterDraft>>({})
+const overlayPane = computed(() => showInstances.value || showFiltered.value)
 const mobileThread = ref(false)
 const loading = ref(true)
 const detailLoading = ref(false)
@@ -693,7 +728,8 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
 }
 
 function sameInbox(left: Snapshot, right: Snapshot) {
-  if (left.selectedConversationId !== right.selectedConversationId) return false
+  if (left.selectedConversationId !== right.selectedConversationId
+      || left.filteredCount !== right.filteredCount) return false
   if (left.connectors.length !== right.connectors.length
       || left.conversations.length !== right.conversations.length
       || left.messages.length !== right.messages.length) return false
@@ -703,6 +739,7 @@ function sameInbox(left: Snapshot, right: Snapshot) {
     if (a.id !== b.id || a.accountLabel !== b.accountLabel || a.displayName !== b.displayName
         || a.channelLabel !== b.channelLabel || a.mode !== b.mode || a.state !== b.state
         || a.lastSeenAt !== b.lastSeenAt || a.native !== b.native || a.nativeDesktop !== b.nativeDesktop
+        || a.agentAccess !== b.agentAccess || JSON.stringify(a.filter) !== JSON.stringify(b.filter)
         || a.capabilities.length !== b.capabilities.length
         || a.capabilities.some((value, itemIndex) => value !== b.capabilities[itemIndex])) return false
   }
@@ -934,8 +971,163 @@ function applyConversationSelection(conversations: Conversation[]) {
 
 function showConnectorManagement() {
   showInstances.value = true
+  showFiltered.value = false
   mobileThread.value = false
 }
+
+const FILTER_RULE_LABELS: Record<string, string> = {
+  link_drop: '仅含链接',
+  spam_keywords: '垃圾关键词',
+  custom_sender: '发件人含',
+  custom_body: '正文含',
+  custom_regex: '正则',
+}
+
+const FILTER_ERRORS: Record<string, string> = {
+  invalid_filter_rule: '规则无效：正则有误、过长或存在回溯风险',
+  invalid_filter_allowlist: '白名单无效',
+}
+
+function filterRuleLabel(message: FilteredMessage) {
+  const label = FILTER_RULE_LABELS[message.rule] || '已过滤'
+  return message.rule === 'link_drop' || !message.detail ? label : `${label}：${message.detail}`
+}
+
+function seedFilterDraft(settings: FilterSettings): FilterDraft {
+  return {
+    enabled: settings.enabled,
+    linkDrop: settings.linkDrop,
+    spamKeywords: settings.spamKeywords,
+    customRules: settings.customRules.map((rule) => ({ ...rule })),
+    allowlistText: settings.allowlist.join('\n'),
+    dirty: false,
+  }
+}
+
+watch(() => snapshot.value.connectors, (connectors) => {
+  for (const connector of connectors) {
+    const draft = filterDrafts.value[connector.id]
+    if (!draft || !draft.dirty) filterDrafts.value[connector.id] = seedFilterDraft(connector.filter)
+  }
+}, { immediate: true })
+
+async function saveConnectorSettings(connector: Connector, patch: { agentAccess?: AgentAccess, filter?: FilterSettings }) {
+  try {
+    await api(`/api/connectors/${encodeURIComponent(connector.id)}/settings`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(patch),
+    })
+    return true
+  } catch (error) {
+    const code = error instanceof Error ? error.message : String(error)
+    notify(`保存失败：${FILTER_ERRORS[code] || code}`)
+    return false
+  }
+}
+
+async function setAgentAccess(connector: Connector, event: Event) {
+  const agentAccess = (event.target as HTMLSelectElement).value as AgentAccess
+  if (await saveConnectorSettings(connector, { agentAccess })) await refreshNow()
+  else (event.target as HTMLSelectElement).value = connector.agentAccess
+}
+
+function addFilterRule(draft: FilterDraft) {
+  draft.customRules.push({ type: 'body', pattern: '' })
+  draft.dirty = true
+}
+
+function removeFilterRule(draft: FilterDraft, index: number) {
+  draft.customRules.splice(index, 1)
+  draft.dirty = true
+}
+
+async function saveFilter(connector: Connector) {
+  const draft = filterDrafts.value[connector.id]
+  if (!draft) return
+  const filter: FilterSettings = {
+    enabled: draft.enabled,
+    linkDrop: draft.linkDrop,
+    spamKeywords: draft.spamKeywords,
+    customRules: draft.customRules
+      .map((rule) => ({ type: rule.type, pattern: rule.pattern.trim() }))
+      .filter((rule) => rule.pattern),
+    allowlist: draft.allowlistText.split('\n').map((line) => line.trim()).filter(Boolean),
+  }
+  if (!await saveConnectorSettings(connector, { filter })) return
+  draft.dirty = false
+  notify('已保存')
+  await refreshNow()
+}
+
+async function loadFiltered() {
+  filteredLoading.value = true
+  try {
+    const body = await api<{ messages: FilteredMessage[] }>('/api/filtered')
+    filteredMessages.value = body.messages
+  } catch (error) {
+    notify(`加载失败：${error instanceof Error ? error.message : String(error)}`)
+  } finally {
+    filteredLoading.value = false
+  }
+}
+
+function showFilteredView() {
+  showInfoView()
+  showInstances.value = false
+  showFiltered.value = true
+  mobileThread.value = false
+  void loadFiltered()
+}
+
+const fetchingMessageIds = ref(new Set<string>())
+
+function canFetchMedia(message: Message, kind: string) {
+  const conversation = selectedConversation.value
+  if (message.direction !== 'inbound' || message.attachments.length || !conversation) return false
+  if (!['image', 'sticker', 'file'].includes(kind)) return false
+  if (selectedConversationConnector.value?.mode !== 'device_relay' || !connectorReachable.value) return false
+  return conversation.capabilities.includes(kind === 'file' ? 'receive_files' : 'receive_images')
+}
+
+async function fetchMedia(message: Message) {
+  fetchingMessageIds.value = new Set([...fetchingMessageIds.value, message.id])
+  try {
+    await api(`/api/messages/${encodeURIComponent(message.id)}/fetch-media`, { method: 'POST' })
+    notify('已请求取回，完成后会出现在这条消息下')
+    // A failed fetch leaves no trace in the thread, so the button comes back after the adapter's time limit.
+    window.setTimeout(() => {
+      const next = new Set(fetchingMessageIds.value)
+      next.delete(message.id)
+      fetchingMessageIds.value = next
+    }, 200_000)
+  } catch (error) {
+    const code = error instanceof Error ? error.message : String(error)
+    notify(code === 'media_not_latest' ? '只能取回这个会话里最新的一条同类消息' : `取回失败：${code}`)
+    const next = new Set(fetchingMessageIds.value)
+    next.delete(message.id)
+    fetchingMessageIds.value = next
+  }
+}
+
+async function restoreFiltered(message: FilteredMessage, allowlist: boolean) {
+  try {
+    await api(`/api/messages/${encodeURIComponent(message.id)}/restore`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ allowlist }),
+    })
+    filteredMessages.value = filteredMessages.value.filter((item) => item.id !== message.id)
+    notify(allowlist ? '已恢复并加入白名单' : '已恢复')
+    await refreshNow()
+  } catch (error) {
+    notify(`恢复失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+watch(() => snapshot.value.filteredCount, () => {
+  if (showFiltered.value) void loadFiltered()
+})
 
 const VIEW_MODE_KEY = 'message-center:view-mode'
 const NATIVE_DESKTOP_KEY = 'message-center:native-desktop'
@@ -959,6 +1151,7 @@ const nativeDesktopKey = ref(readStored(NATIVE_DESKTOP_KEY))
 
 function showInfoView() {
   viewMode.value = 'info'
+  showFiltered.value = false
   writeStored(VIEW_MODE_KEY, 'info')
 }
 
@@ -970,6 +1163,7 @@ function showNativeView(connector?: Connector | null) {
   viewMode.value = 'native'
   writeStored(VIEW_MODE_KEY, 'native')
   showInstances.value = false
+  showFiltered.value = false
   mobileThread.value = false
 }
 
@@ -1232,7 +1426,7 @@ onUnmounted(() => {
 
 <template>
   <FluentTheme mode="system">
-  <main class="mc-shell" :class="{ 'is-thread-open': mobileThread, 'is-instances-open': showInstances }">
+  <main class="mc-shell" :class="{ 'is-thread-open': mobileThread, 'is-instances-open': overlayPane }">
     <aside class="nav-pane" aria-label="导航">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true"><AppIcon name="brand" :size="18" /></span>
@@ -1254,10 +1448,10 @@ onUnmounted(() => {
             v-for="filter in filters"
             :key="filter.id"
             class="nav-item"
-            :class="{ active: activeFilter === filter.id && !showInstances && !nativeViewActive }"
+            :class="{ active: activeFilter === filter.id && !overlayPane && !nativeViewActive }"
             type="button"
             :title="filter.label"
-            :aria-current="activeFilter === filter.id && !showInstances && !nativeViewActive ? 'page' : undefined"
+            :aria-current="activeFilter === filter.id && !overlayPane && !nativeViewActive ? 'page' : undefined"
             :data-channel="filter.channel || undefined"
             :data-unread-count="filter.unread"
             @click="selectFilter(filter.id)"
@@ -1275,6 +1469,19 @@ onUnmounted(() => {
             <span v-if="filter.unread" class="nav-count is-unread" aria-hidden="true">{{ filter.unread > 99 ? '99+' : filter.unread }}</span>
             <span v-else class="nav-count" aria-hidden="true">{{ filter.count }}</span>
             <span class="sr-only">，{{ filter.count }} 个会话，{{ filter.unread }} 条未读</span>
+          </button>
+          <button
+            class="nav-item"
+            :class="{ active: showFiltered }"
+            type="button"
+            title="已过滤"
+            :aria-current="showFiltered ? 'page' : undefined"
+            @click="showFilteredView"
+          >
+            <span class="nav-glyph is-system" aria-hidden="true"><AppIcon name="filter" :size="16" /></span>
+            <span class="nav-copy">已过滤</span>
+            <span class="nav-count" aria-hidden="true">{{ snapshot.filteredCount }}</span>
+            <span class="sr-only">，{{ snapshot.filteredCount }} 条</span>
           </button>
         </div>
 
@@ -1312,7 +1519,7 @@ onUnmounted(() => {
       </div>
     </aside>
 
-    <section v-if="nativeViewActive && !showInstances" class="native-pane" aria-label="原生桌面">
+    <section v-if="nativeViewActive && !overlayPane" class="native-pane" aria-label="原生桌面">
       <header class="thread-header native-header">
         <div class="segmented native-tabs" role="tablist" aria-label="原生桌面">
           <button
@@ -1338,7 +1545,7 @@ onUnmounted(() => {
       />
     </section>
 
-    <section v-if="!showInstances && !nativeViewActive" class="conversation-pane" aria-label="会话列表">
+    <section v-if="!overlayPane && !nativeViewActive" class="conversation-pane" aria-label="会话列表">
       <header class="pane-header">
         <div class="pane-title">
           <h1>{{ conversationListTitle }}</h1>
@@ -1507,7 +1714,7 @@ onUnmounted(() => {
       </div>
     </section>
 
-    <section v-if="!showInstances && !nativeViewActive" class="content-pane" aria-label="会话详情">
+    <section v-if="!overlayPane && !nativeViewActive" class="content-pane" aria-label="会话详情">
       <template v-if="selectedConversation">
         <header class="thread-header">
           <button class="quiet-button mobile-back" type="button" aria-label="返回收件箱" title="返回收件箱" @click="mobileThread = false">
@@ -1645,7 +1852,17 @@ onUnmounted(() => {
                       <span class="money-foot">{{ block.label }}<template v-if="block.status"> · {{ block.status }}</template></span>
                     </div>
                     <p v-else-if="block.type === 'notice'" class="block-notice" data-block="notice"><AppIcon name="handWave" :size="14" />{{ block.text }}</p>
-                    <span v-else class="block-media" data-block="media" :data-media-kind="block.kind"><AppIcon :name="MEDIA_ICONS[block.kind]" :size="14" />{{ block.label }}</span>
+                    <span v-else class="block-media" data-block="media" :data-media-kind="block.kind">
+                      <AppIcon :name="MEDIA_ICONS[block.kind]" :size="14" />{{ block.label }}
+                      <button
+                        v-if="canFetchMedia(entry.message, block.kind)"
+                        type="button"
+                        class="media-fetch"
+                        :disabled="fetchingMessageIds.has(entry.message.id)"
+                        title="打开原会话取回内容，会把该会话标为已读"
+                        @click="fetchMedia(entry.message)"
+                      >{{ fetchingMessageIds.has(entry.message.id) ? '取回中' : '取回' }}</button>
+                    </span>
                   </template>
                   <div v-for="file in entry.message.attachments" :key="file.id" class="attachment">
                     <img
@@ -1781,6 +1998,38 @@ onUnmounted(() => {
       </div>
     </section>
 
+    <section v-if="showFiltered" class="instances-pane" aria-label="已过滤">
+      <header class="instances-header">
+        <button class="quiet-button" type="button" aria-label="返回收件箱" title="返回收件箱" @click="showFiltered = false">
+          <AppIcon name="back" :size="18" />
+        </button>
+        <div>
+          <h1>已过滤</h1>
+          <p>{{ snapshot.filteredCount }} 条消息被规则拦下，不进入收件箱和 AI 队列</p>
+        </div>
+      </header>
+      <ul class="filtered-list">
+        <li v-for="message in filteredMessages" :key="message.id" class="filtered-item">
+          <div class="filtered-head">
+            <strong>{{ message.senderName }}</strong>
+            <span class="channel-tag channel-tone" :class="`tone-${channelTone(normalizeChannelLabel(message.channelLabel))}`">{{ normalizeChannelLabel(message.channelLabel) }}</span>
+            <span class="filtered-rule">{{ filterRuleLabel(message) }}</span>
+            <time :datetime="isoTime(message.occurredAt)" :title="formatFullStamp(message.occurredAt)">{{ relativeAge(message.occurredAt) }}</time>
+          </div>
+          <p class="filtered-body">{{ message.body }}</p>
+          <div class="filtered-actions">
+            <FluentButton type="button" tone="subtle" @click="restoreFiltered(message, false)">恢复</FluentButton>
+            <FluentButton type="button" tone="subtle" @click="restoreFiltered(message, true)">恢复并加入白名单</FluentButton>
+          </div>
+        </li>
+      </ul>
+      <div v-if="!filteredMessages.length && !filteredLoading" class="empty-state">
+        <span class="empty-glyph"><AppIcon name="filter" :size="22" /></span>
+        <p>没有被过滤的消息</p>
+      </div>
+      <div v-if="filteredLoading && !filteredMessages.length" class="loading-state"><span class="spinner" />正在载入</div>
+    </section>
+
     <section v-if="showInstances" class="instances-pane" aria-label="接入管理">
       <header class="instances-header">
         <button class="quiet-button" type="button" aria-label="返回收件箱" title="返回收件箱" @click="showInstances = false">
@@ -1836,6 +2085,36 @@ onUnmounted(() => {
               <span v-if="!connector.capabilities.length" class="capability-chip">未声明</span>
             </dd>
           </dl>
+          <div class="instance-settings">
+            <label class="setting-row">
+              <span>AI 权限</span>
+              <select :value="connector.agentAccess" @change="setAgentAccess(connector, $event)">
+                <option value="none">不可见</option>
+                <option value="read">只读</option>
+                <option value="send">可发送</option>
+              </select>
+            </label>
+            <details v-if="filterDrafts[connector.id]" class="filter-settings">
+              <summary>消息过滤<span v-if="connector.filter.enabled" class="filter-on">已开启</span></summary>
+              <label class="check-row"><input v-model="filterDrafts[connector.id].enabled" type="checkbox" @change="filterDrafts[connector.id].dirty = true">启用过滤</label>
+              <label class="check-row"><input v-model="filterDrafts[connector.id].linkDrop" type="checkbox" @change="filterDrafts[connector.id].dirty = true">陌生人只发链接的私信</label>
+              <label class="check-row"><input v-model="filterDrafts[connector.id].spamKeywords" type="checkbox" @change="filterDrafts[connector.id].dirty = true">垃圾关键词</label>
+              <p class="setting-label">自定义规则</p>
+              <div v-for="(rule, index) in filterDrafts[connector.id].customRules" :key="index" class="rule-row">
+                <select v-model="rule.type" aria-label="规则类型" @change="filterDrafts[connector.id].dirty = true">
+                  <option value="sender">发件人含</option>
+                  <option value="body">正文含</option>
+                  <option value="regex">正则</option>
+                </select>
+                <input v-model="rule.pattern" type="text" maxlength="200" aria-label="规则内容" @input="filterDrafts[connector.id].dirty = true">
+                <button type="button" class="quiet-button" aria-label="删除规则" title="删除规则" @click="removeFilterRule(filterDrafts[connector.id], index)"><AppIcon name="dismiss" :size="12" /></button>
+              </div>
+              <button type="button" class="link-button" @click="addFilterRule(filterDrafts[connector.id])">添加规则</button>
+              <p class="setting-label">白名单（每行一个发件人或会话 ID）</p>
+              <textarea v-model="filterDrafts[connector.id].allowlistText" rows="3" aria-label="白名单" @input="filterDrafts[connector.id].dirty = true" />
+              <FluentButton type="button" :disabled="!filterDrafts[connector.id].dirty" @click="saveFilter(connector)">保存</FluentButton>
+            </details>
+          </div>
           <footer class="instance-actions">
             <FluentButton
               class="instance-open-button"

@@ -139,6 +139,7 @@ const statement = database.prepare(`
 `);
 statement.run('instance-email-personal', 'personal@example.test', '个人邮箱', '["receive_text","send_text"]', stamp, stamp);
 statement.run('instance-email-alerts', 'alerts@example.test', '告警邮箱', '["receive_text"]', stamp, stamp);
+database.prepare("UPDATE connector_instances SET agent_access = 'send' WHERE id = 'instance-email-personal'").run();
 assert.equal(database.prepare("SELECT COUNT(*) AS total FROM connector_instances WHERE kind = 'email'").get().total, 2);
 assert.equal(database.prepare("SELECT capabilities_json FROM connector_instances WHERE id = ?").get('instance-email-alerts').capabilities_json, '["receive_text"]');
 const backup = database.prepare(`
@@ -203,6 +204,7 @@ database.prepare(`
   ) VALUES (?, 'im', 'Test IM', 'device', 'Device', 'device_relay',
     '["receive_text","receive_files","receive_images","send_text","send_files"]', ?, ?)
 `).run(connectorId, stamp, stamp);
+database.prepare("UPDATE connector_instances SET agent_access = 'send' WHERE id = ?").run(connectorId);
 database.prepare(`
   INSERT INTO group_text_backups (
     connector_id, conversation_external_id, conversation_title, external_id,

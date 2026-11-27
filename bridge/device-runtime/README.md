@@ -111,6 +111,15 @@ A scan may also return `conversationProfiles`, with at most 20 entries. Each ent
 - It sends (WeChat with Enter, QQ with the 发送 button), then waits until the input is empty and the last message in the chat equals the text. Only then does it answer with a receipt. A result it cannot confirm carries no `dispatched: false`, so the runtime records it as uncertain for manual review and never sends it again.
 - The next scans recognise the chat-list preview of a message the adapter just sent and do not report it as an incoming message; the outbound message already exists in Message Center.
 
+### Fetching media
+
+Chat-list previews only say that a message is an image (`[图片]`), a sticker (`[动画表情]`) or a file (`[文件] name`); the content is in the chat itself, and opening a chat marks it read. So media is fetched only when the owner asks for it: a `fetch_media` command (`{externalConversationId, kind: "image" | "file", fileName}`) makes the runtime call the adapter with `{"op":"fetch", ..., "mediaDirectory", "maxMediaBytes"}`. The adapter opens the chat and takes the last on-screen element of that kind:
+
+- an image or sticker is cut from a screenshot of the chat as a PNG (a still picture, at screen resolution);
+- a file named `fileName` is saved through its context menu's 另存为 into the outgoing folder (only that exact menu item is clicked; the same menu holds 撤回 and 删除), and read once its size stops changing.
+
+It answers `{"ok":true,"attachment":{externalId,fileName,mimeType,sizeBytes,sha256,stagingKey}}`; the runtime uploads the file through `PUT /api/connectors/files/<externalId>` and completes the command with the attachment metadata, which the Worker attaches to the requested message. Nothing is sent, so a failed fetch is simply reported as failed.
+
 ## Runtime limits
 
 The single process scans configured profiles sequentially, one page of at most 20 messages each, every 15 seconds while a page reports `more`, 60 seconds while `active`, and 300 seconds otherwise. A failed scan marks the source offline and backs off with bounded exponential delay up to 300 seconds. Normal event responses with `suppressed > 0` do not acknowledge or remove the outbox record. The outbox has a byte ceiling; pending records are drained before new scans, and a full queue stops collection so the source cursor cannot move past unspooled messages. Delivery rotates fairly across connectors and removes a record only after a successful Worker response. A failed connector is skipped while other connectors continue draining.
