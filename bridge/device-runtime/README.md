@@ -14,11 +14,11 @@ Store a UTF-8 JSON configuration at a private local path with mode `0600`. Relat
   "mediaDirectory": "./message-center-media",
   "connectors": [
     {"id":"instance-selkies-wechat","token":"injected-token-a",
-     "kind":"wechat","accountLabel":"Account A","displayName":"WeChat A","profile":"main",
-     "nativeDesktop":"DESKTOP_MAIN"},
+     "kind":"wechat","accountLabel":"Account A","displayName":"WeChat A","profile":"wechat-a",
+     "nativeDesktop":"DESKTOP_WECHAT_A"},
     {"id":"instance-selkies-qq","token":"injected-token-b",
-     "kind":"qq","accountLabel":"Account A","displayName":"QQ A","profile":"main",
-     "nativeDesktop":"DESKTOP_MAIN"}
+     "kind":"qq","accountLabel":"Account A","displayName":"QQ A","profile":"qq-a",
+     "nativeDesktop":"DESKTOP_QQ_A"}
   ],
   "outboxMaxBytes": 134217728,
   "pageLimit": 20
@@ -38,18 +38,24 @@ Use a real HTTPS origin and keep each bearer token private; the sample values ar
 ```json
 {
   "profiles": {
-    "main": {
+    "wechat-a": {
       "desktopUrl": "http://127.0.0.1:13000",
-      "tokenFile": "~/.local/share/wechat-selkies/master-token",
+      "tokenFile": "~/.local/share/wechat-selkies/wechat-a/master-token",
       "readFolders": false,
-      "outgoingDirectory": "~/.local/share/wechat-selkies/config/message-center-outgoing",
+      "outgoingDirectory": "~/.local/share/wechat-selkies/wechat-a/config/message-center-outgoing",
+      "containerOutgoingDirectory": "/config/message-center-outgoing"
+    },
+    "qq-a": {
+      "desktopUrl": "http://127.0.0.1:13001",
+      "tokenFile": "~/.local/share/wechat-selkies/qq-a/master-token",
+      "outgoingDirectory": "~/.local/share/wechat-selkies/qq-a/config/message-center-outgoing",
       "containerOutgoingDirectory": "/config/message-center-outgoing"
     }
   }
 }
 ```
 
-`outgoingDirectory` is a folder inside the container's mounted config volume and `containerOutgoingDirectory` is the same folder as the container sees it; files to send are copied there under their own names (recipients see them) and removed after a day. Without both, sends with files are refused before anything is sent. `tokenFile` holds the container's Selkies master token (`SELKIES_MASTER_TOKEN`), which the adapter sends as `Authorization: Bearer`; it stays outside the repository. The runtime starts the adapter directly, so keep it executable (`chmod 755 selkies_adapter.py`). Use one container per account. A `wechat` connector and a `qq` connector can name the same profile when one container runs both clients. The adapter keeps the names of the chats it has seen, its recent sends and nothing else in `selkies_adapter.state.json` beside itself (mode `0600`).
+`outgoingDirectory` is a folder inside the container's mounted config volume and `containerOutgoingDirectory` is the same folder as the container sees it; files to send are copied there under their own names (recipients see them) and removed after a day. Without both, sends with files are refused before anything is sent. `tokenFile` holds the container's Selkies master token (`SELKIES_MASTER_TOKEN`), which the adapter sends as `Authorization: Bearer`; it stays outside the repository. The runtime starts the adapter directly, so keep it executable (`chmod 755 selkies_adapter.py`). Run one container per client account (`AUTO_START_WECHAT` / `AUTO_START_QQ` pick the client), so each desktop has one client to restore, maximize and read, and a second account is one more container. A container costs about 0.8 GB for the desktop and streaming stack plus about 1.1 GB per signed-in client. The adapter keeps each profile's chat names and recent sends, and nothing else, in `selkies_adapter.<profile>.state.json` beside itself (mode `0600`), so two accounts in the same group do not take each other's messages for their own.
 
 ### Container requirements
 
@@ -69,7 +75,8 @@ Generate two random tokens (for example `openssl rand -hex 32`), keep them in mo
 - `SELKIES_ENABLE_BASIC_AUTH=false`, `SELKIES_MASTER_TOKEN=<master-token>`, `SELKIES_TOKENS_FILE=/config/selkies-tokens.json`
 - `SELKIES_FRAME_ANCESTORS=<Message Center origin>` so only Message Center can frame the desktop
 - the published port bound to `127.0.0.1` only; the Worker reaches it through a Cloudflare Tunnel (`cloudflared` on the same machine, QUIC transport) and a Workers VPC HTTP service pointing at `127.0.0.1:<port>`
-- `AUTO_START_WECHAT=true`, `AUTO_START_QQ=true`, and a non-empty `PASSWORD` (the start script still requires one)
+- `AUTO_START_WECHAT` / `AUTO_START_QQ` set to `true` for the one client this container runs, and a non-empty `PASSWORD` (the start script still requires one)
+- a fixed `--hostname`; the clients tie a saved sign-in to it, so a recreated container with a new hostname asks to sign in again
 
 Sign each client in once in Message Center's native view. Tick QQ's 自动登录 so it signs in again after a restart; WeChat asks for a confirmation on the phone after each container restart.
 

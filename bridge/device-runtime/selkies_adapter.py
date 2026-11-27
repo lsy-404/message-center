@@ -37,10 +37,10 @@ MAX_ATTACHMENTS = 20
 OUTGOING_KEEP_S = 24 * 3600
 FILE_SEND_WAIT_S = 90
 CONFIG_PATH = os.path.splitext(os.path.abspath(__file__))[0] + ".json"
-STATE_PATH = os.path.splitext(os.path.abspath(__file__))[0] + ".state.json"
+STATE_BASE = os.path.splitext(os.path.abspath(__file__))[0]
 
 APPS = {
-    "wechat": {"app_id": "wechat", "sign_in": ("扫码登录", "当前登录用户"), "folder": "折叠的聊天", "prefix": "wx"},
+    "wechat": {"app_id": "wechat", "sign_in": ("扫码登录", "当前登录用户", "需在手机上完成登录"), "folder": "折叠的聊天", "prefix": "wx"},
     "qq": {"app_id": "QQ", "sign_in": ("手机QQ扫码登录",), "folder": "群助手", "prefix": "qq"},
 }
 # Rows that gather other chats rather than being one conversation.
@@ -94,9 +94,16 @@ def load_config():
     return config
 
 
-def load_state():
+def state_path(profile):
+    """Each profile (one account) keeps its own chat names and recent sends."""
+    if not isinstance(profile, str) or not re.match(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$", profile):
+        raise AdapterError("profile_invalid")
+    return "{}.{}.state.json".format(STATE_BASE, profile)
+
+
+def load_state(profile):
     try:
-        with open(STATE_PATH, encoding="utf-8") as handle:
+        with open(state_path(profile), encoding="utf-8") as handle:
             state = json.load(handle)
     except (OSError, ValueError):
         state = {}
@@ -104,6 +111,7 @@ def load_state():
         state = {}
     state.setdefault("conversations", {})
     state.setdefault("recent", {})
+    state["profile"] = profile
     return state
 
 
@@ -116,13 +124,14 @@ def save_state(state):
     state["recent"] = {key: [entry for entry in entries if now - entry.get("at", 0) < RECENT_SEND_MS]
                        for key, entries in state["recent"].items()}
     state["recent"] = {key: entries for key, entries in state["recent"].items() if entries}
-    directory = os.path.dirname(STATE_PATH)
+    path = state_path(state["profile"])
+    directory = os.path.dirname(path)
     descriptor, temporary = tempfile.mkstemp(prefix=".selkies-state-", dir=directory)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             json.dump(state, handle, ensure_ascii=False, separators=(",", ":"))
         os.chmod(temporary, 0o600)
-        os.replace(temporary, STATE_PATH)
+        os.replace(temporary, path)
     except BaseException:
         try:
             os.unlink(temporary)
@@ -654,7 +663,7 @@ def scan(request, config):
     if driver not in APPS:
         raise AdapterError("driver_unsupported")
     desktop, entry = container(config, request.get("profile"))
-    state = load_state()
+    state = load_state(request.get("profile"))
     window_id, tree = open_client(desktop, driver)
     owner = qq_owner(tree) if driver == "qq" else None
     if driver == "qq":
@@ -1079,7 +1088,7 @@ def send(request, config):
 
     try:
         desktop, entry = container(config, request.get("profile"))
-        state = load_state()
+        state = load_state(request.get("profile"))
         target = state["conversations"].get(conversation) if isinstance(conversation, str) else None
         if not target:
             return refused("conversation_unknown")
