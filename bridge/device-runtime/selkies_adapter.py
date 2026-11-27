@@ -31,6 +31,7 @@ MAX_PROFILES = 20
 MAX_BODY = 20000
 MAX_STATE_CONVERSATIONS = 1000
 FOLDER_REFRESH_MS = 10 * 60 * 1000
+FULL_SCAN_MS = 5 * 60 * 1000
 RECENT_SEND_MS = 15 * 60 * 1000
 SCROLL_PAGES = 8
 MAX_ATTACHMENTS = 20
@@ -244,20 +245,27 @@ def find(tree, predicate):
     return next((node for node in walk(tree) if predicate(node)), None)
 
 
-def type_chars(desktop, text, ref=None):
-    """Types `text` where the keyboard focus is (after clicking `ref`), pressing TYPED_AS_KEYS characters as keysyms."""
-    if not any(char in text for char in TYPED_AS_KEYS):
+def type_chars(desktop, text, ref=None, replace=False):
+    """Types `text` where the keyboard focus is, or into `ref`, first clearing the field with `replace`; TYPED_AS_KEYS
+    characters are pressed as keysyms. Pelorus settles for about a second after each action, so the click, the
+    clearing and the first run of plain text go in one call."""
+    parts = [part for part in re.split("([{}])".format("".join(TYPED_AS_KEYS)), text) if part]
+    if parts and parts[0] not in TYPED_AS_KEYS:
+        arguments = {"text": parts.pop(0)}
         if ref:
-            desktop.tool("type", ref=ref, text=text)
-        else:
-            desktop.tool("type", text=text)
-        return
-    if ref:
-        desktop.tool("click", ref=ref)
-    for part in re.split("([{}])".format("".join(TYPED_AS_KEYS)), text):
+            arguments["ref"] = ref
+        if replace:
+            arguments["replace"] = True
+        desktop.tool("type", **arguments)
+    else:
+        if ref:
+            desktop.tool("click", ref=ref)
+        if replace:
+            clear_input(desktop)
+    for part in parts:
         if part in TYPED_AS_KEYS:
             desktop.tool("key", keys=TYPED_AS_KEYS[part])
-        elif part:
+        else:
             desktop.tool("type", text=part)
 
 
@@ -407,14 +415,21 @@ def qq_open_chat(tree):
 
 
 def qq_scroll_top(desktop, window_id, tree):
-    chats = find(tree, lambda n: n.get("name") == "会话列表")
-    bounds = chats.get("bounds") if chats else None
-    if not bounds:
-        return tree
-    desktop.tool("scroll", at=[int(bounds["x"] + bounds["w"] / 2), int(bounds["y"] + bounds["h"] / 2)],
-                 direction="up", amount=30)
-    time.sleep(0.5)
-    return desktop.tree(window_id)
+    """Scrolls the chat list until its first row sits at the list's top edge; QQ sometimes takes a burst of wheel
+    steps as one, so the position is checked after each burst."""
+    for _ in range(4):
+        chats = find(tree, lambda n: n.get("name") == "会话列表")
+        bounds = chats.get("bounds") if chats else None
+        if not bounds:
+            return tree
+        first = next((c for c in chats.get("children") or [] if c.get("bounds")), None)
+        if first and first["bounds"]["y"] >= bounds["y"]:
+            return tree
+        desktop.tool("scroll", at=[int(bounds["x"] + bounds["w"] / 2), int(bounds["y"] + bounds["h"] / 2)],
+                     direction="up", amount=30)
+        time.sleep(0.3)
+        tree = desktop.tree(window_id)
+    return tree
 
 
 def qq_mark_pinned(desktop, window_id, rows, open_name):
@@ -658,6 +673,38 @@ def own_echo(state, conversation, texts, now):
     return False
 
 
+def row_traits(row):
+    return "{}{}{}".format(int(bool(row["muted"])), int(bool(row["pinned"])), row["placement"][0])
+
+
+def folder_print(row):
+    return digest("{}\n{}".format(row["preview"], row["unread"]))
+
+
+def rows_known(driver, rows, seen, folder_seen):
+    """Whether the chat list as read, before any scrolling or pin sampling, shows nothing the last full scan did not:
+    every row's preview and mute state as last seen, no unread count grown, and the folder row as it was when the
+    folder is read at all (`folder_seen`). QQ pins need a screenshot, so they are compared on full scans only."""
+    if not rows:
+        return False
+    prefix = APPS[driver]["prefix"]
+    for row in rows:
+        if row["name"] == APPS[driver]["folder"]:
+            if folder_seen is not None and folder_print(row) != folder_seen:
+                return False
+            continue
+        if row["name"] in AGGREGATES[driver] or not row["preview"]:
+            continue
+        previous = seen.get("{}-{}".format(prefix, digest(row["name"])))
+        unread = row["unread"] if isinstance(row["unread"], int) else 0
+        if previous is None or previous.get("p") != digest(row["preview"]) or unread > previous.get("u", 0):
+            return False
+        traits, known = row_traits(row), previous.get("s") or ""
+        if (traits != known) if driver == "wechat" else (traits[0] + traits[2:] != known[:1] + known[2:]):
+            return False
+    return True
+
+
 def scan(request, config):
     driver = request.get("driver")
     if driver not in APPS:
@@ -666,23 +713,28 @@ def scan(request, config):
     state = load_state(request.get("profile"))
     window_id, tree = open_client(desktop, driver)
     owner = qq_owner(tree) if driver == "qq" else None
-    if driver == "qq":
-        desktop.activate(window_id)
-        tree = qq_scroll_top(desktop, window_id, tree)
-        rows = qq_mark_pinned(desktop, window_id, main_rows(driver, tree) or [], qq_open_chat(tree))
-    else:
-        rows = main_rows(driver, tree) or []
     cursor = request.get("cursor") if isinstance(request.get("cursor"), dict) else {}
     seen = dict(cursor.get("chats") or {})
     folder_state = dict(cursor.get("folder") or {})
     limit = max(1, min(int(request.get("limit") or 20), 20))
     now = int(time.time() * 1000)
+    full_at = cursor.get("full") if isinstance(cursor.get("full"), int) else 0
+
+    rows = main_rows(driver, tree) or []
+    if now - full_at < FULL_SCAN_MS and rows_known(driver, rows, seen, cursor.get("a")):
+        return {"ok": True, "sourceReadStatus": "complete", "health": "online", "cursor": cursor,
+                "messages": [], "conversationProfiles": [], "active": True, "more": False}
+    if driver == "qq":
+        desktop.activate(window_id)
+        tree = qq_scroll_top(desktop, window_id, tree)
+        rows = qq_mark_pinned(desktop, window_id, main_rows(driver, tree) or [], qq_open_chat(tree))
 
     aggregate = next((r for r in rows if r["name"] == APPS[driver]["folder"]), None)
-    aggregate_print = digest("{}\n{}".format(aggregate["preview"], aggregate["unread"])) if aggregate else None
+    aggregate_print = folder_print(aggregate) if aggregate else None
     due = (aggregate_print and folder_state.get("p") != aggregate_print) or now - folder_state.get("at", 0) >= FOLDER_REFRESH_MS
     # A pinned folder row cannot move, so opening it is safe without the readFolders opt-in.
-    if (entry.get("readFolders") is True or (aggregate and aggregate.get("pinned"))) and due:
+    readable = entry.get("readFolders") is True or bool(aggregate and aggregate.get("pinned"))
+    if readable and due:
         folded = read_folder(desktop, driver, window_id, rows)
         if folded is not None:
             rows = rows + folded
@@ -702,7 +754,7 @@ def scan(request, config):
         state["conversations"][conversation] = {"name": row["name"], "folder": row["placement"] == "folded", "at": now}
         if row["pinned"] is None:
             row["pinned"] = bool(previous and len(previous.get("s") or "") > 1 and previous["s"][1] == "1")
-        traits = "{}{}{}".format(int(bool(row["muted"])), int(bool(row["pinned"])), row["placement"][0])
+        traits = row_traits(row)
         changed = previous is None or previous.get("p") != fingerprint or unread > previous.get("u", 0)
         if not changed and previous.get("s") == traits:
             continue
@@ -740,7 +792,7 @@ def scan(request, config):
     save_state(state)
     kept = sorted(seen.items(), key=lambda item: -item[1].get("at", 0))[:MAX_REMEMBERED]
     return {"ok": True, "sourceReadStatus": "complete", "health": "online",
-            "cursor": {"chats": dict(kept), "folder": folder_state},
+            "cursor": {"chats": dict(kept), "folder": folder_state, "full": now, "a": aggregate_print if readable else None},
             "messages": messages, "conversationProfiles": profiles, "active": True, "more": more}
 
 
@@ -825,7 +877,7 @@ def open_conversation(desktop, driver, window_id, tree, name, folded):
             if wechat_find_row(desktop, window_id, "会话", folder) is None or \
                     not stable_click(desktop, window_id, row_locator(driver, "会话", folder)):
                 raise AdapterError("conversation_not_found")
-            time.sleep(1.2)
+            wait_for(lambda: in_folder(driver, desktop.tree(window_id)), 3)
         list_name = folder if folded else "会话"
         if wechat_find_row(desktop, window_id, list_name, name) is None or \
                 not stable_click(desktop, window_id, row_locator(driver, list_name, name)):
@@ -836,11 +888,13 @@ def open_conversation(desktop, driver, window_id, tree, name, folded):
         ref = desktop.ref(window_id, r'entry\b')
         if not ref:
             raise AdapterError("conversation_not_found")
-        desktop.tool("click", ref=ref)
-        clear_input(desktop)
-        type_chars(desktop, name)
-        time.sleep(1.5)
-        results = [n for n in walk(desktop.tree(window_id)) if n.get("role") == "list item" and n.get("bounds")]
+        type_chars(desktop, name, ref=ref, replace=True)
+        results = []
+
+        def exact_listed():
+            results[:] = [n for n in walk(desktop.tree(window_id)) if n.get("role") == "list item" and n.get("bounds")]
+            return any(qq_result_match(n, name) == "exact" for n in results)
+        wait_for(exact_listed, 1.5)
         exact = [n for n in results if qq_result_match(n, name) == "exact"]
         truncated = [n for n in results if qq_result_match(n, name) == "truncated"]
         match = exact[0] if exact else (truncated[0] if len(truncated) == 1 else None)
@@ -850,10 +904,12 @@ def open_conversation(desktop, driver, window_id, tree, name, folded):
             desktop.tool("key", keys="BackSpace")
             raise AdapterError("conversation_not_found")
         desktop.click(match["bounds"])
-    time.sleep(1.5)
-    tree = desktop.tree(window_id)
-    node, _ = chat_input(driver, tree, name, loose=True)
-    if node is None:
+
+    def opened():
+        tree = desktop.tree(window_id)
+        return tree if chat_input(driver, tree, name, loose=True)[0] is not None else None
+    tree = wait_for(opened, 4)
+    if tree is None:
         raise AdapterError("conversation_open_failed")
     return tree
 
@@ -933,9 +989,7 @@ def pick_file(desktop, driver, window_id, button, path):
     if driver == "wechat":
         field = desktop.ref(dialog, r'text "文件名称')
         if field:
-            desktop.tool("click", ref=field)
-            clear_input(desktop)
-            type_chars(desktop, path)
+            type_chars(desktop, path, ref=field, replace=True)
             desktop.tool("key", keys="Return")
     else:
         desktop.activate(dialog)
@@ -1035,13 +1089,14 @@ def send_file(desktop, driver, window_id, name, attachment, path):
     return before, False
 
 
-def wait_for(check, seconds):
+def wait_for(check, seconds, every=0.3):
+    """Polls `check` until it returns something truthy or `seconds` pass; returns its last result."""
     deadline = time.time() + seconds
-    while time.time() < deadline:
-        time.sleep(1)
-        if check():
-            return True
-    return False
+    while True:
+        time.sleep(every)
+        result = check()
+        if result or time.time() >= deadline:
+            return result
 
 
 def echo_texts(attachment):
@@ -1116,10 +1171,11 @@ def send(request, config):
         tree = desktop.tree(window_id)
         before_text, before_count = last_message(driver, tree)
         type_text(desktop, driver, window_id, tree, name, body)
-        time.sleep(0.6)
-        tree = desktop.tree(window_id)
-        node, typed = chat_input(driver, tree, name, loose=True)
-        if node is None or collapse(typed) != collapse(body):
+
+        def typed_in():
+            node, typed = chat_input(driver, desktop.tree(window_id), name, loose=True)
+            return node is not None and collapse(typed) == collapse(body)
+        if not wait_for(typed_in, 2, every=0.2):
             clear_input(desktop)
             return refused("input_mismatch")
     except AdapterError as error:
@@ -1136,8 +1192,9 @@ def send(request, config):
                 desktop.tool("key", keys="Return")
         else:
             desktop.tool("key", keys="Return")
-        for _ in range(5):
-            time.sleep(1)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            time.sleep(0.3)
             tree = desktop.tree(window_id)
             node, remaining = chat_input(driver, tree, name, loose=True)
             last, count = last_message(driver, tree)
@@ -1245,14 +1302,12 @@ def save_file_as(desktop, driver, window_id, node, entry, file_name):
     if dialog is None:
         raise AdapterError("file_dialog_missing")
     target = "{}/{}/{}".format(inside, folder, file_name)
+    field = None
     if driver == "wechat":
         field = desktop.ref(dialog, r'text "文件名')
-        if field:
-            desktop.tool("click", ref=field)
     else:
         desktop.activate(dialog)
-    clear_input(desktop)
-    type_chars(desktop, target)
+    type_chars(desktop, target, ref=field, replace=True)
     desktop.tool("key", keys="Return")
     path = os.path.join(host, folder, file_name)
     previous = -1

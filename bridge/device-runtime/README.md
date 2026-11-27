@@ -55,7 +55,7 @@ Use a real HTTPS origin and keep each bearer token private; the sample values ar
 }
 ```
 
-`outgoingDirectory` is a folder inside the container's mounted config volume and `containerOutgoingDirectory` is the same folder as the container sees it; files to send are copied there under their own names (recipients see them) and removed after a day. Without both, sends with files are refused before anything is sent. `tokenFile` holds the container's Selkies master token (`SELKIES_MASTER_TOKEN`), which the adapter sends as `Authorization: Bearer`; it stays outside the repository. The runtime starts the adapter directly, so keep it executable (`chmod 755 selkies_adapter.py`). Run one container per client account (`AUTO_START_WECHAT` / `AUTO_START_QQ` pick the client), so each desktop has one client to restore, maximize and read, and a second account is one more container. A container costs about 0.8 GB for the desktop and streaming stack plus about 1.1 GB per signed-in client. The adapter keeps each profile's chat names and recent sends, and nothing else, in `selkies_adapter.<profile>.state.json` beside itself (mode `0600`), so two accounts in the same group do not take each other's messages for their own.
+`outgoingDirectory` is a folder inside the container's mounted config volume and `containerOutgoingDirectory` is the same folder as the container sees it; files to send are copied there under their own names (recipients see them) and removed after a day. Without both, sends with files are refused before anything is sent. `tokenFile` holds the container's Selkies master token (`SELKIES_MASTER_TOKEN`), which the adapter sends as `Authorization: Bearer`; it stays outside the repository. The runtime starts the adapter directly, so keep it executable (`chmod 755 selkies_adapter.py`). Run one container per client account (`AUTO_START_WECHAT` / `AUTO_START_QQ` pick the client), so each desktop has one client to restore, maximize and read, and a second account is one more container. A container costs about 0.3 GB for the desktop and streaming stack (with audio, printing and the TURN server turned off as below) plus 0.4–1 GB for its client, which grows the longer it runs. The adapter keeps each profile's chat names and recent sends, and nothing else, in `selkies_adapter.<profile>.state.json` beside itself (mode `0600`), so two accounts in the same group do not take each other's messages for their own.
 
 ### Container requirements
 
@@ -68,12 +68,16 @@ FROM ghcr.io/nickrunning/wechat-selkies:latest
 RUN rm /usr/bin/qq && printf '#!/bin/sh\nexec /opt/QQ/qq --force-renderer-accessibility "$@"\n' > /usr/bin/qq && chmod 755 /usr/bin/qq
 RUN grep -qx 'export SELKIES_ENABLE_BASIC_AUTH=true' /wechat-container-start \
  && sed -i 's/^export SELKIES_ENABLE_BASIC_AUTH=true$/export SELKIES_ENABLE_BASIC_AUTH=${SELKIES_ENABLE_BASIC_AUTH:-true}/' /wechat-container-start
+RUN rm -rf /etc/service/pipewire /etc/service/pipewire-pulse /etc/service/wireplumber
 ```
+
+The last line drops the audio services, which nothing here uses.
 
 Generate two random tokens (for example `openssl rand -hex 32`), keep them in mode-`0600` files, and write the session token into a tokens file inside the container's config volume, also mode `0600`: `{"<session-token>": {"role": "controller", "mk_control": true}}`. The same session token goes into the Worker's `NATIVE_DESKTOPS` secret. Then run the container with:
 
 - `SELKIES_ENABLE_BASIC_AUTH=false`, `SELKIES_MASTER_TOKEN=<master-token>`, `SELKIES_TOKENS_FILE=/config/selkies-tokens.json`
 - `SELKIES_FRAME_ANCESTORS=<Message Center origin>` so only Message Center can frame the desktop
+- `SELKIES_AUDIO_ENABLED=false`, `SELKIES_PRINTING_ENABLED=false` and `SELKIES_ENABLE_DUAL_MODE=false`: the native view streams over WebSockets, so the TURN server, the print queue and audio capture are not started
 - the published port bound to `127.0.0.1` only; the Worker reaches it through a Cloudflare Tunnel (`cloudflared` on the same machine, QUIC transport) and a Workers VPC HTTP service pointing at `127.0.0.1:<port>`
 - `AUTO_START_WECHAT` / `AUTO_START_QQ` set to `true` for the one client this container runs, and a non-empty `PASSWORD` (the start script still requires one)
 - a fixed `--hostname`; the clients tie a saved sign-in to it, so a recreated container with a new hostname asks to sign in again
@@ -83,6 +87,7 @@ Sign each client in once in Message Center's native view. Tick QQ's 自动登录
 ### What is read
 
 - Each scan reads the chat-list last-message previews. It never opens a chat, so nothing is marked read.
+- A scan first compares the list as it stands with the last full scan, without scrolling or taking a screenshot. When every row's preview and mute state are as last seen, no unread count grew and the folder row is unchanged, it reports nothing; otherwise, and at least every five minutes, it runs the full scan described here. QQ pins are therefore refreshed on full scans only.
 - A chat is reported when it is new, its preview changed, or its unread count grew; the first scan therefore reports each chat's current preview once.
 - A group chat is recognised by the `sender: ` or `sender：` prefix of its preview and remembered afterwards. A preview with the `[有人@我]` marker is a `mention` trigger; other group messages are `background`.
 - Aggregate rows such as 公众号, 折叠的聊天, and 群助手 are not conversations and are not reported themselves.
@@ -122,6 +127,6 @@ It answers `{"ok":true,"attachment":{externalId,fileName,mimeType,sizeBytes,sha2
 
 ## Runtime limits
 
-The single process scans configured profiles sequentially, one page of at most 20 messages each, every 15 seconds while a page reports `more`, 60 seconds while `active`, and 300 seconds otherwise. A failed scan marks the source offline and backs off with bounded exponential delay up to 300 seconds. Normal event responses with `suppressed > 0` do not acknowledge or remove the outbox record. The outbox has a byte ceiling; pending records are drained before new scans, and a full queue stops collection so the source cursor cannot move past unspooled messages. Delivery rotates fairly across connectors and removes a record only after a successful Worker response. A failed connector is skipped while other connectors continue draining.
+The single process scans configured profiles sequentially, one page of at most 20 messages each, every 2 seconds while a page reports `more`, 5 seconds while `active`, and 300 seconds otherwise; each pass, about every 5 seconds, also asks the Worker for one pending command per healthy connector, so a send from the web UI starts within seconds. A failed scan marks the source offline and backs off with bounded exponential delay up to 300 seconds. Normal event responses with `suppressed > 0` do not acknowledge or remove the outbox record. The outbox has a byte ceiling; pending records are drained before new scans, and a full queue stops collection so the source cursor cannot move past unspooled messages. Delivery rotates fairly across connectors and removes a record only after a successful Worker response. A failed connector is skipped while other connectors continue draining.
 
 An optional macOS launchd sample is provided in `launchd.plist.example`; replace every placeholder path before enabling it. It keeps `/usr/bin/python3 device_runtime.py <config>` running. This package does not install or activate a background service automatically.

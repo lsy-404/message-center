@@ -665,7 +665,7 @@ class Relay:
             self.db.rollback()
             raise
         active = result.get("active") is True
-        self.scan_interval[self.connector] = 15 if result.get("more") is True else (60 if active else 300)
+        self.scan_interval[self.connector] = 2 if result.get("more") is True else (5 if active else 300)
         return result.get("health") == "online"
 
     def validate_staged_attachment(self, attachment, any_type=False):
@@ -1089,7 +1089,7 @@ def main(argv):
                 relay.register_connectors()
                 relay.pass_once()
                 backoff = 1
-                time.sleep(15)
+                time.sleep(5)
             except KeyboardInterrupt:
                 return
             except Exception:

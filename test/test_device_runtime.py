@@ -1748,8 +1748,8 @@ class DeviceRuntimeTests(unittest.TestCase):
             lambda *args: {"ok": True, "commands": []})
         with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]):
             relay.pass_once()
-            self.assertEqual(relay.scan_interval["connector-a"], 15)
-            now[0] += 14
+            self.assertEqual(relay.scan_interval["connector-a"], 2)
+            now[0] += 1
             relay.pass_once()
             self.assertEqual(len(scans), 1)
             now[0] += 1
@@ -1760,7 +1760,7 @@ class DeviceRuntimeTests(unittest.TestCase):
             self.assertEqual(len(scans), 2)
             now[0] += 1
             relay.pass_once()
-            self.assertEqual(relay.scan_interval["connector-a"], 60)
+            self.assertEqual(relay.scan_interval["connector-a"], 5)
         self.assertEqual(len(scans), 3)
 
     def test_first_scan_is_immediate_when_monotonic_clock_starts_at_zero(self):
