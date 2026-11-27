@@ -1186,7 +1186,8 @@ def stage_media(request, data, file_name, mime_type):
     with os.fdopen(descriptor, "wb") as handle:
         handle.write(data)
     os.replace(temporary, os.path.join(directory, key))
-    return {"externalId": "{}:{}".format(request.get("profile"), sha256), "fileName": file_name,
+    # The id goes into a URL path segment, where the runtime percent-encodes ":".
+    return {"externalId": "fetch-{}-{}".format(request.get("profile"), sha256), "fileName": file_name,
             "mimeType": mime_type, "sizeBytes": len(data), "sha256": sha256, "stagingKey": key}
 
 
