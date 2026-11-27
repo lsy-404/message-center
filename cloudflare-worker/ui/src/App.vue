@@ -1677,7 +1677,7 @@ onUnmounted(() => {
       </div>
     </section>
 
-    <section v-else class="instances-pane" aria-label="接入管理">
+    <section v-if="showInstances" class="instances-pane" aria-label="接入管理">
       <header class="instances-header">
         <button class="quiet-button" type="button" aria-label="返回收件箱" title="返回收件箱" @click="showInstances = false">
           <AppIcon name="back" :size="18" />
