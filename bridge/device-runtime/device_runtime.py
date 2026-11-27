@@ -11,12 +11,14 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 import urllib.error
 import urllib.parse
 import urllib.request
 
+from command_signal import CommandSignal
 from conversation_profiles import sync_profiles, sync_sender_avatars
 
 if os.name == "posix":
@@ -36,6 +38,7 @@ IMAGE_MIME = re.compile(r"^image/[a-z0-9.+-]{1,100}$", re.IGNORECASE)
 DEFAULT_OUTBOX_BYTES = 128 * 1024 * 1024
 MAX_DELIVERIES_PER_PASS = 5
 HEARTBEAT_MIN_INTERVAL = 30
+COMMAND_POLL_FALLBACK = 60
 ADAPTER_SCAN_TIMEOUT = 60
 ADAPTER_SEND_TIMEOUT = 130
 ADAPTER_FETCH_TIMEOUT = 180
@@ -283,6 +286,36 @@ class Relay:
         self.heartbeat_retry_at = {item["id"]: 0 for item in self.connectors}
         self.heartbeat_last_state = {item["id"]: None for item in self.connectors}
         self.heartbeat_last_sent = {item["id"]: float("-inf") for item in self.connectors}
+        self.last_command_poll = {item["id"]: float("-inf") for item in self.connectors}
+        self.signals = {}
+        self.signalled = set()
+        self.signal_lock = threading.Lock()
+        self.signal_wake = threading.Event()
+
+    def start_signals(self):
+        for connector in self.connectors:
+            if connector.get("receiveOnly") is not True:
+                signal_thread = CommandSignal(self.base, connector["id"], connector["token"], self.on_signal)
+                self.signals[connector["id"]] = signal_thread
+                signal_thread.start()
+
+    def on_signal(self, connector_id):
+        with self.signal_lock:
+            self.signalled.add(connector_id)
+        self.signal_wake.set()
+
+    def command_poll_due(self, connector_id, signalled_only=False):
+        """Due when the Worker announced a command, or, without a live signal socket, on every pass; a connected
+        connector is still polled every COMMAND_POLL_FALLBACK seconds in case an announcement was lost."""
+        with self.signal_lock:
+            if connector_id in self.signalled:
+                self.signalled.discard(connector_id)
+                return True
+        if signalled_only:
+            return False
+        signal_thread = self.signals.get(connector_id)
+        return (signal_thread is None or not signal_thread.connected
+                or time.monotonic() - self.last_command_poll[connector_id] >= COMMAND_POLL_FALLBACK)
 
     def close(self):
         self.db.close()
@@ -1031,17 +1064,24 @@ class Relay:
                 finally:
                     self.cleanup_unreferenced_media()
             self.send_heartbeat(connector_id, self.connector_heartbeat_state(connector_id))
+        self.poll_commands()
+
+    def poll_commands(self, signalled_only=False):
         for connector in self.connectors:
             self.select_connector(connector)
             connector_id = self.connector
             if (connector.get("receiveOnly") is True or not self.eligible(connector_id)
                     or not self.health.get(connector_id)
-                    or time.monotonic() - self.last_scan[connector_id] > self.scan_interval[connector_id] + 30):
+                    or time.monotonic() - self.last_scan[connector_id] > self.scan_interval[connector_id] + 30
+                    or not self.command_poll_due(connector_id, signalled_only)):
                 continue
+            self.last_command_poll[connector_id] = time.monotonic()
             path = "/api/connectors/commands?connectorId=" + urllib.parse.quote(self.connector, safe="") + "&limit=1"
             try:
                 commands = self.http_call("GET", path, None).get("commands", [])
                 if commands:
+                    # One command per lease; look again next pass for any queued behind it.
+                    self.on_signal(connector_id)
                     if self.process_command(commands[0], connector["profile"]) is False:
                         self.failed(connector_id)
                         continue
@@ -1082,14 +1122,18 @@ def main(argv):
         except OSError:
             raise SystemExit("device_runtime_already_running")
     relay = Relay(config)
+    relay.start_signals()
     backoff = 1
     try:
         while True:
             try:
+                if relay.signal_wake.is_set():
+                    relay.signal_wake.clear()
+                    relay.poll_commands(signalled_only=True)
                 relay.register_connectors()
                 relay.pass_once()
                 backoff = 1
-                time.sleep(5)
+                relay.signal_wake.wait(5)
             except KeyboardInterrupt:
                 return
             except Exception:

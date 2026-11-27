@@ -1,6 +1,8 @@
 import PostalMime from "postal-mime";
+import { openCommandSignal, signalCommand } from "./command-signal.js";
 import { evaluateMessageFilter, normalizeFilterSettings, parseFilterSettings } from "./message-filter.js";
 import { normalizeContactName, suggestContactMatches } from "./contacts.js";
+import { handleStickerPackRoute, stickerPackObjectKeys } from "./sticker-packs.js";
 import { deliverPush, deviceLabel, notifyInbound, pushConfigured } from "./push.js";
 import { OidcAuthError, beginOidcLogin, completeOidcLogin, oidcIdentity, logoutOidc, cleanupOidcSessions, clearOidcSessionCookie } from "./oidc.js";
 
@@ -2516,7 +2518,8 @@ async function cleanupOrphanAttachmentObjects(env) {
     SELECT object_key FROM attachments WHERE object_key IS NOT NULL
   `).all();
   const retained = new Set((references.results || []).map((row) => row.object_key));
-  for (const prefix of ["inbound/", "staging/"]) {
+  for (const key of await stickerPackObjectKeys(env)) retained.add(key);
+  for (const prefix of ["inbound/", "staging/", "sticker-packs/"]) {
     await cleanupOrphanObjectPrefix(env, prefix, retained, "orphan_attachment_cleanup_failed");
   }
 }
@@ -2769,6 +2772,7 @@ async function queueOutbound(env, input, retryDepth = 0) {
     console.error(JSON.stringify({ event: "audit_write_failed", action: "outbound_queued",
       message: error instanceof Error ? error.message : String(error) }));
   }
+  await signalCommand(env, conversation.connector_id);
   return { messageId, commandId, state: "pending" };
 }
 
@@ -2888,6 +2892,7 @@ async function requestMediaFetch(env, identity, messageId) {
       JSON.stringify({ externalConversationId: row.external_id, kind: media.kind, fileName: media.fileName || "" }),
       crypto.randomUUID(), identity.id, stamp),
   ]);
+  await signalCommand(env, row.connector_id);
   await audit(env, identity.id, "media_fetch_requested", messageId, { kind: media.kind });
   return json({ ok: true, commandId, state: "pending" }, 202);
 }
@@ -3704,6 +3709,8 @@ async function receiveEmail(message, env, ctx) {
   if (!filterVerdict) runInBackground(ctx, notifyInbound(env, [messageId]));
 }
 
+export { CommandSignal } from "./command-signal.js";
+
 export default {
   async email(message, env, ctx) {
     await receiveEmail(message, env, ctx);
@@ -3741,6 +3748,12 @@ export default {
         return await ingestGroupTextBackups(request, env);
       }
       if (url.pathname === "/api/connectors/commands" && request.method === "GET") return await leaseCommands(request, env, url);
+      if (url.pathname === "/api/connectors/signal" && request.method === "GET") {
+        const signalConnectorId = request.headers.get("x-connector-id") || "";
+        if (!await hasConnectorRole(request, env, signalConnectorId)) return fail("unauthorized", 401);
+        if (!env.COMMAND_SIGNAL) return fail("signal_unavailable", 503);
+        return await openCommandSignal(request, env, signalConnectorId);
+      }
       const connectorCommandLease = url.pathname.match(
         /^\/api\/connectors\/commands\/([a-zA-Z0-9._:-]+)\/lease$/,
       );
@@ -3826,6 +3839,9 @@ export default {
         if (request.method === "DELETE") return await deletePushSubscription(request, env, identity);
       }
       if (url.pathname === "/api/push/test" && request.method === "POST") return await sendTestPush(env, identity);
+      const stickerPackResponse = await handleStickerPackRoute(request, env, identity, url,
+        { json, readJson, audit, imageMime, cleanName });
+      if (stickerPackResponse) return stickerPackResponse;
       if (url.pathname === "/api/stickers" && request.method === "GET") {
         return json({ ok: true, stickers: await readStickers(env) });
       }

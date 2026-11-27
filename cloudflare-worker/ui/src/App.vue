@@ -1582,21 +1582,42 @@ async function stageFiles(selectedFiles: File[]) {
   }
 }
 
-type Sticker = { id: string, fileName: string, mimeType: string, sizeBytes: number, sha256: string }
+type Sticker = { id: string, fileName: string, mimeType: string, sizeBytes: number, sha256: string, path: string }
+type StickerPack = { id: string, name: string, images: Sticker[] }
 const stickerOpen = ref(false)
 const stickers = ref<Sticker[] | null>(null)
+const stickerPacks = ref<StickerPack[]>([])
+const stickerTab = ref('recent')
 const stickersLoading = ref(false)
 const stickersFailed = ref(false)
 const stickerPicker = ref<HTMLElement | null>(null)
 const canSendImages = computed(() => canSendFiles.value && supportsAttachment(
   selectedConversation.value?.capabilities ?? [], 'image/gif', 'sticker.gif',
 ))
+const visibleStickers = computed(() => stickerTab.value === 'recent'
+  ? stickers.value ?? []
+  : stickerPacks.value.find((pack) => pack.id === stickerTab.value)?.images ?? [])
+
+function withPath(sticker: Omit<Sticker, 'path'>, base: string): Sticker {
+  return { ...sticker, path: `${base}/${encodeURIComponent(sticker.id)}` }
+}
+
+async function loadStickerPacks() {
+  const { packs } = await api<{ packs: StickerPack[] }>('/api/sticker-packs')
+  stickerPacks.value = packs.map((pack) => ({
+    ...pack, images: pack.images.map((image) => withPath(image, '/api/sticker-images')),
+  }))
+  if (stickerTab.value !== 'recent' && !stickerPacks.value.some((pack) => pack.id === stickerTab.value)) {
+    stickerTab.value = 'recent'
+  }
+}
 
 async function loadStickers() {
   stickersLoading.value = true
   stickersFailed.value = false
   try {
-    stickers.value = (await api<{ stickers: Sticker[] }>('/api/stickers')).stickers
+    const [recent] = await Promise.all([api<{ stickers: Omit<Sticker, 'path'>[] }>('/api/stickers'), loadStickerPacks()])
+    stickers.value = recent.stickers.map((sticker) => withPath(sticker, '/api/files'))
   } catch {
     stickersFailed.value = true
   } finally {
@@ -1612,13 +1633,120 @@ function toggleStickers() {
 async function pickSticker(sticker: Sticker) {
   stickerOpen.value = false
   try {
-    const response = await fetch(`/api/files/${encodeURIComponent(sticker.id)}`, { credentials: 'same-origin' })
+    const response = await fetch(sticker.path, { credentials: 'same-origin' })
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
     const blob = await response.blob()
     await stageFiles([new File([blob], sticker.fileName, { type: sticker.mimeType })])
   } catch (error) {
     notify(`表情加载失败：${error instanceof Error ? error.message : String(error)}`)
   }
+}
+
+const packManageOpen = ref(false)
+const packBusy = ref(false)
+const managedPackId = ref('')
+const newPackName = ref('')
+const renamedPackName = ref('')
+const managedPack = computed(() => stickerPacks.value.find((pack) => pack.id === managedPackId.value) ?? null)
+
+function openPackManager() {
+  stickerOpen.value = false
+  packManageOpen.value = true
+  if (!managedPack.value) managedPackId.value = stickerPacks.value[0]?.id ?? ''
+  renamedPackName.value = managedPack.value?.name ?? ''
+}
+
+function selectManagedPack(id: string) {
+  managedPackId.value = id
+  renamedPackName.value = managedPack.value?.name ?? ''
+}
+
+async function runPackAction(action: () => Promise<void>, failure: string) {
+  packBusy.value = true
+  try {
+    await action()
+    await loadStickerPacks()
+  } catch (error) {
+    notify(`${failure}：${error instanceof Error ? error.message : String(error)}`)
+  } finally {
+    packBusy.value = false
+  }
+}
+
+const packJson = (method: string, body: unknown): RequestInit => ({
+  method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+})
+
+async function createStickerPack() {
+  const name = newPackName.value.trim()
+  if (!name) return
+  await runPackAction(async () => {
+    const { pack } = await api<{ pack: StickerPack }>('/api/sticker-packs', packJson('POST', { name }))
+    newPackName.value = ''
+    managedPackId.value = pack.id
+    renamedPackName.value = pack.name
+  }, '新建失败')
+}
+
+async function renameStickerPack() {
+  const pack = managedPack.value
+  const name = renamedPackName.value.trim()
+  if (!pack || !name || name === pack.name) return
+  await runPackAction(async () => {
+    await api(`/api/sticker-packs/${pack.id}`, packJson('PUT', { name }))
+  }, '重命名失败')
+}
+
+async function deleteStickerPack() {
+  const pack = managedPack.value
+  if (!pack || !window.confirm(`删除表情包“${pack.name}”及其中 ${pack.images.length} 张图片？删除后无法恢复。`)) return
+  await runPackAction(async () => {
+    await api(`/api/sticker-packs/${pack.id}`, { method: 'DELETE' })
+    managedPackId.value = stickerPacks.value.find((item) => item.id !== pack.id)?.id ?? ''
+    renamedPackName.value = stickerPacks.value.find((item) => item.id === managedPackId.value)?.name ?? ''
+  }, '删除失败')
+}
+
+async function moveStickerPack(id: string, offset: number) {
+  const ids = stickerPacks.value.map((pack) => pack.id)
+  const from = ids.indexOf(id)
+  const to = from + offset
+  if (from < 0 || to < 0 || to >= ids.length) return
+  ids.splice(to, 0, ...ids.splice(from, 1))
+  await runPackAction(async () => {
+    await api('/api/sticker-packs/order', packJson('PUT', { ids }))
+  }, '排序失败')
+}
+
+async function addPackImages(event: Event) {
+  const input = event.target as HTMLInputElement
+  const files = [...(input.files ?? [])]
+  input.value = ''
+  const pack = managedPack.value
+  if (!pack || !files.length) return
+  await runPackAction(async () => {
+    for (const file of files) {
+      const form = new FormData()
+      form.append('file', file)
+      await api(`/api/sticker-packs/${pack.id}/images`, { method: 'POST', body: form })
+    }
+  }, '添加失败')
+}
+
+async function collectSticker(sticker: Sticker) {
+  const pack = managedPack.value
+  if (!pack) return
+  await runPackAction(async () => {
+    await api(`/api/sticker-packs/${pack.id}/images/from-attachment`, packJson('POST', { attachmentId: sticker.id }))
+  }, '添加失败')
+}
+
+async function removePackImage(image: Sticker) {
+  const pack = managedPack.value
+  if (!pack) return
+  await runPackAction(async () => {
+    await api(`/api/sticker-packs/${pack.id}/images/${image.id}`, { method: 'DELETE' })
+  }, '移除失败')
 }
 
 function onStickerPointer(event: PointerEvent) {
@@ -1631,8 +1759,12 @@ function onStickerKeydown(event: KeyboardEvent) {
   stickerPicker.value?.querySelector<HTMLElement>('.sticker-toggle')?.focus()
 }
 
+function onPackDialogKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape' && packManageOpen.value) packManageOpen.value = false
+}
+
 watch(selectedId, () => { stickerOpen.value = false })
-watch(canSendImages, (value) => { if (!value) stickerOpen.value = false })
+watch(canSendImages, (value) => { if (!value) { stickerOpen.value = false; packManageOpen.value = false } })
 
 async function removeStaged(index: number) {
   const [removed] = staged.value.splice(index, 1)
@@ -1761,6 +1893,7 @@ onMounted(() => {
   window.addEventListener('pageshow', onPageShow)
   document.addEventListener('pointerdown', onStickerPointer)
   document.addEventListener('keydown', onStickerKeydown)
+  document.addEventListener('keydown', onPackDialogKeydown)
   window.addEventListener('pagehide', onOffline)
   window.addEventListener('online', onOnline)
   window.addEventListener('offline', onOffline)
@@ -1770,6 +1903,7 @@ onMounted(() => {
 onUnmounted(() => {
   document.removeEventListener('pointerdown', onStickerPointer)
   document.removeEventListener('keydown', onStickerKeydown)
+  document.removeEventListener('keydown', onPackDialogKeydown)
   refreshLoop?.stop()
   cancelInboxRead()
   if (toastTimer) window.clearTimeout(toastTimer)
@@ -2417,23 +2551,104 @@ onUnmounted(() => {
                   <AppIcon name="sticker" :size="18" />
                 </button>
                 <div v-if="stickerOpen" class="sticker-popover" role="dialog" aria-label="表情">
+                  <div class="sticker-tabs" role="tablist">
+                    <button
+                      type="button"
+                      role="tab"
+                      :aria-selected="stickerTab === 'recent'"
+                      :class="{ active: stickerTab === 'recent' }"
+                      @click="stickerTab = 'recent'"
+                    >最近</button>
+                    <button
+                      v-for="pack in stickerPacks"
+                      :key="pack.id"
+                      type="button"
+                      role="tab"
+                      :aria-selected="stickerTab === pack.id"
+                      :class="{ active: stickerTab === pack.id }"
+                      @click="stickerTab = pack.id"
+                    >{{ pack.name }}</button>
+                    <button type="button" class="sticker-manage" @click="openPackManager">管理</button>
+                  </div>
                   <span v-if="stickersLoading" class="sticker-state"><span class="spinner small" />正在加载</span>
                   <span v-else-if="stickersFailed" class="sticker-state">
                     加载失败 <button type="button" class="sticker-retry" @click="loadStickers">重试</button>
                   </span>
-                  <span v-else-if="!stickers?.length" class="sticker-state">还没有收到过表情</span>
+                  <span v-else-if="!visibleStickers.length" class="sticker-state">
+                    {{ stickerTab === 'recent' ? '还没有收到过表情' : '这个表情包还没有图片' }}
+                  </span>
                   <div v-else class="sticker-grid">
                     <button
-                      v-for="sticker in stickers"
+                      v-for="sticker in visibleStickers"
                       :key="sticker.id"
                       type="button"
                       class="sticker-item"
                       :aria-label="`发送表情 ${sticker.fileName}`"
                       @click="pickSticker(sticker)"
                     >
-                      <img :src="`/api/files/${encodeURIComponent(sticker.id)}`" :alt="sticker.fileName" loading="lazy">
+                      <img :src="sticker.path" :alt="sticker.fileName" loading="lazy">
                     </button>
                   </div>
+                </div>
+              </div>
+              <div v-if="packManageOpen" class="pack-dialog-backdrop" @pointerdown.self="packManageOpen = false">
+                <div class="pack-dialog" role="dialog" aria-modal="true" aria-label="表情包">
+                  <header>
+                    <strong>表情包</strong>
+                    <button type="button" class="quiet-button" aria-label="关闭" @click="packManageOpen = false">
+                      <AppIcon name="dismiss" :size="12" />
+                    </button>
+                  </header>
+                  <form class="pack-create" @submit.prevent="createStickerPack">
+                    <input v-model="newPackName" maxlength="20" placeholder="新表情包名称" aria-label="新表情包名称">
+                    <button type="submit" :disabled="packBusy || !newPackName.trim()">新建</button>
+                  </form>
+                  <ul v-if="stickerPacks.length" class="pack-list">
+                    <li v-for="pack in stickerPacks" :key="pack.id" :class="{ active: pack.id === managedPackId }">
+                      <button type="button" class="pack-name" @click="selectManagedPack(pack.id)">
+                        {{ pack.name }} <small>{{ pack.images.length }}</small>
+                      </button>
+                      <button type="button" :disabled="packBusy" :aria-label="`上移 ${pack.name}`" @click="moveStickerPack(pack.id, -1)">上移</button>
+                      <button type="button" :disabled="packBusy" :aria-label="`下移 ${pack.name}`" @click="moveStickerPack(pack.id, 1)">下移</button>
+                    </li>
+                  </ul>
+                  <p v-else class="sticker-state">还没有表情包。输入名称新建一个。</p>
+                  <section v-if="managedPack" class="pack-detail">
+                    <form class="pack-create" @submit.prevent="renameStickerPack">
+                      <input v-model="renamedPackName" maxlength="20" aria-label="表情包名称">
+                      <button type="submit" :disabled="packBusy || !renamedPackName.trim() || renamedPackName.trim() === managedPack.name">重命名</button>
+                      <button type="button" class="danger" :disabled="packBusy" @click="deleteStickerPack">删除</button>
+                    </form>
+                    <div v-if="managedPack.images.length" class="sticker-grid">
+                      <div v-for="image in managedPack.images" :key="image.id" class="pack-image">
+                        <img :src="image.path" :alt="image.fileName" loading="lazy">
+                        <button type="button" :disabled="packBusy" :aria-label="`移除 ${image.fileName}`" @click="removePackImage(image)">
+                          <AppIcon name="dismiss" :size="12" />
+                        </button>
+                      </div>
+                    </div>
+                    <p v-else class="sticker-state">这个表情包还没有图片。</p>
+                    <label class="pack-add">
+                      添加图片
+                      <input type="file" multiple accept="image/png,image/jpeg,image/gif,image/webp" :disabled="packBusy" @change="addPackImages">
+                    </label>
+                    <template v-if="stickers?.length">
+                      <h4>从最近添加</h4>
+                      <div class="sticker-grid">
+                        <button
+                          v-for="sticker in stickers"
+                          :key="sticker.id"
+                          type="button"
+                          class="sticker-item"
+                          :disabled="packBusy"
+                          :aria-label="`添加 ${sticker.fileName}`"
+                          @click="collectSticker(sticker)"
+                        >
+                          <img :src="sticker.path" :alt="sticker.fileName" loading="lazy">
+                        </button>
+                      </div>
+                    </template>
+                  </section>
                 </div>
               </div>
               <span v-if="uploadingConversationIds.has(selectedId)" class="capability-hint"><span class="spinner small" />正在上传</span>

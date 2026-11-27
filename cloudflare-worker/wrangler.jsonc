@@ -36,6 +36,20 @@
 			"migrations_dir": "migrations"
 		}
 	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "COMMAND_SIGNAL",
+				"class_name": "CommandSignal"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["CommandSignal"]
+		}
+	],
 	"r2_buckets": [
 		{
 			"bucket_name": "message-center-files",

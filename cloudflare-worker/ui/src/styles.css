@@ -922,6 +922,32 @@ button { color: inherit; }
   background: var(--flyout-bg);
   box-shadow: var(--shadow-card);
 }
+.sticker-tabs { display: flex; gap: 2px; margin: -2px 0 6px; padding-bottom: 6px; overflow-x: auto; border-bottom: 1px solid var(--stroke-surface-flyout); }
+.sticker-tabs button { flex: none; padding: 3px 8px; border: 0; border-radius: 4px; color: var(--text-secondary); background: transparent; font: inherit; font-size: 12px; cursor: pointer; }
+.sticker-tabs button:hover { background: var(--row-hover); }
+.sticker-tabs button.active { color: var(--text-primary); background: var(--row-hover); font-weight: 600; }
+.sticker-tabs .sticker-manage { margin-left: auto; color: var(--accent-soft-text); }
+.pack-dialog-backdrop { position: fixed; z-index: 40; inset: 0; display: grid; place-items: center; background: rgb(0 0 0 / 35%); }
+.pack-dialog { display: flex; flex-direction: column; gap: 10px; width: min(440px, calc(100vw - 32px)); max-height: min(620px, calc(100vh - 32px)); padding: 14px; overflow-y: auto; border: 1px solid var(--stroke-surface-flyout); border-radius: 8px; background: var(--flyout-bg); box-shadow: var(--shadow-card); }
+.pack-dialog header { display: flex; align-items: center; justify-content: space-between; }
+.pack-dialog h4 { margin: 4px 0 0; font-size: 12px; color: var(--text-tertiary); }
+.pack-dialog button, .pack-add { font: inherit; font-size: 12px; cursor: pointer; }
+.pack-dialog button:disabled { cursor: not-allowed; opacity: .55; }
+.pack-create { display: flex; gap: 6px; }
+.pack-create input { flex: 1; min-width: 0; padding: 4px 8px; border: 1px solid var(--stroke-surface-flyout); border-radius: 4px; color: var(--text-primary); background: transparent; font: inherit; }
+.pack-create button, .pack-add, .pack-list button:not(.pack-name) { padding: 4px 8px; border: 1px solid var(--stroke-surface-flyout); border-radius: 4px; color: var(--text-primary); background: transparent; }
+.pack-create .danger { color: var(--danger-text); }
+.pack-list { display: flex; flex-direction: column; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.pack-list li { display: flex; align-items: center; gap: 4px; padding: 2px; border-radius: 4px; }
+.pack-list li.active { background: var(--row-hover); }
+.pack-list .pack-name { flex: 1; padding: 4px 6px; border: 0; color: var(--text-primary); background: transparent; text-align: left; }
+.pack-list small { color: var(--text-tertiary); }
+.pack-detail { display: flex; flex-direction: column; gap: 10px; }
+.pack-image { position: relative; display: grid; place-items: center; height: 64px; }
+.pack-image img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.pack-image button { position: absolute; top: 0; right: 0; display: grid; place-items: center; width: 18px; height: 18px; padding: 0; border: 0; border-radius: 50%; color: var(--text-primary); background: var(--flyout-bg); box-shadow: var(--shadow-card); }
+.pack-add { position: relative; align-self: flex-start; }
+.pack-add input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 .sticker-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); gap: 4px; }
 .sticker-item {
   display: grid;
