@@ -513,13 +513,14 @@ def scan(request, config):
         fingerprint = digest(row["preview"])
         unread = row["unread"] if isinstance(row["unread"], int) else 0
         state["conversations"][conversation] = {"name": row["name"], "folder": row["placement"] == "folded", "at": now}
+        traits = "{}{}{}".format(int(bool(row["muted"])), int(bool(row["pinned"])), row["placement"][0])
         changed = previous is None or previous.get("p") != fingerprint or unread > previous.get("u", 0)
-        if not changed:
+        if not changed and previous.get("s") == traits:
             continue
-        if len(messages) >= limit:
+        if (changed and len(messages) >= limit) or len(profiles) >= MAX_PROFILES:
             more = True
             continue
-        if not own_echo(state, conversation, [row["preview"], body], now):
+        if changed and not own_echo(state, conversation, [row["preview"], body], now):
             message = {
                 "externalId": "{}:{}:{}".format(conversation, fingerprint, now),
                 "conversationExternalId": conversation,
@@ -537,14 +538,16 @@ def scan(request, config):
             messages.append(message)
         profile = {"conversationExternalId": conversation, "displayName": row["name"][:200],
                    "conversationType": "group" if group else "direct", "placement": row["placement"],
-                   "pinned": bool(row["pinned"]), "muted": bool(row["muted"]),
-                   "lastMessagePreview": row["preview"][:500], "lastMessageAt": iso(now)}
+                   "pinned": bool(row["pinned"]), "muted": bool(row["muted"])}
+        if changed:
+            profile["lastMessagePreview"] = row["preview"][:500]
+            profile["lastMessageAt"] = iso(now)
         if isinstance(row["unread"], int):
             profile["unreadCount"] = row["unread"]
             profile["unreadObservedAt"] = iso(now)
-        if len(profiles) < MAX_PROFILES:
-            profiles.append(profile)
-        seen[conversation] = {"p": fingerprint, "u": unread, "g": group, "at": now}
+        profiles.append(profile)
+        seen[conversation] = {"p": fingerprint, "u": unread, "g": group, "s": traits,
+                              "at": now if changed else previous.get("at", now)}
     save_state(state)
     kept = sorted(seen.items(), key=lambda item: -item[1].get("at", 0))[:MAX_REMEMBERED]
     return {"ok": True, "sourceReadStatus": "complete", "health": "online",
