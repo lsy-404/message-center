@@ -7,8 +7,8 @@
 - `worker/index.js`：唯一生产运行时入口；不依赖 Pages、Sites、服务器或入站设备端口。
 - `ui/`：Vue 3 + Vite 前端。Worker 在认证后通过静态资产绑定返回带哈希的构建产物；页面与 API 均显式禁用缓存。图标为内联的 Fluent UI System Icons；会话行与消息带 `data-*` 状态属性、`<time datetime>` 时间与 ARIA 语义，供浏览器中的 AI agent 直接读取。收件箱在页面可见且联网时轮询，请求结束后才安排下一次刷新；失败时指数退避至最多 60 秒，页面隐藏或离线时暂停，恢复后立即刷新。
 - `worker/schema.sql`：D1 schema。`connector_instances` 是连接实例表，不对渠道类型设置唯一约束。
-- `connector_layout_control` 只服务于显式声明 `layout_control` 的单一设备 owner；云端使用 revision 做 CAS，设备本地动作另用持久化 generation 与 action ID 排序、去重。
-- `wrangler.jsonc`：本地开发与 Wrangler 生产部署配置。
+- `connector_instances.native_url`：实例可选的原生客户端远程桌面地址，由 `POST /api/connectors/register` 的 `nativeUrl` 写入，随 `/api/inbox` 的 `connectors[].nativeUrl` 返回。页面 CSP 的 `frame-src` 取所有已登记地址的 origin，没有登记时为 `'none'`。
+- 网页有两种模式：信息模式是会话列表、消息线程与输入框；原生模式在内容区以 iframe 嵌入该实例的 `nativeUrl`，直接操作真实客户端。会话标题栏和“接入管理”卡片在实例有 `nativeUrl` 时提供切换，每个实例的上次模式保存在浏览器 localStorage。- `wrangler.jsonc`：本地开发与 Wrangler 生产部署配置。
 - 客户端登录态和供应商凭据只保留在设备 relay 或对应云 relay 中。
 - relay 只向 `message.example.com` 发起出站 HTTPS。
 
@@ -23,7 +23,6 @@
 - `receive_images` / `send_images`
 - `receive_video` / `send_video`
 - `threads` / `reactions`
-- `layout_control`（仅 `device_relay`；每台物理设备只允许一个 owner）
 
 发送 API、网页输入框和 MCP 回复都会检查目标实例的实际能力。
 原生表情目前只能作为文本占位摘要入库，未实现独立媒体对象的收发，因此不声明表情收发能力。

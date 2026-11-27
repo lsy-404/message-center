@@ -1,7 +1,7 @@
 export const relayCapabilities = [
   'receive_text', 'send_text', 'receive_files', 'send_files',
   'receive_images', 'send_images', 'receive_video', 'send_video',
-  'threads', 'reactions', 'layout_control',
+  'threads', 'reactions',
 ] as const;
 
 export type RelayCapability = typeof relayCapabilities[number];
@@ -85,29 +85,6 @@ export function parseConnectorInstances(
 
 export function uniqueConnectorInstances(values: Record<string, RelayConnectorInstance>): RelayConnectorInstance[] {
   return [...new Map(Object.values(values).map((connector) => [connector.id, connector])).values()];
-}
-
-export function assignLayoutControlOwner(
-  connectors: RelayConnectorInstance[],
-  ownerConnectorId?: string,
-): RelayConnectorInstance[] {
-  const declared = connectors.filter((connector) => connector.capabilities.includes('layout_control'));
-  if (!ownerConnectorId) {
-    if (declared.length) throw new Error('layout_control_owner_required');
-    return connectors;
-  }
-  const owner = connectors.find((connector) => connector.id === ownerConnectorId);
-  if (!owner) throw new Error('layout_control_owner_not_found');
-  if (owner.mode !== 'device_relay') throw new Error('layout_control_owner_requires_device_relay');
-  if (declared.some((connector) => connector.id !== ownerConnectorId)) {
-    throw new Error('layout_control_capability_requires_owner');
-  }
-  return connectors.map((connector) => connector.id === ownerConnectorId
-    ? {
-      ...connector,
-      capabilities: [...new Set<RelayCapability>([...connector.capabilities, 'layout_control'])],
-    }
-    : connector);
 }
 
 export function parseConnectorTokens(

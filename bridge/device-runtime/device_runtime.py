@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-"""Small direct HTTPS relay for a device-resident private adapter."""
+"""Small direct HTTPS relay for a device adapter process."""
 
 import json
 import hashlib
 import http.client
 import os
 import re
-import stat
 import selectors
 import signal
 import sqlite3
-import tempfile
 import subprocess
 import sys
 import time
@@ -20,8 +18,6 @@ import urllib.parse
 import urllib.request
 
 from conversation_profiles import sync_profiles, sync_sender_avatars
-import device_activity
-import dirty_hint
 
 if os.name == "posix":
     import fcntl
@@ -29,8 +25,6 @@ if os.name == "posix":
 MAX_RESPONSE = 1024 * 1024
 MAX_SCAN_RESPONSE = 900 * 1024
 MAX_CURSOR_BYTES = 65_536
-MAX_QQ_CONFIRMED_SEND_READS = 8
-QQ_CONFIRMED_SEND_READ_ATTEMPTS = 3
 MAX_EVENT = 256 * 1024
 MAX_OUTBOX_BATCH_MESSAGES = 20
 MAX_OUTBOX_BATCH_BYTES = MAX_SCAN_RESPONSE
@@ -44,13 +38,6 @@ MAX_DELIVERIES_PER_PASS = 5
 HEARTBEAT_MIN_INTERVAL = 30
 ADAPTER_SCAN_TIMEOUT = 60
 ADAPTER_SEND_TIMEOUT = 130
-ADAPTER_WAKE_TIMEOUT = 55
-AUTO_WAKE_INTERVAL = 60
-SOURCE_RECOVERY_FAILURE_THRESHOLD = 3
-SOURCE_RECOVERY_COOLDOWN = 300
-SOURCE_STARTUP_SETTLE = 60
-WAKE_REASON = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
-QQ_RECEIVE_HINT_RELATIVE = ("signals/changed.json", "signals")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -59,97 +46,10 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class SourceReadError(RuntimeError):
-    def __init__(self, code, *, attach_failure_pid=None, query_gate_pending_pid=None,
-                 native_operation_uncertain_pid=None, native_operation_blocked_pid=None):
-        super().__init__(code)
-        self.attach_failure_pid = attach_failure_pid
-        self.query_gate_pending_pid = query_gate_pending_pid
-        self.native_operation_uncertain_pid = native_operation_uncertain_pid
-        self.native_operation_blocked_pid = native_operation_blocked_pid
-
-
-class SendPreDispatchError(RuntimeError):
     pass
 
 
-def explicit_native_query_gate_pending(value):
-    if type(value) is not dict or set(value) != {"stage", "errorCode", "dispatch", "processId"}:
-        return False
-    return (type(value["stage"]) is str and value["stage"] == "query_gate"
-            and type(value["errorCode"]) is str and value["errorCode"] == "native-query-busy"
-            and type(value["dispatch"]) is str and value["dispatch"] == "not_started"
-            and type(value["processId"]) is int and value["processId"] > 1)
-
-
-def explicit_native_attach_failure(value):
-    if type(value) is not dict or set(value) != {"stage", "errorCode", "dispatch", "processId"}:
-        return False
-    return (type(value["stage"]) is str and value["stage"] == "attach"
-            and type(value["errorCode"]) is str
-            and value["errorCode"] in {"attach_failed", "timeout"}
-            and type(value["dispatch"]) is str and value["dispatch"] == "not_started"
-            and type(value["processId"]) is int and value["processId"] > 1)
-
-
-def explicit_native_create_script_timeout(value):
-    if type(value) is not dict or set(value) != {"stage", "errorCode", "dispatch", "processId"}:
-        return False
-    return (type(value["stage"]) is str and value["stage"] == "create_script"
-            and type(value["errorCode"]) is str and value["errorCode"] == "timeout"
-            and type(value["dispatch"]) is str and value["dispatch"] == "not_started"
-            and type(value["processId"]) is int and value["processId"] > 1)
-
-
-def explicit_native_operation_uncertain(value):
-    if type(value) is not dict or set(value) != {
-            "stage", "errorCode", "cleanupCode", "cleanupStage", "dispatch", "processId"}:
-        return False
-    return (value["stage"] == "await_result" and value["errorCode"] == "timeout"
-            and value["cleanupCode"] == "cleanup_timeout"
-            and value["cleanupStage"] == "unload" and value["dispatch"] == "unknown"
-            and type(value["processId"]) is int and value["processId"] > 1)
-
-
-def explicit_native_cleanup_operation_uncertain(value):
-    if type(value) is not dict or set(value) != {
-            "stage", "errorCode", "cleanupCode", "cleanupStage",
-            "cleanupIncomplete", "phaseElapsedMs", "dispatch", "processId"}:
-        return False
-    phase = value["phaseElapsedMs"]
-    if (value["stage"] != "cleanup" or value["errorCode"] != "cleanup_timeout"
-            or value["cleanupCode"] != "cleanup_timeout"
-            or value["cleanupStage"] != "unload"
-            or type(value["cleanupIncomplete"]) is not bool
-            or value["dispatch"] != "confirmed"
-            or type(value["processId"]) is not int or value["processId"] <= 1
-            or type(phase) is not dict
-            or set(phase) - {"resultReceivedMs", "cleanupStartedMs", "unloadFinishedMs",
-                             "detachFinishedMs", "closeFinishedMs"}
-            or not {"resultReceivedMs", "cleanupStartedMs", "unloadFinishedMs"}.issubset(phase)
-            or not all(type(item) is int and 0 <= item <= 150000
-                       for item in phase.values())):
-        return False
-    previous = -1
-    for key in ("resultReceivedMs", "cleanupStartedMs", "unloadFinishedMs",
-                "detachFinishedMs", "closeFinishedMs"):
-        if key in phase:
-            if phase[key] < previous:
-                return False
-            previous = phase[key]
-    return phase["unloadFinishedMs"] - phase["cleanupStartedMs"] >= 5000
-
-
-def explicit_native_operation_blocked(value):
-    if type(value) is not dict or set(value) != {"stage", "errorCode", "dispatch", "processId"}:
-        return False
-    return (value["stage"] == "native_operation" and value["errorCode"] == "blocked_pid"
-            and value["dispatch"] == "not_started"
-            and type(value["processId"]) is int and value["processId"] > 1)
-
-
 def _event_route(message):
-    if message.get("presentation") == "system":
-        return "/api/connectors/events"
     default_trigger = "background" if message.get("conversationType") == "group" else "direct"
     background_group = (message.get("conversationType") == "group" and
                         message.get("trigger", default_trigger) == "background" and
@@ -225,176 +125,12 @@ def open_database(path):
         state TEXT NOT NULL,
         result TEXT, retryable INTEGER NOT NULL DEFAULT 0);
       CREATE UNIQUE INDEX IF NOT EXISTS command_ledger_key ON command_ledger(connector_id,idempotency_key);
-      CREATE TABLE IF NOT EXISTS source_recovery(
-        connector_id TEXT PRIMARY KEY, consecutive_failures INTEGER NOT NULL DEFAULT 0,
-        last_success_at REAL NOT NULL DEFAULT 0, retry_after REAL NOT NULL DEFAULT 0,
-        settle_until REAL NOT NULL DEFAULT 0);
     """)
     return db
 
 
 def compact(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-
-
-def verified_qq_external_id(profile, external_id, receipt_text):
-    if not isinstance(profile, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", profile):
-        return False
-    if not isinstance(receipt_text, str) or len(receipt_text) > 8192:
-        return False
-    try:
-        receipt = json.loads(receipt_text)
-    except (TypeError, ValueError):
-        return False
-    if not isinstance(receipt, dict):
-        return False
-    source_id = receipt.get("sourceId")
-    if not canonical_qq_source_id(source_id):
-        return False
-    value = 0x811C9DC5
-    for byte in source_id.encode("ascii"):
-        value = ((value ^ byte) * 0x01000193) & 0xFFFFFFFF
-    alias = f"message-{value:08x}"
-    return (receipt.get("messageAlias") == alias
-            and type(receipt.get("messageType")) is int and receipt["messageType"] == 1
-            and type(receipt.get("sendStatus")) is int and receipt["sendStatus"] == 2
-            and receipt.get("confirmation") == "verified-status"
-            and external_id == f"{profile}:qq-message:{source_id}")
-
-
-def canonical_qq_source_id(value):
-    if not isinstance(value, str) or len(value) > 20:
-        return False
-    if re.fullmatch(r"-?(?:0|[1-9][0-9]*)", value) is None or value == "-0":
-        return False
-    try:
-        numeric = int(value)
-    except ValueError:
-        return False
-    return -(1 << 63) <= numeric < (1 << 63)
-
-
-def canonical_qq_owner_uin(value):
-    return isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,18}", value) is not None
-
-
-def qq_directory_string(value, allow_empty=False):
-    if not isinstance(value, str) or (not allow_empty and not value) or len(value) > 256:
-        return False
-    if value.strip() != value or any(ord(character) < 0x20 or ord(character) == 0x7F
-                                     for character in value):
-        return False
-    try:
-        value.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return True
-
-
-def qq_conversation_alias(value):
-    digest = 0x811C9DC5
-    encoded = value.encode("utf-16-le")
-    for offset in range(0, len(encoded), 2):
-        unit = encoded[offset] | (encoded[offset + 1] << 8)
-        digest = ((digest ^ unit) * 0x01000193) & 0xFFFFFFFF
-    return f"conversation-{digest:08x}"
-
-
-def valid_qq_friend_directory(directory):
-    if (not isinstance(directory, dict)
-            or set(directory) != {"version", "ownerUin", "entries", "lastAttemptUin",
-                                  "lastAttemptAt", "nextMainItem"}
-            or directory.get("version") != "qfd1"
-            or not canonical_qq_owner_uin(directory.get("ownerUin"))
-            or not isinstance(directory.get("entries"), list)
-            or len(directory["entries"]) > 100):
-        return False
-    last_uin = directory.get("lastAttemptUin")
-    last_at = directory.get("lastAttemptAt")
-    next_item = directory.get("nextMainItem")
-    if last_uin is not None and not canonical_qq_owner_uin(last_uin):
-        return False
-    if (type(last_at) is not int or not 0 <= last_at <= 9007199254740991
-            or (last_uin is None) != (last_at == 0)
-            or type(next_item) is not int or not 0 <= next_item <= 512):
-        return False
-    seen_uins = set()
-    seen_uids = set()
-    seen_aliases = set()
-    for entry in directory["entries"]:
-        if (not isinstance(entry, dict) or set(entry) != {"peerUin", "peerUid", "guildId"}
-                or not canonical_qq_owner_uin(entry.get("peerUin"))
-                or not qq_directory_string(entry.get("peerUid"))
-                or not qq_directory_string(entry.get("guildId"), allow_empty=True)):
-            return False
-        alias = qq_conversation_alias(entry["peerUid"])
-        if (entry["peerUin"] in seen_uins or entry["peerUid"] in seen_uids
-                or alias in seen_aliases):
-            return False
-        seen_uins.add(entry["peerUin"])
-        seen_uids.add(entry["peerUid"])
-        seen_aliases.add(alias)
-    try:
-        return len(compact(directory).encode("utf-8")) <= 16 * 1024
-    except (TypeError, ValueError, UnicodeError, RecursionError):
-        return False
-
-
-def qq_priority_owner_uin(cursor, profile):
-    owners = []
-    directory = cursor.get("qqFriendDirectory")
-    if valid_qq_friend_directory(directory):
-        owners.append(directory["ownerUin"])
-    discovery = cursor.get("qqDiscoveryCache")
-    discovery_size_ok = False
-    if isinstance(discovery, list):
-        try:
-            discovery_size_ok = len(compact(discovery).encode("utf-8")) <= 24 * 1024
-        except (TypeError, ValueError, UnicodeError, RecursionError):
-            pass
-    if (isinstance(discovery, list) and len(discovery) == 8
-            and discovery[0] == "qdc3" and discovery[1] == profile
-            and type(discovery[2]) is int and discovery[2] > 1
-            and type(discovery[3]) is bool
-            and type(discovery[4]) is int and 3600 <= discovery[4] <= 604800
-            and type(discovery[5]) is int and 0 <= discovery[5] <= 9007199254740991
-            and isinstance(discovery[7], list) and len(discovery[7]) <= 200
-            and discovery_size_ok
-            and canonical_qq_owner_uin(discovery[6])):
-        owners.append(discovery[6])
-    if not owners or len(set(owners)) != 1:
-        return None
-    return owners[0]
-
-
-def valid_qq_confirmed_read_queue(value, owner_uin):
-    if not isinstance(value, list) or len(value) > MAX_QQ_CONFIRMED_SEND_READS:
-        return None
-    expected = {"ownerUin", "alias", "sourceId", "remainingAttempts"}
-    seen_aliases = set()
-    queue_owner = owner_uin
-    for entry in value:
-        if (not isinstance(entry, dict) or set(entry) != expected
-                or not canonical_qq_owner_uin(entry.get("ownerUin"))
-                or (queue_owner is not None and entry.get("ownerUin") != queue_owner)
-                or not isinstance(entry.get("alias"), str)
-                or re.fullmatch(r"conversation-[a-f0-9]{8}", entry["alias"]) is None
-                or entry["alias"] in seen_aliases
-                or not canonical_qq_source_id(entry.get("sourceId"))
-                or type(entry.get("remainingAttempts")) is not int
-                or not 1 <= entry["remainingAttempts"] <= QQ_CONFIRMED_SEND_READ_ATTEMPTS):
-            return None
-        if queue_owner is None:
-            queue_owner = entry["ownerUin"]
-        seen_aliases.add(entry["alias"])
-    return value
-
-
-def qq_command_conversation_alias(external_conversation_id):
-    if (not isinstance(external_conversation_id, str)
-            or re.fullmatch(r"conversation-[a-f0-9]{8}", external_conversation_id) is None):
-        return None
-    return external_conversation_id
 
 
 def resolve_local_paths(config, config_path):
@@ -404,39 +140,6 @@ def resolve_local_paths(config, config_path):
         if not os.path.isabs(config[key]):
             config[key] = os.path.join(base, config[key])
     return config
-
-
-def resolve_qq_receive_hint_paths(paths):
-    """Accept only the two canonical rootless signal paths with trusted metadata."""
-    if (device_activity.platform.system() != "Darwin" or
-            not isinstance(paths, (list, tuple)) or len(paths) != 2):
-        return None
-    jbroot = os.path.realpath("/var/jb")
-    if (not jbroot.startswith("/private/preboot/") or
-            not re.fullmatch(r"/private/preboot/[^/]+(?:/[^/]+)*", jbroot)):
-        return None
-    root = jbroot.rstrip("/") + "/var/mobile/Library/MessageCenterReceiveHints"
-    expected = tuple(root + "/" + item for item in QQ_RECEIVE_HINT_RELATIVE)
-    if tuple(paths) != expected:
-        return None
-    if any(os.path.realpath(path) != path for path in (root, expected[1], expected[0])):
-        return None
-    try:
-        import pwd
-        mobile_uid = pwd.getpwnam("mobile").pw_uid
-        root_info = os.lstat(root)
-        signals_info = os.lstat(expected[1])
-        changed_info = os.lstat(expected[0])
-    except (ImportError, KeyError, OSError):
-        return None
-    if (stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode) or
-            root_info.st_uid != 0 or stat.S_IMODE(root_info.st_mode) != 0o755 or
-            stat.S_ISLNK(signals_info.st_mode) or not stat.S_ISDIR(signals_info.st_mode) or
-            signals_info.st_uid != mobile_uid or stat.S_IMODE(signals_info.st_mode) != 0o700 or
-            stat.S_ISLNK(changed_info.st_mode) or not stat.S_ISREG(changed_info.st_mode) or
-            changed_info.st_uid != mobile_uid or stat.S_IMODE(changed_info.st_mode) != 0o600):
-        return None
-    return expected
 
 
 def run_adapter(path, request, timeout=30):
@@ -527,32 +230,11 @@ def adapter_timeout_for_request(request):
         return ADAPTER_SCAN_TIMEOUT
     if operation == "send":
         return ADAPTER_SEND_TIMEOUT
-    if operation == "ensure-active":
-        return ADAPTER_WAKE_TIMEOUT
     raise ValueError("unsupported_adapter_operation")
 
 
-def wake_error_category(error):
-    if isinstance(error, subprocess.TimeoutExpired):
-        return "timeout"
-    if isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)):
-        return "invalid_json"
-    if isinstance(error, OSError):
-        return "io_error"
-    if isinstance(error, RuntimeError):
-        return {
-            "adapter_timeout": "timeout",
-            "adapter_failed": "subprocess_failed",
-            "adapter_invalid_response": "invalid_schema",
-            "adapter_response_too_large": "response_too_large",
-            "adapter_spawn_failed": "spawn_error",
-        }.get(str(error), "adapter_error")
-    return "adapter_error"
-
-
 class Relay:
-    def __init__(self, config, db=None, adapter_call=None, http_call=None,
-                 activity_monitor=None, dirty_watcher=None):
+    def __init__(self, config, db=None, adapter_call=None, http_call=None):
         self.config = config
         self.db = db or open_database(config["database"])
         self.adapter_call = adapter_call or (
@@ -563,8 +245,6 @@ class Relay:
         if not self.base.startswith("https://"):
             raise ValueError("https_required")
         self.connectors = config["connectors"]
-        if "autoWake" in config and type(config["autoWake"]) is not bool:
-            raise ValueError("invalid_auto_wake_configuration")
         self.media_directory = os.path.abspath(config.get("mediaDirectory", config["database"] + ".media"))
         if not os.path.isdir(self.media_directory):
             os.makedirs(self.media_directory, mode=0o700)
@@ -580,37 +260,15 @@ class Relay:
             if (not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._:-]{7,199}", connector["id"]) or
                     len(connector["token"]) < 32):
                 raise ValueError("invalid_connector_configuration")
+            native_url = connector.get("nativeUrl")
+            if native_url is not None and (
+                    not isinstance(native_url, str) or len(native_url) > 500
+                    or urllib.parse.urlsplit(native_url).scheme not in ("http", "https")
+                    or not urllib.parse.urlsplit(native_url).netloc):
+                raise ValueError("invalid_native_url")
         self.connector_by_id = {item["id"]: item for item in self.connectors}
-        self.native_operation_state_path = self.config["database"] + ".native-operation.json"
-        self.native_operation_uncertain, self.native_operation_state_unavailable = (
-            self._load_native_operation_state())
-        self.auto_wake = config.get("autoWake") is True
-        if self.auto_wake and any(item.get("kind") != "qq" for item in self.connectors):
-            raise ValueError("auto_wake_requires_qq_only")
-        self.wake_ready = not self.auto_wake
-        self.wake_readiness_established = not self.auto_wake
-        self.last_wake_attempt = float("-inf")
-        self.wake_ready_at = float("-inf")
-        self.last_logged_wake_state = None
-        self.wake_scan_pending = set()
-        self.wake_scan_failures = {item["id"]: 0 for item in self.connectors}
-        self.wake_scan_retry_at = {item["id"]: 0 for item in self.connectors}
-        recovery_rows = {row[0]: row[1:] for row in self.db.execute(
-            "SELECT connector_id,consecutive_failures,last_success_at,retry_after,settle_until FROM source_recovery")}
-        self.source_failures = {item["id"]: recovery_rows.get(item["id"], (0, 0, 0))[0]
-                                for item in self.connectors}
-        self.attach_failure_streak = {item["id"]: (None, 0) for item in self.connectors}
-        self.query_gate_failure_streak = {item["id"]: (None, 0) for item in self.connectors}
-        self.source_last_success = {item["id"]: recovery_rows.get(item["id"], (0, 0, 0, 0))[1]
-                                    for item in self.connectors}
-        self.source_recovery_after = {item["id"]: recovery_rows.get(item["id"], (0, 0, 0, 0))[2]
-                                      for item in self.connectors}
-        self.source_settle_until = {item["id"]: recovery_rows.get(item["id"], (0, 0, 0, 0))[3]
-                                    for item in self.connectors}
-        self.source_state_durable = {item["id"]: True for item in self.connectors}
         self.connector = self.connectors[0]["id"]
         self.health = {item["id"]: False for item in self.connectors}
-        self.partial_read = {item["id"]: False for item in self.connectors}
         self.last_scan = {item["id"]: float("-inf") for item in self.connectors}
         self.scan_interval = {item["id"]: 300 for item in self.connectors}
         self.registered = set()
@@ -623,204 +281,9 @@ class Relay:
         self.heartbeat_retry_at = {item["id"]: 0 for item in self.connectors}
         self.heartbeat_last_state = {item["id"]: None for item in self.connectors}
         self.heartbeat_last_sent = {item["id"]: float("-inf") for item in self.connectors}
-        if activity_monitor is not None:
-            self.activity_monitor = activity_monitor
-        elif device_activity.platform.system() == "Darwin":
-            self.activity_monitor = device_activity.create_monitor(
-                config["database"] + ".activity.json",
-                readable_state_path=device_activity.SHARED_MIRROR_ALIAS)
-        else:
-            self.activity_monitor = device_activity.create_monitor(
-                config["database"] + ".activity.json")
-        self.activity_monitor.start()
-        self.activity_pause_active = False
-        self.activity_fresh_required = set()
-        self.activity_resume_pending = False
-        self.activity_resume_token = None
-        self.dirty_watcher = dirty_watcher if dirty_watcher is not None else dirty_hint.DirtyHint()
-
-    def _load_native_operation_state(self):
-        descriptor = -1
-        try:
-            descriptor = os.open(self.native_operation_state_path,
-                                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-                                | getattr(os, "O_CLOEXEC", 0)
-                                | (getattr(os, "O_NONBLOCK", 0) if os.name == "posix" else 0))
-            metadata = os.fstat(descriptor)
-            if (not stat.S_ISREG(metadata.st_mode) or
-                    (os.name == "posix" and hasattr(os, "getuid")
-                     and metadata.st_uid != os.getuid()) or
-                    (os.name == "posix" and stat.S_IMODE(metadata.st_mode) != 0o600) or
-                    metadata.st_size > 4096):
-                return {}, True
-            encoded = os.read(descriptor, 4097)
-            if len(encoded) > 4096:
-                return {}, True
-            value = json.loads(encoded.decode("utf-8"))
-            if (type(value) is not dict or set(value) != {"version", "entries"}
-                    or value["version"] != 1 or type(value["entries"]) is not dict):
-                return {}, True
-            result = {}
-            for connector_id, entry in value["entries"].items():
-                if (connector_id in self.connector_by_id and type(entry) is int
-                        and entry > 1):
-                    result[connector_id] = entry
-                elif connector_id in self.connector_by_id:
-                    return {}, True
-            return result, False
-        except FileNotFoundError:
-            return {}, False
-        except (OSError, UnicodeDecodeError, ValueError, TypeError):
-            return {}, True
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-
-    def _persist_native_operation_state(self):
-        payload = {"version": 1, "entries": self.native_operation_uncertain}
-        descriptor = -1
-        temporary_path = None
-        try:
-            parent = os.path.dirname(self.native_operation_state_path)
-            parent_info = os.lstat(parent)
-            if not stat.S_ISDIR(parent_info.st_mode) or stat.S_ISLNK(parent_info.st_mode):
-                raise OSError("invalid_state_parent")
-            encoded = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
-            if len(encoded) > 4096:
-                raise OSError("state_too_large")
-            descriptor, temporary_name = tempfile.mkstemp(prefix=".native-operation.", dir=parent)
-            temporary_path = temporary_name
-            if hasattr(os, "fchmod"):
-                os.fchmod(descriptor, 0o600)
-            else:
-                os.chmod(temporary_name, 0o600)
-            metadata = os.fstat(descriptor)
-            if (not stat.S_ISREG(metadata.st_mode) or
-                    (os.name == "posix" and stat.S_IMODE(metadata.st_mode) != 0o600)):
-                raise OSError("invalid_state_mode")
-            offset = 0
-            while offset < len(encoded):
-                written = os.write(descriptor, encoded[offset:])
-                if written <= 0:
-                    raise OSError("state_write_failed")
-                offset += written
-            os.fsync(descriptor)
-            os.close(descriptor)
-            descriptor = -1
-            os.replace(temporary_path, self.native_operation_state_path)
-            temporary_path = None
-            if os.name == "posix":
-                directory_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-                                       | getattr(os, "O_NOFOLLOW", 0))
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-            self.native_operation_state_unavailable = False
-            return True
-        except (OSError, TypeError, ValueError):
-            self.native_operation_state_unavailable = True
-            if descriptor >= 0:
-                os.close(descriptor)
-            try:
-                if temporary_path is not None:
-                    os.unlink(temporary_path)
-            except OSError:
-                pass
-            return False
-
-    def _block_native_operation(self, connector_id, process_id):
-        if type(process_id) is int and process_id > 1:
-            self.native_operation_uncertain[connector_id] = process_id
-            self._persist_native_operation_state()
-
-    def _clear_native_operation(self, connector_id):
-        if connector_id in self.native_operation_uncertain:
-            previous = self.native_operation_uncertain[connector_id]
-            del self.native_operation_uncertain[connector_id]
-            if not self._persist_native_operation_state():
-                self.native_operation_uncertain[connector_id] = previous
-                return False
-        return True
-
-    def activity_state(self):
-        try:
-            state = self.activity_monitor.snapshot()
-        except Exception:
-            state = None
-        if (not isinstance(state, dict) or type(state.get("healthy")) is not bool or
-                type(state.get("armed")) is not bool or
-                type(state.get("shouldPause")) is not bool or
-                type(state.get("cleanupRequired")) is not bool):
-            state = {"healthy": False, "armed": True, "shouldPause": True,
-                     "cleanupRequired": True, "reason": "activity_state_unknown"}
-        paused = state["shouldPause"] or state["armed"] or not state["healthy"]
-        was_paused = self.activity_pause_active
-        if paused and not was_paused:
-            self.activity_resume_pending = False
-            self.activity_resume_token = None
-            self.activity_fresh_required.update(self.connector_by_id)
-            for connector_id in self.connector_by_id:
-                self.health[connector_id] = False
-                self.last_scan[connector_id] = float("-inf")
-            self.wake_ready = False
-        elif was_paused and not paused:
-            if state["cleanupRequired"]:
-                request_fields = getattr(self.activity_monitor, "request_fields", None)
-                fields = request_fields() if callable(request_fields) else None
-                token = fields.get("activityResumeToken") if isinstance(fields, dict) else None
-                if type(token) is str and token:
-                    self.activity_resume_pending = True
-                    self.activity_resume_token = token
-                else:
-                    paused = True
-                    state = state | {"healthy": False, "armed": True,
-                                     "reason": "activity_resume_token_unknown"}
-        self.activity_pause_active = paused
-        return state | {"shouldPause": paused}
-
-    def activity_paused(self):
-        return self.activity_state()["shouldPause"]
 
     def close(self):
-        try:
-            self.dirty_watcher.close()
-        except Exception:
-            pass
-        try:
-            self.activity_monitor.stop()
-        except Exception:
-            pass
-
-    def call_adapter(self, request):
-        request_fields = getattr(self.activity_monitor, "request_fields", None)
-        if callable(request_fields):
-            guarded_request = dict(request)
-            fields = request_fields()
-            if (not isinstance(fields, dict) or set(fields) != {
-                    "activityStatePath", "activityMonitorId", "activityRuntimePid",
-                    "activityResumeToken"}):
-                raise RuntimeError("activity_request_state_invalid")
-            guarded_request.update(fields)
-            if request.get("op") == "ensure-active" and self.activity_resume_pending:
-                guarded_request["activityResumeCleanup"] = True
-                guarded_request["activityResumeToken"] = self.activity_resume_token
-            request = guarded_request
-        response = self.adapter_call(request)
-        if (request.get("activityResumeCleanup") is True and
-                isinstance(response, dict) and
-                response.get("activityResumeCleanupComplete") is True and
-                response.get("activityResumeCleanupToken") ==
-                request.get("activityResumeToken") == self.activity_resume_token):
-            acknowledge = getattr(self.activity_monitor, "acknowledge_cleanup", None)
-            if not callable(acknowledge) or not acknowledge(self.activity_resume_token):
-                return response
-            response = dict(response)
-            response.pop("activityResumeCleanupComplete")
-            response.pop("activityResumeCleanupToken")
-            self.activity_resume_pending = False
-            self.activity_resume_token = None
-        return response
+        self.db.close()
 
     def media_directory_for(self, connector_id):
         if not any(item["id"] == connector_id for item in self.connectors):
@@ -860,142 +323,6 @@ class Relay:
         self.outbox_failures[connector_id] = 0
         self.outbox_retry_at[connector_id] = 0
 
-    def persist_source_state(self, connector_id):
-        try:
-            self.db.execute(
-                "INSERT INTO source_recovery(connector_id,consecutive_failures,last_success_at,retry_after,settle_until) "
-                "VALUES(?,?,?,?,?) ON CONFLICT(connector_id) DO UPDATE SET "
-                "consecutive_failures=excluded.consecutive_failures,last_success_at=excluded.last_success_at,"
-                "retry_after=excluded.retry_after,settle_until=excluded.settle_until",
-                (connector_id, self.source_failures[connector_id], self.source_last_success[connector_id],
-                 self.source_recovery_after[connector_id], self.source_settle_until[connector_id]),
-            )
-            self.db.commit()
-        except sqlite3.Error:
-            self.source_state_durable[connector_id] = False
-            try:
-                self.db.rollback()
-            except sqlite3.Error:
-                pass
-            return False
-        self.source_state_durable[connector_id] = True
-        return True
-
-    def source_read_failed(self, connector_id, attach_failure_pid=None, query_gate_pending_pid=None):
-        self.partial_read[connector_id] = False
-        self.source_failures[connector_id] += 1
-        current_pid, count = self.attach_failure_streak[connector_id]
-        if self.auto_wake and type(attach_failure_pid) is int and attach_failure_pid > 1:
-            self.attach_failure_streak[connector_id] = (
-                attach_failure_pid, count + 1 if current_pid == attach_failure_pid else 1)
-        else:
-            self.attach_failure_streak[connector_id] = (None, 0)
-        gate_pid, gate_count = self.query_gate_failure_streak[connector_id]
-        if self.auto_wake and type(query_gate_pending_pid) is int and query_gate_pending_pid > 1:
-            self.query_gate_failure_streak[connector_id] = (
-                query_gate_pending_pid, gate_count + 1 if gate_pid == query_gate_pending_pid else 1)
-        else:
-            self.query_gate_failure_streak[connector_id] = (None, 0)
-        return self.persist_source_state(connector_id)
-
-    def source_read_succeeded(self, connector_id):
-        self.partial_read[connector_id] = False
-        self.source_failures[connector_id] = 0
-        self.attach_failure_streak[connector_id] = (None, 0)
-        self.query_gate_failure_streak[connector_id] = (None, 0)
-        self.source_last_success[connector_id] = time.time()
-        self.persist_source_state(connector_id)
-
-    def source_read_partial(self, connector_id, completed_pages):
-        self.partial_read[connector_id] = True
-        self.source_failures[connector_id] = 0
-        self.attach_failure_streak[connector_id] = (None, 0)
-        self.query_gate_failure_streak[connector_id] = (None, 0)
-        if completed_pages > 0:
-            self.source_last_success[connector_id] = time.time()
-        self.persist_source_state(connector_id)
-
-    def recover_source_after_failures(self, connector_id):
-        now = time.time()
-        if (not self.auto_wake
-                or not self.source_state_durable[connector_id]
-                or self.source_failures[connector_id] < SOURCE_RECOVERY_FAILURE_THRESHOLD
-                or now < self.source_recovery_after[connector_id]
-                or now < self.source_settle_until[connector_id]):
-            return False
-        self.source_recovery_after[connector_id] = now + SOURCE_RECOVERY_COOLDOWN
-        if not self.persist_source_state(connector_id):
-            return False
-        self.health[connector_id] = False
-        try:
-            result = self.ensure_active(recovery_driver=self.connector_by_id[connector_id].get("kind"))
-        except Exception:
-            return False
-        return result
-
-    def recover_attach_after_failures(self, connector_id):
-        now = time.time()
-        if (not self.auto_wake
-                or not self.source_state_durable[connector_id]
-                or self.attach_failure_streak[connector_id][1] < SOURCE_RECOVERY_FAILURE_THRESHOLD
-                or now < self.source_recovery_after[connector_id]
-                or now < self.source_settle_until[connector_id]):
-            return False
-        self.source_recovery_after[connector_id] = now + SOURCE_RECOVERY_COOLDOWN
-        if not self.persist_source_state(connector_id):
-            return False
-        self.health[connector_id] = False
-        try:
-            return self.ensure_active(
-                recovery_driver=self.connector_by_id[connector_id].get("kind"),
-                recovery_reason="attach_failure",
-                observed_pid=self.attach_failure_streak[connector_id][0],
-            )
-        except Exception:
-            return False
-
-    def recover_query_gate_after_failures(self, connector_id):
-        now = time.time()
-        streak = self.query_gate_failure_streak[connector_id]
-        if (not self.auto_wake
-                or not self.source_state_durable[connector_id]
-                or streak[1] < SOURCE_RECOVERY_FAILURE_THRESHOLD
-                or now < self.source_recovery_after[connector_id]
-                or now < self.source_settle_until[connector_id]):
-            return False
-        self.source_recovery_after[connector_id] = now + SOURCE_RECOVERY_COOLDOWN
-        self.query_gate_failure_streak[connector_id] = (None, 0)
-        if not self.persist_source_state(connector_id):
-            return False
-        self.health[connector_id] = False
-        try:
-            return self.ensure_active(
-                recovery_driver=self.connector_by_id[connector_id].get("kind"),
-                recovery_reason="query_gate_pending",
-                observed_pid=streak[0],
-            )
-        except Exception:
-            return False
-
-    def recover_native_operation_after_uncertain(self, connector_id, observed_pid):
-        now = time.time()
-        if (not self.auto_wake or not self.source_state_durable[connector_id]
-                or now < self.source_recovery_after[connector_id]
-                or now < self.source_settle_until[connector_id]):
-            return False
-        self.source_recovery_after[connector_id] = now + SOURCE_RECOVERY_COOLDOWN
-        if not self.persist_source_state(connector_id):
-            return False
-        self.health[connector_id] = False
-        try:
-            return self.ensure_active(
-                recovery_driver=self.connector_by_id[connector_id].get("kind"),
-                recovery_reason="native_operation_uncertain",
-                observed_pid=observed_pid,
-            )
-        except Exception:
-            return False
-
     def heartbeat_failed(self, connector_id):
         count = self.heartbeat_failures[connector_id] + 1
         self.heartbeat_failures[connector_id] = count
@@ -1026,13 +353,9 @@ class Relay:
         self.heartbeat_last_sent[connector_id] = time.monotonic()
         return True
 
-    def connector_heartbeat_state(self, connector_id, ready):
-        if (self.activity_paused() or not ready or not self.wake_readiness_current()
-                or connector_id in self.activity_fresh_required
-                or time.monotonic() - self.last_scan[connector_id] > self.scan_interval[connector_id] + 30):
+    def connector_heartbeat_state(self, connector_id):
+        if time.monotonic() - self.last_scan[connector_id] > self.scan_interval[connector_id] + 30:
             return "offline"
-        if self.partial_read[connector_id]:
-            return "degraded"
         return "online" if self.health[connector_id] else "offline"
 
     def select_connector(self, connector):
@@ -1167,8 +490,6 @@ class Relay:
             raise
 
     def scan_profile(self, profile, history=False):
-        if self.activity_paused():
-            return None
         ceiling = max(1, int(self.config.get("outboxMaxBytes", DEFAULT_OUTBOX_BYTES)) // len(self.connectors))
         if self.count_bytes(self.connector) >= ceiling:
             return None
@@ -1181,75 +502,33 @@ class Relay:
         driver = connector.get("kind")
         if driver not in {"qq", "wechat"}:
             raise RuntimeError("unsupported_connector_driver")
-        if driver == "qq" and self.native_operation_state_unavailable:
-            raise SourceReadError("native_operation_state_unavailable")
         scan_request = {"op": "scan", "driver": driver,
                                         "profile": profile, "cursor": cursor,
                                         "limit": limit, "maxBytes": MAX_SCAN_RESPONSE,
                                         "maxEventBytes": MAX_EVENT, "mediaDirectory": self.media_directory_for(self.connector),
                                         "maxMediaBytes": remaining, "history": bool(history)}
-        blocked_pid = self.native_operation_uncertain.get(self.connector)
-        if driver == "qq" and type(blocked_pid) is int and blocked_pid > 1:
-            scan_request["blockedProcessId"] = blocked_pid
         try:
-            result = self.call_adapter(scan_request)
+            result = self.adapter_call(scan_request)
         except Exception as error:
             raise SourceReadError("source_read_failed") from error
-        if self.activity_paused():
-            return None
         if not isinstance(result, dict):
             raise RuntimeError("invalid_scan_result")
-        receive_hint_paths = result.pop("receiveHintPaths", None)
-        validated_receive_hint_paths = None
-        if driver == "qq" and receive_hint_paths is not None:
-            validated_receive_hint_paths = resolve_qq_receive_hint_paths(receive_hint_paths)
         source_read_status = result.get("sourceReadStatus")
         if ("sourceReadOk" in result
                 or type(source_read_status) is not str
-                or source_read_status not in {"complete", "partial", "failed"}):
-            raise RuntimeError("invalid_scan_result")
-        if source_read_status != "partial" and "readStatistics" in result:
+                or source_read_status not in {"complete", "failed"}):
             raise RuntimeError("invalid_scan_result")
         if source_read_status == "failed":
             if result.get("ok") is not False:
                 raise RuntimeError("invalid_scan_result")
-            failure = result.get("nativeFailure")
-            raise SourceReadError(
-                "source_read_failed",
-                attach_failure_pid=(failure["processId"]
-                                    if (explicit_native_attach_failure(failure)
-                                        or explicit_native_create_script_timeout(failure)) else None),
-                query_gate_pending_pid=(failure["processId"]
-                                        if explicit_native_query_gate_pending(failure) else None),
-                native_operation_uncertain_pid=(failure["processId"]
-                                               if (explicit_native_operation_uncertain(failure)
-                                                   or explicit_native_cleanup_operation_uncertain(failure)) else None),
-                native_operation_blocked_pid=(failure["processId"]
-                                              if explicit_native_operation_blocked(failure) else None),
-            )
+            code = result.get("error")
+            raise SourceReadError(code if isinstance(code, str) and re.fullmatch(r"[a-z0-9_]{1,40}", code) else "source_read_failed")
         if (result.get("ok") is not True or "cursor" not in result or
                 not isinstance(result.get("messages"), list)):
             raise RuntimeError("invalid_scan_result")
         health = result.get("health")
         if not isinstance(health, str) or health not in {"online", "degraded"}:
             raise RuntimeError("invalid_scan_health")
-        partial_completed_pages = None
-        if source_read_status == "partial":
-            statistics = result.get("readStatistics")
-            if (driver != "qq" or health != "degraded"
-                    or type(statistics) is not dict
-                    or set(statistics) != {"attemptedPages", "completedPages", "failedPages"}):
-                raise RuntimeError("invalid_scan_partial")
-            attempted_pages = statistics["attemptedPages"]
-            partial_completed_pages = statistics["completedPages"]
-            failed_pages = statistics["failedPages"]
-            if (any(isinstance(value, bool) or type(value) is not int
-                    for value in (attempted_pages, partial_completed_pages, failed_pages))
-                    or not 1 <= attempted_pages <= 2
-                    or not 0 <= partial_completed_pages <= 2
-                    or not 1 <= failed_pages <= 2
-                    or partial_completed_pages + failed_pages != attempted_pages):
-                raise RuntimeError("invalid_scan_partial")
         if len(compact(result).encode("utf-8")) > MAX_SCAN_RESPONSE:
             raise RuntimeError("scan_response_too_large")
         messages = result["messages"]
@@ -1281,24 +560,13 @@ class Relay:
                 raise RuntimeError("invalid_event")
             if "isSelf" in message and type(message["isSelf"]) is not bool:
                 raise RuntimeError("invalid_event")
-            presentation = message.get("presentation")
-            if "presentation" in message and presentation != "system":
+            if "presentation" in message:
                 raise RuntimeError("invalid_event_presentation")
             attachments = message.get("attachments", [])
             if attachments is None:
                 attachments = []
             if not isinstance(attachments, list) or len(attachments) > 20:
                 raise RuntimeError("invalid_attachments")
-            if presentation == "system":
-                body = message.get("body", "")
-                content_type = message.get("contentType", "text")
-                try:
-                    body_length = len(body.encode("utf-16-le")) // 2
-                except UnicodeEncodeError:
-                    raise RuntimeError("invalid_event_presentation")
-                if (driver != "qq" or message.get("isSelf") is not False or attachments or
-                        content_type not in (None, "", "text") or not body.strip() or body_length > 20000):
-                    raise RuntimeError("invalid_event_presentation")
             normalized_attachments = []
             for attachment in attachments:
                 normalized_attachments.append(self.validate_staged_attachment(attachment))
@@ -1347,8 +615,6 @@ class Relay:
         candidate = compact(result.get("cursor"))
         if len(candidate.encode("utf-8")) > MAX_CURSOR_BYTES:
             raise RuntimeError("cursor_too_large")
-        if self.activity_paused():
-            return None
         sync_profiles(self, result.get("conversationProfiles", []))
         sync_sender_avatars(self, result.get("senderAvatars", []))
         self.db.execute("BEGIN IMMEDIATE")
@@ -1396,98 +662,9 @@ class Relay:
         except Exception:
             self.db.rollback()
             raise
-        if driver == "qq" and receive_hint_paths is not None:
-            self.dirty_watcher.set_paths(validated_receive_hint_paths or [])
         active = result.get("active") is True
         self.scan_interval[self.connector] = 15 if result.get("more") is True else (60 if active else 300)
-        if not self._clear_native_operation(self.connector):
-            self.health[self.connector] = False
-            raise SourceReadError("native_operation_state_persist_failed")
-        if source_read_status == "partial":
-            self.source_read_partial(self.connector, partial_completed_pages)
-        else:
-            self.source_read_succeeded(self.connector)
         return result.get("health") == "online"
-
-    def ensure_active(self, recovery_driver=None, recovery_reason="read_failure", observed_pid=None):
-        if self.activity_paused():
-            return False
-        if not self.auto_wake:
-            return True
-        now = time.monotonic()
-        if (recovery_driver is None and now - self.last_wake_attempt < AUTO_WAKE_INTERVAL):
-            return self.wake_readiness_current()
-        self.last_wake_attempt = now
-        was_ready = self.wake_ready
-        self.wake_ready = False
-        try:
-            request = {"op": "ensure-active", "driver": "qq"}
-            if recovery_driver is not None:
-                if (recovery_driver != "qq"
-                        or recovery_reason not in {"read_failure", "attach_failure", "query_gate_pending",
-                                                   "native_operation_uncertain"}
-                        or (recovery_reason in {"attach_failure", "query_gate_pending",
-                                                "native_operation_uncertain"}
-                            and (type(observed_pid) is not int or observed_pid <= 1))):
-                    raise RuntimeError("invalid_recovery_driver")
-                request.update({"reason": recovery_reason, "driver": recovery_driver})
-                if recovery_reason in {"attach_failure", "query_gate_pending", "native_operation_uncertain"}:
-                    request["observedPid"] = observed_pid
-            result = self.call_adapter(request)
-            if (not isinstance(result, dict) or set(result) != {"ok", "ready", "attempted", "reason"} or
-                    result.get("ok") is not True or type(result.get("ready")) is not bool or
-                    type(result.get("attempted")) is not bool or
-                    (result["ready"] and result["attempted"]) or
-                    not isinstance(result.get("reason"), str) or not WAKE_REASON.fullmatch(result["reason"])):
-                self.wake_ready = False
-                self.log_wake_state(False, False, "invalid_schema")
-                return False
-            self.wake_ready = result["ready"]
-            self.wake_ready_at = time.monotonic()
-            if self.wake_ready and not was_ready:
-                self.wake_scan_pending = set(self.connector_by_id)
-                if not self.wake_readiness_established:
-                    self.wake_readiness_established = True
-                    settle_until = time.time() + SOURCE_STARTUP_SETTLE
-                    for connector_id in self.connector_by_id:
-                        self.health[connector_id] = False
-                        self.source_settle_until[connector_id] = settle_until
-                        self.persist_source_state(connector_id)
-            if result["attempted"]:
-                settle_until = time.time() + SOURCE_STARTUP_SETTLE
-                for connector_id in self.connector_by_id:
-                    self.health[connector_id] = False
-                    self.source_settle_until[connector_id] = settle_until
-                    self.persist_source_state(connector_id)
-            self.log_wake_state(result["ready"], result["attempted"], result["reason"])
-            return self.wake_readiness_current()
-        except Exception as error:
-            self.wake_ready = False
-            self.log_wake_state(False, False, wake_error_category(error))
-            return False
-
-    def log_wake_state(self, ready, attempted, reason):
-        state = (ready, attempted, reason)
-        if state == self.last_logged_wake_state:
-            return
-        self.last_logged_wake_state = state
-        observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-        sys.stderr.write(compact({"observedAt": observed_at, "ready": ready,
-                                  "attempted": attempted, "reason": reason}) + "\n")
-        sys.stderr.flush()
-
-    def wake_readiness_current(self):
-        return (not self.auto_wake or
-                (self.wake_ready and time.monotonic() - self.wake_ready_at < AUTO_WAKE_INTERVAL))
-
-    def wake_scan_failed(self, connector_id):
-        count = self.wake_scan_failures[connector_id] + 1
-        self.wake_scan_failures[connector_id] = count
-        self.wake_scan_retry_at[connector_id] = time.monotonic() + min(15 * (2 ** min(count - 1, 5)), 300)
-
-    def wake_scan_succeeded(self, connector_id):
-        self.wake_scan_failures[connector_id] = 0
-        self.wake_scan_retry_at[connector_id] = 0
 
     def validate_staged_attachment(self, attachment):
         if not isinstance(attachment, dict):
@@ -1626,139 +803,7 @@ class Relay:
         self.http_call("POST", "/api/connectors/commands/" + urllib.parse.quote(command["id"], safe="") + "/complete",
                        {"connectorId": self.connector, "leaseToken": command["leaseToken"], **result})
 
-    def qq_send_cursor(self, connector, profile):
-        if (not isinstance(connector, dict) or connector.get("id") != self.connector
-                or connector.get("kind") != "qq" or connector.get("profile") != profile
-                or not isinstance(profile, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", profile)):
-            raise SendPreDispatchError("qq_send_scope_mismatch")
-        try:
-            row = self.db.execute(
-                "SELECT value FROM cursors WHERE connector_id=? AND profile=?",
-                (self.connector, profile),
-            ).fetchone()
-        except sqlite3.Error:
-            raise SendPreDispatchError("qq_send_cursor_unavailable") from None
-        if row is None:
-            raise SendPreDispatchError("qq_send_cursor_unavailable")
-        try:
-            raw_cursor = row[0]
-            if not isinstance(raw_cursor, str) or len(raw_cursor.encode("utf-8")) > MAX_CURSOR_BYTES:
-                raise SendPreDispatchError("qq_send_cursor_oversized")
-            cursor = json.loads(raw_cursor)
-            encoded_size = len(compact(cursor).encode("utf-8"))
-        except SendPreDispatchError:
-            raise
-        except (TypeError, ValueError, UnicodeError):
-            raise SendPreDispatchError("qq_send_cursor_invalid") from None
-        if (not isinstance(cursor, dict) or cursor.get("version") != 1
-                or not isinstance(cursor.get("conversations"), dict)):
-            raise SendPreDispatchError("qq_send_cursor_invalid")
-        if encoded_size > MAX_CURSOR_BYTES:
-            raise SendPreDispatchError("qq_send_cursor_oversized")
-        return cursor
-
-    def _register_qq_confirmed_read(self, profile, alias, source_id):
-        connector = self.connector_by_id.get(self.connector, {})
-        if (connector.get("kind") != "qq" or connector.get("profile") != profile
-                or not isinstance(profile, str)
-                or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", profile)
-                or not isinstance(alias, str)
-                or re.fullmatch(r"conversation-[a-f0-9]{8}", alias) is None
-                or not canonical_qq_source_id(source_id)):
-            return
-        savepoint_started = False
-        try:
-            self.db.execute("SAVEPOINT qq_confirmed_read")
-            savepoint_started = True
-            row = self.db.execute(
-                "SELECT value FROM cursors WHERE connector_id=? AND profile=?",
-                (self.connector, profile),
-            ).fetchone()
-            if row is None or not isinstance(row[0], str):
-                self.db.execute("RELEASE qq_confirmed_read")
-                return
-            raw_cursor = row[0]
-            if len(raw_cursor.encode("utf-8")) > MAX_CURSOR_BYTES:
-                self.db.execute("RELEASE qq_confirmed_read")
-                return
-            try:
-                cursor = json.loads(raw_cursor)
-            except (TypeError, ValueError, UnicodeError):
-                self.db.execute("RELEASE qq_confirmed_read")
-                return
-            if (not isinstance(cursor, dict) or type(cursor.get("version")) is not int
-                    or cursor.get("version") != 1
-                    or not isinstance(cursor.get("conversations"), dict)):
-                self.db.execute("RELEASE qq_confirmed_read")
-                return
-            owner_uin = qq_priority_owner_uin(cursor, profile)
-            original_queue = cursor.get("qqConfirmedSendReads")
-            queue_was_present = "qqConfirmedSendReads" in cursor
-            queue = valid_qq_confirmed_read_queue(original_queue, owner_uin)
-            malformed_queue = queue_was_present and queue is None
-            if owner_uin is None:
-                if malformed_queue:
-                    candidate_cursor = dict(cursor)
-                    candidate_cursor.pop("qqConfirmedSendReads", None)
-                    updated_value = compact(candidate_cursor)
-                    if len(updated_value.encode("utf-8")) <= MAX_CURSOR_BYTES:
-                        self.db.execute(
-                            "UPDATE cursors SET value=? WHERE connector_id=? AND profile=? AND value=?",
-                            (updated_value, self.connector, profile, raw_cursor),
-                        )
-                self.db.execute("RELEASE qq_confirmed_read")
-                return
-            if queue is None:
-                queue = []
-            replacement = {"ownerUin": owner_uin, "alias": alias,
-                           "sourceId": source_id,
-                           "remainingAttempts": QQ_CONFIRMED_SEND_READ_ATTEMPTS}
-            existing_index = next((index for index, entry in enumerate(queue)
-                                   if entry["alias"] == alias), None)
-            if existing_index is None:
-                if len(queue) >= MAX_QQ_CONFIRMED_SEND_READS:
-                    queue.pop(0)
-                queue.append(replacement)
-            else:
-                queue[existing_index] = replacement
-            candidate_cursor = dict(cursor)
-            candidate_cursor["qqConfirmedSendReads"] = queue
-            candidate = compact(candidate_cursor)
-            if len(candidate.encode("utf-8")) <= MAX_CURSOR_BYTES:
-                updated_value = candidate
-            elif malformed_queue:
-                candidate_cursor = dict(cursor)
-                candidate_cursor.pop("qqConfirmedSendReads", None)
-                updated_value = compact(candidate_cursor)
-                if len(updated_value.encode("utf-8")) > MAX_CURSOR_BYTES:
-                    self.db.execute("RELEASE qq_confirmed_read")
-                    return
-            else:
-                self.db.execute("RELEASE qq_confirmed_read")
-                return
-            self.db.execute(
-                "UPDATE cursors SET value=? WHERE connector_id=? AND profile=? AND value=?",
-                (updated_value, self.connector, profile, raw_cursor),
-            )
-            self.db.execute("RELEASE qq_confirmed_read")
-        except sqlite3.Error:
-            if savepoint_started:
-                try:
-                    self.db.execute("ROLLBACK TO qq_confirmed_read")
-                    self.db.execute("RELEASE qq_confirmed_read")
-                except sqlite3.Error:
-                    pass
-        except (TypeError, ValueError, UnicodeError, RecursionError, OverflowError):
-            if savepoint_started:
-                try:
-                    self.db.execute("ROLLBACK TO qq_confirmed_read")
-                    self.db.execute("RELEASE qq_confirmed_read")
-                except sqlite3.Error:
-                    pass
-
     def process_command(self, command, profile):
-        if self.activity_paused():
-            return False
         key = command.get("idempotencyKey")
         if not key:
             self.complete(command, {"ok": False, "error": "invalid_idempotency_key"})
@@ -1801,17 +846,6 @@ class Relay:
             self.db.execute("INSERT INTO command_ledger(connector_id,idempotency_key,fingerprint,state) "
                             "VALUES(?,?,?,'started')", (self.connector, key, fingerprint))
             self.db.commit()
-        connector_kind = self.connector_by_id[self.connector].get("kind")
-        blocked_pid = self.native_operation_uncertain.get(self.connector)
-        if (connector_kind == "qq" and type(blocked_pid) is int and blocked_pid > 1):
-            outcome = {"retry": True, "dispatched": False,
-                       "error": "native_operation_uncertain"}
-            self.db.execute("UPDATE command_ledger SET state='retry',result=?,retryable=1 "
-                            "WHERE connector_id=? AND idempotency_key=?",
-                            (compact(outcome), self.connector, key))
-            self.db.commit()
-            self.complete(command, outcome)
-            return
         if payload.get("attachments"):
             outcome, retryable = {"ok": False, "error": "adapter_file_send_not_supported"}, 0
             self.db.execute("UPDATE command_ledger SET state='done',result=? WHERE connector_id=? AND idempotency_key=?",
@@ -1819,20 +853,6 @@ class Relay:
             self.db.commit()
             self.complete(command, outcome)
             return
-        if not self.wake_readiness_current():
-            self.db.execute("UPDATE command_ledger SET state='retry',retryable=1 WHERE connector_id=? AND idempotency_key=?",
-                            (self.connector, key))
-            self.db.commit()
-            self.complete(command, {"retry": True, "error": "device_not_ready"})
-            return
-        if self.activity_paused():
-            self.db.execute("UPDATE command_ledger SET state='retry',retryable=1 WHERE connector_id=? AND idempotency_key=?",
-                            (self.connector, key))
-            self.db.commit()
-            self.complete(command, {"retry": True, "dispatched": False,
-                                    "error": "human_use_active"})
-            return
-        priority_read = None
         try:
             connector = self.connector_by_id[self.connector]
             driver = connector.get("kind")
@@ -1845,23 +865,9 @@ class Relay:
                        "body": payload.get("body", ""),
                        "confirmed": True, "targetConfirmed": True,
                        "attachments": payload.get("attachments", [])}
-            if driver == "qq":
-                request["cursor"] = self.qq_send_cursor(connector, profile)
-            result = self.call_adapter(request)
+            result = self.adapter_call(request)
             if result.get("ok") is True and isinstance(result.get("receipt"), str) and result.get("receipt"):
-                if driver == "qq":
-                    external_id = result.get("externalId")
-                    if verified_qq_external_id(profile, external_id, result["receipt"]):
-                        outcome = {"ok": True, "result": {
-                            "receipt": result["receipt"], "externalId": external_id}}
-                        receipt = json.loads(result["receipt"])
-                        alias = qq_command_conversation_alias(payload.get("externalConversationId"))
-                        if alias is not None:
-                            priority_read = (alias, receipt["sourceId"])
-                    else:
-                        outcome = {"uncertain": True, "error": "qq_receipt_identity_unverified"}
-                else:
-                    outcome = {"ok": True, "result": {"receipt": result["receipt"]}}
+                outcome = {"ok": True, "result": {"receipt": result["receipt"]}}
                 retryable = 0
             elif result.get("retryable") is True:
                 if result.get("dispatched") is not False:
@@ -1877,16 +883,11 @@ class Relay:
             else:
                 outcome = {"uncertain": True, "error": "device_send_outcome_uncertain"}
                 retryable = 0
-        except SendPreDispatchError as error:
-            outcome, retryable = {"ok": False, "dispatched": False, "error": str(error)}, 0
         except Exception:
             outcome, retryable = {"uncertain": True, "error": "device_send_outcome_uncertain"}, 0
         if not retryable:
-            self.db.execute("BEGIN IMMEDIATE")
             self.db.execute("UPDATE command_ledger SET state='done',result=?,retryable=? WHERE connector_id=? AND idempotency_key=?",
                             (compact(outcome), retryable, self.connector, key))
-            if priority_read is not None:
-                self._register_qq_confirmed_read(profile, *priority_read)
         self.db.commit()
         self.complete(command, outcome)
 
@@ -1899,147 +900,54 @@ class Relay:
                 capabilities = ["receive_text", "receive_images"]
                 if connector.get("receiveOnly") is not True:
                     capabilities.append("send_text")
-                self.http_call("POST", "/api/connectors/register", {
+                payload = {
                     "id": connector["id"], "kind": connector["kind"],
                     "accountLabel": connector["accountLabel"], "displayName": connector["displayName"],
                     "mode": "device_relay", "capabilities": capabilities,
-                })
+                }
+                if connector.get("nativeUrl"):
+                    payload["nativeUrl"] = connector["nativeUrl"]
+                self.http_call("POST", "/api/connectors/register", payload)
                 self.registered.add(connector["id"])
                 self.succeeded(connector["id"])
             except Exception:
                 self.failed(connector["id"])
 
     def pass_once(self):
-        self.activity_state()
-        initial_ready = self.ensure_active()
         for _ in range(MAX_DELIVERIES_PER_PASS):
             try:
                 connector_id = self.flush_one()
                 if not connector_id:
                     break
-                heartbeat_state = self.connector_heartbeat_state(connector_id, initial_ready)
-                self.send_heartbeat(connector_id, heartbeat_state)
+                self.send_heartbeat(connector_id, self.connector_heartbeat_state(connector_id))
             except Exception:
                 break
-        self.dirty_watcher.poll(0)
         for connector in self.connectors:
             self.select_connector(connector)
             profile = connector["profile"]
             connector_id = connector["id"]
-            ready = self.ensure_active()
-            activity_paused = self.activity_paused()
-            force_scan = self.auto_wake and ready and connector_id in self.wake_scan_pending
-            dirty_generation = (self.dirty_watcher.due_generation()
-                                if connector.get("kind") == "qq" else None)
-            scan_due = (time.monotonic() - self.last_scan[connector_id] >= self.scan_interval[connector_id]
-                        or dirty_generation is not None)
-            scan_allowed = (not activity_paused and
-                            (ready if self.auto_wake else self.eligible(connector_id)))
-            scan_retry_allowed = (force_scan or time.monotonic() >= self.wake_scan_retry_at[connector_id])
-            if (scan_allowed and scan_retry_allowed and
-                    time.time() >= self.source_settle_until[connector_id] and
-                    (force_scan or scan_due)):
-                backpressured = False
+            if (self.eligible(connector_id)
+                    and time.monotonic() - self.last_scan[connector_id] >= self.scan_interval[connector_id]):
                 try:
-                    self.dirty_watcher.scan_started()
                     scan_health = self.scan_profile(profile)
-                    if scan_health is None:
-                        backpressured = True
-                    else:
-                        if dirty_generation is not None:
-                            self.dirty_watcher.acknowledge(dirty_generation)
+                    if scan_health is not None:
                         self.health[connector_id] = scan_health
                         self.last_scan[connector_id] = time.monotonic()
-                        self.activity_fresh_required.discard(connector_id)
-                        if self.auto_wake:
-                            self.wake_scan_succeeded(connector_id)
-                        else:
-                            self.succeeded(connector_id)
-                except SourceReadError as error:
+                        self.succeeded(connector_id)
+                except Exception as error:
                     self.health[connector_id] = False
                     self.last_scan[connector_id] = time.monotonic() - self.scan_interval[connector_id]
-                    failure_pid = (error.attach_failure_pid
-                                   if type(error.attach_failure_pid) is int and error.attach_failure_pid > 1
-                                   else None)
-                    query_gate_pid = (error.query_gate_pending_pid
-                                      if type(error.query_gate_pending_pid) is int
-                                      and error.query_gate_pending_pid > 1 else None)
-                    native_uncertain_pid = (error.native_operation_uncertain_pid
-                                            if type(error.native_operation_uncertain_pid) is int
-                                            and error.native_operation_uncertain_pid > 1 else None)
-                    native_blocked_pid = (error.native_operation_blocked_pid
-                                          if type(error.native_operation_blocked_pid) is int
-                                          and error.native_operation_blocked_pid > 1 else None)
-                    if native_uncertain_pid is not None:
-                        self._block_native_operation(connector_id, native_uncertain_pid)
-                    source_state_saved = self.source_read_failed(
-                        connector_id, attach_failure_pid=failure_pid,
-                        query_gate_pending_pid=query_gate_pid,
-                    )
-                    driver = self.connector_by_id[connector_id].get("kind")
-                    if driver in {"qq", "wechat"}:
-                        try:
-                            observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
-                                "+00:00", "Z")
-                            sys.stderr.write(compact({
-                                "observedAt": observed_at,
-                                "driver": driver,
-                                "consecutiveFailures": self.source_failures[connector_id],
-                                "classification": ("native_operation_uncertain" if native_uncertain_pid is not None else
-                                                   "native_operation_blocked" if native_blocked_pid is not None else
-                                                   "explicit_attach" if failure_pid is not None else
-                                                   "explicit_query_gate" if query_gate_pid is not None else
-                                                   "source_unclassified"),
-                                "processId": (native_uncertain_pid if native_uncertain_pid is not None else
-                                               native_blocked_pid if native_blocked_pid is not None else
-                                               failure_pid if failure_pid is not None else query_gate_pid),
-                            }) + "\n")
-                            sys.stderr.flush()
-                        except Exception:
-                            pass
-                    if self.auto_wake:
-                        self.wake_scan_failed(connector_id)
-                        if source_state_saved:
-                            if native_uncertain_pid is not None:
-                                self.recover_native_operation_after_uncertain(connector_id, native_uncertain_pid)
-                            elif native_blocked_pid is not None:
-                                self.recover_native_operation_after_uncertain(
-                                    connector_id, native_blocked_pid)
-                            elif error.attach_failure_pid is not None:
-                                self.recover_attach_after_failures(connector_id)
-                            elif query_gate_pid is not None:
-                                self.recover_query_gate_after_failures(connector_id)
-                            else:
-                                self.recover_source_after_failures(connector_id)
-                    else:
-                        self.failed(connector_id)
-                except Exception:
-                    self.partial_read[connector_id] = False
-                    self.health[connector_id] = False
-                    self.attach_failure_streak[connector_id] = (None, 0)
-                    self.query_gate_failure_streak[connector_id] = (None, 0)
-                    self.last_scan[connector_id] = time.monotonic() - self.scan_interval[connector_id]
-                    if self.auto_wake:
-                        self.wake_scan_failed(connector_id)
-                    else:
-                        self.failed(connector_id)
+                    self.failed(connector_id)
+                    self.log_scan_failure(connector_id, error)
                 finally:
-                    if force_scan and not backpressured:
-                        self.wake_scan_pending.discard(connector_id)
                     self.cleanup_unreferenced_media()
-            ready = self.ensure_active()
-            heartbeat_state = self.connector_heartbeat_state(connector_id, ready)
-            self.send_heartbeat(connector_id, heartbeat_state)
+            self.send_heartbeat(connector_id, self.connector_heartbeat_state(connector_id))
         for connector in self.connectors:
             self.select_connector(connector)
             connector_id = self.connector
-            ready = self.ensure_active()
-            source_read_ready = (self.health.get(connector_id) or self.partial_read.get(connector_id))
-            if (self.activity_paused() or not ready or connector.get("receiveOnly") is True or
-                    not self.eligible(connector_id) or
-                    not source_read_ready or connector_id in self.activity_fresh_required or
-                    time.time() < self.source_settle_until[connector_id] or
-                    time.monotonic() - self.last_scan[connector_id] > self.scan_interval[connector_id] + 30):
+            if (connector.get("receiveOnly") is True or not self.eligible(connector_id)
+                    or not self.health.get(connector_id)
+                    or time.monotonic() - self.last_scan[connector_id] > self.scan_interval[connector_id] + 30):
                 continue
             path = "/api/connectors/commands?connectorId=" + urllib.parse.quote(self.connector, safe="") + "&limit=1"
             try:
@@ -2051,6 +959,16 @@ class Relay:
                 self.succeeded(connector_id)
             except Exception:
                 self.failed(connector_id)
+
+    def log_scan_failure(self, connector_id, error):
+        cause = error.__cause__ or error
+        observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        try:
+            sys.stderr.write(compact({"observedAt": observed_at, "connectorId": connector_id,
+                                      "error": str(cause)[:100] or type(cause).__name__}) + "\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
 
 
 def main(argv):
@@ -2082,7 +1000,7 @@ def main(argv):
                 relay.register_connectors()
                 relay.pass_once()
                 backoff = 1
-                relay.dirty_watcher.wait(15)
+                time.sleep(15)
             except KeyboardInterrupt:
                 return
             except Exception:

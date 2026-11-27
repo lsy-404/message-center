@@ -23,7 +23,6 @@ for (const functionName of [
   'heartbeatConnector',
   'ingestEvents',
   'ingestGroupTextBackups',
-  'acknowledgeConnectorLayoutControl',
   'renewCommandLease',
   'completeCommand',
 ]) {
@@ -52,6 +51,7 @@ const assetBodies = new Map([
 const auth = await createAdminTestAuth({
   ADMIN_TOKEN: adminToken,
   AGENT_TOKEN: agentToken,
+  DB: { prepare: () => ({ all: async () => ({ results: [] }) }) },
   ASSETS: {
     async fetch(request) {
       const value = assetBodies.get(new URL(request.url).pathname);
@@ -224,26 +224,14 @@ assert.match(vueSource, /<dt>渠道<\/dt><dd>/);
 assert.match(vueSource, /<dt>ID<\/dt><dd/);
 assert.match(vueSource, /<dt>模式<\/dt><dd/);
 assert.match(vueSource, /<dt>能力<\/dt>/);
-assert.match(vueSource, /自动恢复布局/);
-assert.match(vueSource, /FluentSwitch/);
-assert.match(vueSource, /expectedRevision/);
 assert.match(vueSource, /refresh: String\(Date\.now\(\)\)/);
 assert.match(vueSource, /visibilitychange/);
 assert.match(vueSource, /pageshow/);
 assert.doesNotMatch(vueSource, /trustTier|\breceived\b|Cloudflare Worker/);
 assert.doesNotMatch(vueSource, /{{\s*message\.deliveryState\s*}}/);
 assert.match(uiStyles, /--accent-base/);
-assert.match(uiStyles, /\.toggle-switch/);
 assert.match(fluentNotice, /Microsoft Corporation/);
 assert.match(fluentLicense, /Apache License/);
-assert.match(workerSource, /connector_layout_control/);
-assert.match(workerSource, /layout_revision_conflict/);
-assert.match(workerSource, /"layout_control"/);
-assert.match(workerSource, /device_generation IS NULL OR device_generation < \?/);
-assert.match(workerSource, /device_action_revision = revision \+ 1/);
-assert.match(workerSource, /reported_revision IS NULL OR reported_revision < revision/);
-assert.match(vueSource, /supportsLayoutAutoRecovery\(connector\)/);
-assert.match(vueSource, /mergeConnectorLayoutControls/);
 assert.match(vueSource, /type ConnectorState = 'online' \| 'offline' \| 'degraded'/);
 assert.match(vueSource, /部分同步/);
 assert.match(vueSource, /connectorReachable/);

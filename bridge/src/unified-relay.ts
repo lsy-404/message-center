@@ -14,18 +14,10 @@ import { basename, join } from 'node:path';
 import { createAdapter } from './adapters/index.js';
 import { SingleFlightTask } from './async-coordination.js';
 import { loadConfig } from './config.js';
-import {
-  ConnectorLayoutControlSync,
-  connectorLayoutControlStatePath,
-  parseLayoutControlDesired,
-  type LayoutControlAcknowledgement,
-  type LayoutControlCloudResult,
-} from './layout-control-sync.js';
 import { PresenceService } from './presence.js';
 import { selectFairSpoolWindows } from './spool-fairness.js';
 import type { IncomingBridgeMessage } from './types.js';
 import {
-  assignLayoutControlOwner,
   parseConnectorInstances,
   parseConnectorTokens,
   uniqueConnectorInstances,
@@ -132,14 +124,7 @@ async function main(): Promise<void> {
   if (config.adapter !== 'device') throw new Error('unified_relay_requires_device_adapter');
   const serviceUrl = requiredEnv('BRIDGE_MESSAGE_URL').replace(/\/$/, '');
   const profiles = connectorMap();
-  const layoutControlConfig = config.device.layoutControl;
-  const layoutControlOwnerId = layoutControlConfig.enabled
-    ? layoutControlConfig.ownerConnectorId
-    : undefined;
-  if (layoutControlConfig.enabled && !layoutControlOwnerId) {
-    throw new Error('layout_control_owner_required');
-  }
-  const connectors = assignLayoutControlOwner(uniqueConnectorInstances(profiles), layoutControlOwnerId);
+  const connectors = uniqueConnectorInstances(profiles);
   const connectorTokens = parseConnectorTokens(
     process.env.BRIDGE_MESSAGE_CONNECTOR_TOKENS,
     process.env.BRIDGE_MESSAGE_CONNECTOR_TOKEN,
@@ -155,7 +140,6 @@ async function main(): Promise<void> {
     const allowed = new Set(profile.driver === 'element'
       ? ['receive_text', 'send_text', 'send_files']
       : ['receive_text', 'send_text']);
-    if (connector.id === layoutControlOwnerId) allowed.add('layout_control');
     if (connector.capabilities.some((capability) => !allowed.has(capability))) {
       throw new Error(`connector_capability_not_supported:${profile.id}`);
     }
@@ -200,70 +184,6 @@ async function main(): Promise<void> {
     if (!token) throw new Error(`connector_token_missing:${connectorId}`);
     return { authorization: `Bearer ${token}`, 'x-connector-id': connectorId };
   };
-
-  const readLayoutControl = async (connectorId: string) => {
-    const response = await fetch(
-      `${serviceUrl}/api/connectors/layout-control?connectorId=${encodeURIComponent(connectorId)}`,
-      { headers: connectorHeaders(connectorId), signal: AbortSignal.timeout(15_000) },
-    );
-    const body = await jsonResponse(response);
-    return parseLayoutControlDesired(body.layoutControl);
-  };
-
-  const acknowledgeLayoutControl = async (
-    connectorId: string,
-    value: LayoutControlAcknowledgement,
-  ): Promise<LayoutControlCloudResult> => {
-    const response = await fetch(`${serviceUrl}/api/connectors/layout-control/ack`, {
-      method: 'POST',
-      headers: { ...connectorHeaders(connectorId), 'content-type': 'application/json' },
-      body: JSON.stringify({ connectorId, ...value }),
-      signal: AbortSignal.timeout(15_000),
-    });
-    let body: Record<string, unknown>;
-    try {
-      body = await response.json() as Record<string, unknown>;
-    } catch {
-      throw new RelayHttpError(response.status, 'invalid_layout_control_response');
-    }
-    if (!body.layoutControl) {
-      throw new RelayHttpError(response.status, String(body.error ?? 'layout_control_request_failed'));
-    }
-    if (!response.ok && response.status !== 409) {
-      throw new RelayHttpError(response.status, String(body.error ?? 'layout_control_request_failed'));
-    }
-    return {
-      ok: response.ok && body.ok !== false,
-      retry: body.retry === true,
-      ...(typeof body.error === 'string' ? { error: body.error } : {}),
-      layoutControl: parseLayoutControlDesired(body.layoutControl),
-    };
-  };
-
-  // Layout control is an optional safety subsystem. A corrupt or future-version
-  // state file must fail that subsystem closed without taking message relay down.
-  let layoutControlSync: ConnectorLayoutControlSync | undefined;
-  if (layoutControlOwnerId) {
-    try {
-      layoutControlSync = new ConnectorLayoutControlSync({
-        connectorId: layoutControlOwnerId,
-        statePath: connectorLayoutControlStatePath(config.runtimeDir, layoutControlOwnerId),
-        cloud: {
-          read: () => readLayoutControl(layoutControlOwnerId),
-          acknowledge: (value) => acknowledgeLayoutControl(layoutControlOwnerId, value),
-        },
-        device: {
-          run: async (action, command) => {
-            if (!adapter.controlDeviceLayout) throw new Error('device_layout_control_unavailable');
-            return adapter.controlDeviceLayout(action, command);
-          },
-        },
-        administratorOverrideLocalLock: layoutControlConfig.administratorOverrideLocalLock,
-      });
-    } catch (error) {
-      process.stderr.write(`layout control disabled: ${errorMessage(error)}\n`);
-    }
-  }
 
   const quarantineSpoolFile = (directory: string, name: string, reason: string): void => {
     try {
@@ -834,10 +754,8 @@ async function main(): Promise<void> {
   let stopped = false;
   let lastBackgroundFlush = 0;
   let lastProfileSync = Date.now();
-  let lastLayoutControlSync = 0;
   const heartbeatFlight = new SingleFlightTask();
   const profileSyncFlight = new SingleFlightTask();
-  const layoutControlFlight = new SingleFlightTask();
   const eventFlushFlight = new SingleFlightTask();
   const backgroundFlushFlight = new SingleFlightTask();
   const connectorEventFlights = new Map(connectors.map((connector) => [connector.id, new SingleFlightTask()]));
@@ -850,12 +768,6 @@ async function main(): Promise<void> {
   const triggerProfileSync = (): void => {
     void profileSyncFlight.run(syncConversationProfiles).catch((error: unknown) => {
       process.stderr.write(`conversation profile sync failed: ${error instanceof Error ? error.message : String(error)}\n`);
-    });
-  };
-  const triggerLayoutControlSync = (): void => {
-    if (!layoutControlSync) return;
-    void layoutControlFlight.run(() => layoutControlSync.synchronize()).catch((error: unknown) => {
-      process.stderr.write(`layout control sync failed: ${errorMessage(error)}\n`);
     });
   };
   const triggerBackgroundFlush = (): void => {
@@ -903,10 +815,6 @@ async function main(): Promise<void> {
     if (Date.now() - lastProfileSync >= PROFILE_SYNC_MS) {
       lastProfileSync = Date.now();
       triggerProfileSync();
-    }
-    if (layoutControlSync && Date.now() - lastLayoutControlSync >= layoutControlConfig.pollIntervalMs) {
-      lastLayoutControlSync = Date.now();
-      triggerLayoutControlSync();
     }
     try { await pollCommands(); } catch (error) {
       process.stderr.write(`command poll failed: ${error instanceof Error ? error.message : String(error)}\n`);

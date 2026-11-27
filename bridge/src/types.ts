@@ -172,10 +172,6 @@ export interface BridgeAdapter {
   waitUntilReady?(): Promise<void>;
   stop(): Promise<void>;
   connectorHealth?(): Record<string, { state: "online" | "offline"; observedAt: string }>;
-  controlDeviceLayout?(
-    action: "status" | "enable" | "disable" | "recover",
-    command?: { reason?: string; serverRevision?: number; actionId?: string }
-  ): Promise<Record<string, unknown>>;
   sendReply(message: IncomingBridgeMessage, text: string, idempotencyKey: string): Promise<string>;
   assertCanSendConversationFile?(conversationId: string, preferredProfileId?: string): void | Promise<void>;
   listConversationProfiles?(): Promise<ConversationProfile[]>;

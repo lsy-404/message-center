@@ -52,9 +52,9 @@ $env:BRIDGE_MCP_CONFIG = (Resolve-Path .\config.json)
 pnpm run start
 ```
 
-默认配置使用 `spool` 和 `dry_run`。真实客户端连接使用 `adapter: "device"`，私有适配器及其配置应放在被忽略的 `local-adapters/` 目录；不要把目标标识或任何凭据提交到配置文件。
+默认配置使用 `spool` 和 `dry_run`。真实客户端连接使用 `adapter: "device"`，适配器的本地配置应放在被忽略的 `local-adapters/` 目录；不要把目标标识或任何凭据提交到配置文件。
 
-通用核心通过配置中的 `device.pythonPath` 与 `device.cliPath` 调用外部适配器；进程边界见 [连接器契约](./docs/device-adapter-contract.md)。适配器实现不在公开仓库中。
+通用核心通过配置中的 `device.pythonPath` 与 `device.cliPath` 调用外部适配器；进程边界见 [连接器契约](./docs/device-adapter-contract.md)。设备端 relay 使用的 wechat-selkies 适配器见 [设备端运行器](./device-runtime/README.md)。
 
 HTTP 模式仅允许回环绑定：
 
@@ -134,8 +134,6 @@ pnpm run unified-relay
 ```
 
 启动时 relay 会幂等注册所有实例，随后发送心跳、上传消息和入站附件、领取下行命令。每个请求都同时携带实例 ID 与该实例在 `BRIDGE_MESSAGE_CONNECTOR_TOKENS` 中的专属 bearer；一个实例的 token 不能声明或操作另一个实例。迁移期单 token 模式还要求 Worker 显式设置与之绑定的 `LEGACY_CONNECTOR_ID`，不能用于多实例。附件下载同样携带实例 ID，Worker 会阻止实例读取不属于自己的下行附件。旧 `BRIDGE_MESSAGE_CONNECTOR_MAP` 字符串映射仍兼容，但为避免宣称未经验证的附件路径，其能力只按收发文字注册；新部署应使用带元数据的 `BRIDGE_MESSAGE_CONNECTORS`，并仅声明已验证贯通的能力。
-
-布局控制是独立且 fail-closed 的可选适配器能力：每台物理设备只允许一个 `device_relay` 实例声明 `layout_control`，其本地状态损坏或版本不兼容只会停用布局同步，不会终止消息 relay。公开核心仅定义带 revision、稳定 action ID 和幂等确认的协调协议；本地实现不在仓库中。
 
 每个设备会话还可声明 `conversationType`、`groupDelivery`、`mentionTerms`、`contextBefore` 和可选的 `placementOverride`。私聊默认上报；群聊实时流只上报个人原生提及、匹配的提及词或受控请求前缀，并为触发事件附带最多 20 条此前上下文。全体提及不会触发个人事件。
 

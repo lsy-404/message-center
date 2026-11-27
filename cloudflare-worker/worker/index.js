@@ -9,7 +9,7 @@ const JSON_HEADERS = {
 const CAPABILITIES = new Set([
   "receive_text", "send_text", "receive_files", "send_files",
   "receive_images", "send_images", "receive_video", "send_video",
-  "threads", "reactions", "layout_control",
+  "threads", "reactions",
 ]);
 const BLOCKED_EXTENSIONS = new Set([
   "exe", "dll", "msi", "bat", "cmd", "com", "scr", "ps1", "psm1", "vbs", "vbe",
@@ -59,15 +59,6 @@ function normalizedReplyPreview(value) {
     sourceTextTruncated: value.sourceTextTruncated,
     sourceExpired: value.sourceExpired,
   };
-}
-
-function exactQuoteBodyUpgrade(connector, stored, item, bodyText) {
-  return connector.kind === "qq" && normalizedReplyPreview(item.reply) !== null &&
-    /^[a-zA-Z0-9_-]{1,64}:qq-message:[0-9]{1,20}$/.test(String(item.externalId)) &&
-    stored.body === `[引用消息]\n${bodyText}` &&
-    typeof item.senderId === "string" && item.senderId.length > 0 && stored.sender_id === item.senderId &&
-    Number.isFinite(Date.parse(stored.occurred_at)) &&
-    Date.parse(stored.occurred_at) === Date.parse(item.occurredAt);
 }
 
 function hasSingleLineEndingSpaceInsertion(storedBody, incomingBody) {
@@ -304,87 +295,6 @@ async function connectorRow(env, connectorId) {
   return env.DB.prepare("SELECT * FROM connector_instances WHERE id = ?").bind(connectorId).first();
 }
 
-function layoutControlFromRow(row) {
-  const revision = row?.layout_revision === null || row?.layout_revision === undefined
-    ? 0 : count(row.layout_revision);
-  const reportedRevision = row?.layout_reported_revision === null || row?.layout_reported_revision === undefined
-    ? null : count(row.layout_reported_revision);
-  const enabled = Boolean(count(row?.layout_desired_enabled));
-  const deviceGeneration = row?.layout_device_generation === null || row?.layout_device_generation === undefined
-    ? null : count(row.layout_device_generation);
-  const deviceActionRevision = row?.layout_device_action_revision === null ||
-      row?.layout_device_action_revision === undefined
-    ? null : count(row.layout_device_action_revision);
-  const acknowledgement = reportedRevision === null ? null : {
-    enabled: Boolean(count(row.layout_reported_enabled)),
-    revision: reportedRevision,
-    updatedAt: row.layout_reported_at || null,
-    reason: text(row.layout_reported_reason) || "applied",
-  };
-  return {
-    enabled,
-    revision,
-    updatedAt: row?.layout_desired_updated_at || null,
-    reason: text(row?.layout_desired_reason) || "not_configured",
-    deviceGeneration,
-    deviceActionId: deviceGeneration === null ? null : text(row?.layout_device_action_id) || null,
-    deviceActionRevision,
-    deviceActionEnabled: deviceActionRevision === null ? null : Boolean(count(row?.layout_device_action_enabled)),
-    acknowledgement,
-    synchronized: Boolean(acknowledgement && acknowledgement.revision === revision &&
-      acknowledgement.enabled === enabled),
-  };
-}
-
-async function connectorLayoutState(env, connectorId) {
-  const row = await env.DB.prepare(`
-    SELECT k.id,
-      l.desired_enabled AS layout_desired_enabled,
-      l.revision AS layout_revision,
-      l.desired_reason AS layout_desired_reason,
-      l.desired_updated_at AS layout_desired_updated_at,
-      l.reported_enabled AS layout_reported_enabled,
-      l.reported_revision AS layout_reported_revision,
-      l.reported_reason AS layout_reported_reason,
-      l.reported_at AS layout_reported_at,
-      l.device_generation AS layout_device_generation,
-      l.device_action_id AS layout_device_action_id,
-      l.device_action_revision AS layout_device_action_revision,
-      l.device_action_enabled AS layout_device_action_enabled
-    FROM connector_instances k
-    LEFT JOIN connector_layout_control l ON l.connector_id = k.id
-    WHERE k.id = ?
-  `).bind(connectorId).first();
-  if (!row) throw new Error("connector_not_found");
-  return layoutControlFromRow(row);
-}
-
-function initializeConnectorLayoutControl(env, connectorId, stamp) {
-  return env.DB.prepare(`
-    INSERT OR IGNORE INTO connector_layout_control (
-      connector_id, desired_enabled, revision, desired_reason, desired_updated_at
-    ) VALUES (?, 0, 0, 'not_configured', ?)
-  `).bind(connectorId, stamp);
-}
-
-function parseLayoutRevision(value) {
-  return Number.isSafeInteger(value) && value >= 0 ? value : null;
-}
-
-function parseDeviceGeneration(value) {
-  return Number.isSafeInteger(value) && value >= 0 ? value : null;
-}
-
-function parseLayoutActionId(value) {
-  const normalized = String(value || "").trim();
-  return validId(normalized) ? normalized : null;
-}
-
-function layoutReportReason(value, fallback) {
-  const normalized = String(value || "").trim().slice(0, 200);
-  return normalized || fallback;
-}
-
 const CONNECTOR_STATES = new Set(["online", "offline", "degraded"]);
 
 function liveState(row) {
@@ -396,15 +306,17 @@ function liveState(row) {
 
 function capabilitySet(row) { return new Set(safeJson(row.capabilities_json, [])); }
 
-function supportsLayoutControl(row) {
-  return text(row?.mode) === "device_relay" && capabilitySet(row).has("layout_control");
-}
-
-async function requireLayoutControlConnector(env, connectorId) {
-  const connector = await connectorRow(env, connectorId);
-  if (!connector) throw new Error("connector_not_found");
-  if (!supportsLayoutControl(connector)) throw new Error("layout_control_not_supported");
-  return connector;
+function normalizeNativeUrl(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || value.length > 500) throw new Error("invalid_native_url");
+  let parsed;
+  try { parsed = new URL(value.trim()); } catch { throw new Error("invalid_native_url"); }
+  if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || parsed.username || parsed.password) {
+    throw new Error("invalid_native_url");
+  }
+  const normalized = parsed.href;
+  if (normalized.length > 500) throw new Error("invalid_native_url");
+  return normalized;
 }
 
 function canSendAttachment(capabilities, mimeType, fileName) {
@@ -435,13 +347,11 @@ async function registerConnector(request, env) {
   const note = String(body.note || "").trim();
   const mode = String(body.mode || "device_relay");
   const capabilities = normalizeCapabilities(body.capabilities);
+  const nativeUrl = normalizeNativeUrl(body.nativeUrl);
   if (!validId(id) || !/^[a-z0-9][a-z0-9_-]{1,39}$/.test(kind) || !accountLabel || !displayName) {
     throw new Error("invalid_connector_registration");
   }
   if (!new Set(["device_relay", "cloud_relay", "webhook"]).has(mode)) throw new Error("invalid_connector_mode");
-  if (capabilities.includes("layout_control") && mode !== "device_relay") {
-    throw new Error("invalid_connector_capabilities");
-  }
   const stamp = now();
   const registrationStatements = [];
   if (capabilities.includes("send_text")) {
@@ -495,14 +405,15 @@ async function registerConnector(request, env) {
   registrationStatements.push(env.DB.prepare(`
     INSERT INTO connector_instances (
       id, kind, channel_label, account_label, display_name, note, mode, state, capabilities_json,
-      configuration_json, last_seen_at, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'offline', ?, '{}', NULL, ?, ?)
+      configuration_json, last_seen_at, created_at, updated_at, native_url
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'offline', ?, '{}', NULL, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, channel_label = excluded.channel_label, account_label = excluded.account_label,
       display_name = excluded.display_name, note = excluded.note, mode = excluded.mode,
-      capabilities_json = excluded.capabilities_json, updated_at = excluded.updated_at
+      capabilities_json = excluded.capabilities_json, updated_at = excluded.updated_at,
+      native_url = excluded.native_url
   `).bind(
     id, kind, channelLabel.slice(0, 80), accountLabel.slice(0, 200), displayName.slice(0, 200), note.slice(0, 1000), mode,
-    JSON.stringify(capabilities), stamp, stamp,
+    JSON.stringify(capabilities), stamp, stamp, nativeUrl,
   ));
   await env.DB.batch(registrationStatements);
   await audit(env, `connector:${id}`, "connector_registered", id, { kind, accountLabel, capabilities });
@@ -527,151 +438,6 @@ async function heartbeatConnector(request, env) {
   `).bind(connectorState, stamp, JSON.stringify(body.status || {}), stamp, connectorId).run();
   if (!count(result.meta?.changes)) throw new Error("connector_not_found");
   return json({ ok: true, observedAt: stamp });
-}
-
-async function readConnectorLayoutControl(request, env, url) {
-  const authenticatedConnectorId = request.headers.get("x-connector-id") || "";
-  if (!await hasConnectorRole(request, env, authenticatedConnectorId)) return fail("unauthorized", 401);
-  const connectorId = String(url.searchParams.get("connectorId") || "");
-  if (connectorId !== authenticatedConnectorId) return fail("connector_id_mismatch", 403);
-  if (!validId(connectorId)) throw new Error("invalid_connector_id");
-  await requireLayoutControlConnector(env, connectorId);
-  return json({ ok: true, connectorId, layoutControl: await connectorLayoutState(env, connectorId) });
-}
-
-async function acknowledgeConnectorLayoutControl(request, env) {
-  const authenticatedConnectorId = request.headers.get("x-connector-id") || "";
-  if (!await hasConnectorRole(request, env, authenticatedConnectorId)) return fail("unauthorized", 401);
-  const body = await readJson(request, 16 * 1024);
-  const connectorId = String(body.connectorId || "");
-  if (connectorId !== authenticatedConnectorId) return fail("connector_id_mismatch", 403);
-  if (!validId(connectorId)) throw new Error("invalid_connector_id");
-  await requireLayoutControlConnector(env, connectorId);
-  if (typeof body.enabled !== "boolean") throw new Error("invalid_layout_acknowledgement");
-  if (body.localStop === true && body.localStart === true) throw new Error("invalid_layout_local_action");
-  const localAction = body.localStop === true ? "stop" : body.localStart === true ? "start" : null;
-  const reportedReason = layoutReportReason(body.reason, localAction ? `local_${localAction}` : "applied");
-  const stamp = now();
-
-  if (localAction) {
-    const locallyEnabled = localAction === "start";
-    if (body.enabled !== locallyEnabled) throw new Error("invalid_layout_local_action");
-    const deviceGeneration = parseDeviceGeneration(body.deviceGeneration);
-    const actionId = parseLayoutActionId(body.actionId);
-    if (deviceGeneration === null || actionId === null) throw new Error("invalid_layout_local_action");
-    const [, result] = await env.DB.batch([
-      initializeConnectorLayoutControl(env, connectorId, stamp),
-      env.DB.prepare(`
-        UPDATE connector_layout_control SET
-          desired_enabled = ?,
-          revision = revision + 1,
-          desired_reason = ?,
-          desired_updated_at = ?,
-          reported_enabled = ?,
-          reported_revision = revision + 1,
-          reported_reason = ?,
-          reported_at = ?,
-          device_generation = ?,
-          device_action_id = ?,
-          device_action_revision = revision + 1,
-          device_action_enabled = ?
-        WHERE connector_id = ?
-          AND (device_generation IS NULL OR device_generation < ?)
-      `).bind(
-        locallyEnabled ? 1 : 0, `device_local_${localAction}`, stamp, locallyEnabled ? 1 : 0,
-        reportedReason, stamp, deviceGeneration, actionId, locallyEnabled ? 1 : 0,
-        connectorId, deviceGeneration,
-      ),
-    ]);
-    const layoutControl = await connectorLayoutState(env, connectorId);
-    if (!count(result.meta?.changes)) {
-      if (layoutControl.deviceGeneration === deviceGeneration && layoutControl.deviceActionId === actionId) {
-        if (layoutControl.deviceActionEnabled !== locallyEnabled) {
-          return json({
-            ok: false, error: "layout_device_action_conflict", retry: false, connectorId, layoutControl,
-          }, 409);
-        }
-        return json({
-          ok: true, accepted: false, idempotent: true, connectorId, layoutControl,
-        });
-      }
-      const error = layoutControl.deviceGeneration !== null && deviceGeneration < layoutControl.deviceGeneration
-        ? "layout_device_generation_stale" : "layout_device_generation_conflict";
-      return json({ ok: false, error, retry: false, connectorId, layoutControl }, 409);
-    }
-    await audit(env, `connector:${connectorId}`, `connector_layout_local_${localAction}`, connectorId,
-      { deviceGeneration, actionId, revision: layoutControl.revision });
-    return json({ ok: true, accepted: true, idempotent: false, connectorId, layoutControl });
-  }
-
-  if (body.deviceGeneration !== undefined || body.actionId !== undefined) {
-    throw new Error("invalid_layout_acknowledgement");
-  }
-  const revision = parseLayoutRevision(body.revision);
-  if (revision === null) throw new Error("invalid_layout_acknowledgement");
-  const [, result] = await env.DB.batch([
-    initializeConnectorLayoutControl(env, connectorId, stamp),
-    env.DB.prepare(`
-      UPDATE connector_layout_control SET
-        reported_enabled = ?,
-        reported_revision = ?,
-        reported_reason = ?,
-        reported_at = ?
-      WHERE connector_id = ? AND revision = ? AND desired_enabled = ?
-        AND (reported_revision IS NULL OR reported_revision < revision)
-    `).bind(
-      body.enabled ? 1 : 0, revision, reportedReason, stamp,
-      connectorId, revision, body.enabled ? 1 : 0,
-    ),
-  ]);
-  const layoutControl = await connectorLayoutState(env, connectorId);
-  if (count(result.meta?.changes)) {
-    return json({ ok: true, accepted: true, idempotent: false, connectorId, layoutControl });
-  }
-  if (revision !== layoutControl.revision) {
-    return json({
-      ok: false, error: "layout_revision_conflict", retry: true, connectorId, layoutControl,
-    }, 409);
-  }
-  if (body.enabled !== layoutControl.enabled) {
-    return json({
-      ok: false, error: "layout_state_mismatch", retry: true, connectorId, layoutControl,
-    }, 409);
-  }
-  if (layoutControl.acknowledgement?.revision === revision &&
-      layoutControl.acknowledgement.enabled === body.enabled) {
-    return json({ ok: true, accepted: false, idempotent: true, connectorId, layoutControl });
-  }
-  return json({
-    ok: false, error: "layout_acknowledgement_conflict", retry: true, connectorId, layoutControl,
-  }, 409);
-}
-
-async function updateConnectorLayoutControl(request, env, identity, connectorId) {
-  if (!validId(connectorId)) throw new Error("invalid_connector_id");
-  const body = await readJson(request, 8 * 1024);
-  const expectedRevision = parseLayoutRevision(body.expectedRevision);
-  if (expectedRevision === null || typeof body.enabled !== "boolean") throw new Error("invalid_layout_control_update");
-  await requireLayoutControlConnector(env, connectorId);
-  const stamp = now();
-  const [, result] = await env.DB.batch([
-    initializeConnectorLayoutControl(env, connectorId, stamp),
-    env.DB.prepare(`
-      UPDATE connector_layout_control SET
-        desired_enabled = ?,
-        revision = revision + 1,
-        desired_reason = 'administrator',
-        desired_updated_at = ?
-      WHERE connector_id = ? AND revision = ?
-    `).bind(body.enabled ? 1 : 0, stamp, connectorId, expectedRevision),
-  ]);
-  const layoutControl = await connectorLayoutState(env, connectorId);
-  if (!count(result.meta?.changes)) {
-    return json({ ok: false, error: "layout_revision_conflict", layoutControl }, 409);
-  }
-  await audit(env, identity.id, "connector_layout_control_updated", connectorId,
-    { enabled: body.enabled, previousRevision: expectedRevision, revision: layoutControl.revision });
-  return json({ ok: true, connectorId, layoutControl });
 }
 
 async function uploadConnectorFile(request, env, fileId) {
@@ -1533,8 +1299,7 @@ async function ingestEvents(request, env) {
         existing.direction === "inbound" && existing.content_type === "text" &&
         canonicalBody === "[类型:8]" && existing.attachment_count === 0 && previousAttachments.length === 0 &&
         upgradedBody.trim().length > 0 && upgradedBody !== "[类型:8]";
-      const quoteBodyUpgrade = exactQuoteBodyUpgrade(connector, existing, item, upgradedBody);
-      if (!exactGraytipPlaceholder && !quoteBodyUpgrade && existing.queue_class !== "background" && canonicalBody !== upgradedBody &&
+      if (!exactGraytipPlaceholder && existing.queue_class !== "background" && canonicalBody !== upgradedBody &&
           !(canonicalBody === "[file:asset]" && semanticCardBody(upgradedBody))) {
         await deleteRequestCreatedEmptyConversation(env, requestCreatedConversationId);
         throw new Error("message_external_id_conflict");
@@ -1549,18 +1314,6 @@ async function ingestEvents(request, env) {
       }
       metadata = JSON.stringify({ ...existingMetadata, ...safeJson(metadata, {}),
         attachments: canonicalAttachments });
-      if (quoteBodyUpgrade) {
-        const quoteUpdate = await env.DB.prepare(`
-          UPDATE messages SET body = ?, content_type = ?, metadata_json = ?
-          WHERE id = ? AND connector_id = ? AND external_id = ? AND conversation_id = ?
-            AND direction = ? AND sender_id = ? AND occurred_at = ? AND body = ? AND metadata_json = ?
-        `).bind(upgradedBody, incomingContentType, metadata, existing.id, connectorId, item.externalId,
-          conversation.id, existing.direction, existing.sender_id, existing.occurred_at,
-          existing.body, existing.metadata_json).run();
-        if (!count(quoteUpdate.meta?.changes)) throw new Error("message_external_id_conflict");
-        canonicalBody = upgradedBody;
-        upgraded += 1;
-      }
       canonicalConversationTitle = String(conversation.title || item.conversationTitle).slice(0, 200);
       canonicalAvatarLabel = String(conversation.avatar_label || item.avatarLabel || item.conversationTitle[0] || "?").slice(0, 2);
       if (exactGraytipPlaceholder) {
@@ -1748,7 +1501,7 @@ async function ingestGroupTextBackups(request, env) {
   for (const entry of normalized) {
     const externalId = String(entry.item.externalId).slice(0, 300);
     const expectedConversationExternalId = String(entry.item.conversationExternalId).slice(0, 500);
-    let stored = await env.DB.prepare(`
+    const stored = await env.DB.prepare(`
       SELECT conversation_external_id, conversation_title, sender_id, sender_name,
         body, placement, occurred_at
       FROM group_text_backups WHERE connector_id = ? AND external_id = ?
@@ -1759,16 +1512,7 @@ async function ingestGroupTextBackups(request, env) {
     }
     let lineEndingSpaceAttachmentSupplement = false;
     if (stored.body !== entry.bodyText) {
-      if (exactQuoteBodyUpgrade(connector, stored, entry.item, entry.bodyText)) {
-        const update = await env.DB.prepare(`
-          UPDATE group_text_backups SET body = ?
-          WHERE connector_id = ? AND external_id = ? AND conversation_external_id = ?
-            AND sender_id = ? AND occurred_at = ? AND body = ?
-        `).bind(entry.bodyText, connectorId, externalId, expectedConversationExternalId,
-          stored.sender_id, stored.occurred_at, stored.body).run();
-        if (!count(update.meta?.changes)) throw new Error("message_external_id_conflict");
-        stored = { ...stored, body: entry.bodyText };
-      } else if (entry.attachmentMetadata.length && !entry.replyPreview &&
+      if (entry.attachmentMetadata.length && !entry.replyPreview &&
           hasSingleLineEndingSpaceInsertion(stored.body, entry.bodyText)) {
         const existing = await env.DB.prepare(`
           SELECT m.id, m.direction, m.sender_id, m.sender_name, m.occurred_at, m.body,
@@ -1875,7 +1619,6 @@ async function ingestGroupTextBackups(request, env) {
         FROM messages WHERE connector_id = ? AND external_id = ?
       `).bind(connectorId, String(item.externalId).slice(0, 300)).first();
       if (!existing) throw new Error("message_not_found");
-      const quoteBodyUpgrade = exactQuoteBodyUpgrade(connector, existing, item, bodyText);
       if (existing.conversation_id !== conversation.id || existing.direction !== "inbound" ||
           (lineEndingSpaceAttachmentSupplement &&
             (existing.sender_id !== (item.senderId || null) || existing.sender_name !== item.senderName ||
@@ -1883,7 +1626,7 @@ async function ingestGroupTextBackups(request, env) {
               existing.body !== bodyText || replyPreview ||
               (safeJson(existing.metadata_json, {}).reply !== undefined &&
                 safeJson(existing.metadata_json, {}).reply !== null))) ||
-          (existing.body !== bodyText && !quoteBodyUpgrade)) {
+          existing.body !== bodyText) {
         // The legacy backup table is written before normalization. If an
         // external id is already bound to a different conversation, remove the
         // unnormalizable source row so later migrations/retries cannot derive a
@@ -2067,22 +1810,7 @@ async function readGroupTextBackups(env, url) {
 
 async function readInbox(env, selectedConversationId) {
   const connectorsResult = await env.DB.prepare(`
-    SELECT k.*,
-      l.desired_enabled AS layout_desired_enabled,
-      l.revision AS layout_revision,
-      l.desired_reason AS layout_desired_reason,
-      l.desired_updated_at AS layout_desired_updated_at,
-      l.reported_enabled AS layout_reported_enabled,
-      l.reported_revision AS layout_reported_revision,
-      l.reported_reason AS layout_reported_reason,
-      l.reported_at AS layout_reported_at,
-      l.device_generation AS layout_device_generation,
-      l.device_action_id AS layout_device_action_id,
-      l.device_action_revision AS layout_device_action_revision,
-      l.device_action_enabled AS layout_device_action_enabled
-    FROM connector_instances k
-    LEFT JOIN connector_layout_control l ON l.connector_id = k.id
-    ORDER BY k.kind, k.display_name
+    SELECT * FROM connector_instances ORDER BY kind, display_name
   `).all();
   const conversationResult = await env.DB.prepare(`
     SELECT c.*, COALESCE(p.display_name, c.title) AS profile_title,
@@ -2104,7 +1832,7 @@ async function readInbox(env, selectedConversationId) {
     accountLabel: row.account_label, displayName: row.display_name,
     note: row.note, mode: row.mode, state: liveState(row), capabilities: safeJson(row.capabilities_json, []),
     lastSeenAt: row.last_seen_at,
-    ...(supportsLayoutControl(row) ? { layoutControl: layoutControlFromRow(row) } : {}),
+    nativeUrl: row.native_url || null,
   }));
   const conversations = (conversationResult.results || []).map((row) => ({
     id: row.id, connectorId: row.connector_id, connectorKind: row.connector_kind,
@@ -2740,38 +2468,7 @@ async function renewCommandLease(request, env, commandId) {
   return json({ ok: true, leaseExpiresAt: renewed.lease_expires_at });
 }
 
-function verifiedQQExternalId(result) {
-  if (!result || typeof result !== "object" || Array.isArray(result)) return { present: false };
-  if (result.receipt === undefined && result.externalId === undefined) return { present: false };
-  if (typeof result.receipt !== "string" || result.receipt.length > 8192 ||
-      typeof result.externalId !== "string") return { present: true, valid: false };
-  let receipt;
-  try { receipt = JSON.parse(result.receipt); } catch { return { present: true, valid: false }; }
-  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) return { present: true, valid: false };
-  const sourceId = receipt.sourceId;
-  if (typeof sourceId !== "string" || !/^-?(?:0|[1-9][0-9]*)$/.test(sourceId) || sourceId === "-0") {
-    return { present: true, valid: false };
-  }
-  let numericId;
-  try { numericId = BigInt(sourceId); } catch { return { present: true, valid: false }; }
-  if (numericId < -(1n << 63n) || numericId > (1n << 63n) - 1n) return { present: true, valid: false };
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < sourceId.length; index += 1) {
-    hash ^= sourceId.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193) >>> 0;
-  }
-  const alias = `message-${hash.toString(16).padStart(8, "0")}`;
-  const expectedExternalId = result.externalId.match(/^([A-Za-z0-9_.-]{1,64}):qq-message:(-?(?:0|[1-9][0-9]*))$/);
-  return {
-    present: true,
-    valid: Boolean(expectedExternalId && expectedExternalId[2] === sourceId &&
-      receipt.messageAlias === alias && receipt.messageType === 1 && receipt.sendStatus === 2 &&
-      receipt.confirmation === "verified-status"),
-    externalId: expectedExternalId ? result.externalId : null,
-  };
-}
-
-async function completeCommand(request, env, commandId, batchRetry = false) {
+async function completeCommand(request, env, commandId) {
   const authenticatedConnectorId = request.headers.get("x-connector-id") || "";
   if (!await hasConnectorRole(request, env, authenticatedConnectorId)) return fail("unauthorized", 401);
   const body = await readJson(request, 64 * 1024);
@@ -2781,61 +2478,19 @@ async function completeCommand(request, env, commandId, batchRetry = false) {
   if (!validId(connectorId) || !validId(commandId) || !validId(leaseToken)) throw new Error("invalid_command_completion");
   const stamp = now();
   const command = await env.DB.prepare(`
-    SELECT c.message_id, c.conversation_id, c.kind, c.payload_json,
-      k.kind AS connector_kind, m.direction, m.external_id, m.body, m.content_type, m.created_by, m.sender_name
-    FROM commands c JOIN messages m ON m.id = c.message_id
-    JOIN connector_instances k ON k.id = c.connector_id
+    SELECT c.message_id, k.kind AS connector_kind
+    FROM commands c JOIN connector_instances k ON k.id = c.connector_id
     WHERE c.id = ? AND c.connector_id = ? AND c.state = 'leased' AND c.lease_token = ?
       AND lease_expires_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
   `).bind(commandId, connectorId, leaseToken).first();
   if (!command) throw new Error("invalid_command_lease");
   const resultValue = body.result && typeof body.result === "object" ? body.result : {};
-  const isQQConnector = command.connector_kind === "qq";
-  const qqIdentity = body.ok === true && isQQConnector ? verifiedQQExternalId(resultValue) : { present: false };
   let state = body.retry === true ? "pending" : body.uncertain === true ? "manual_review" : body.ok === true ? "completed" : "failed";
-  const retryHasPhysicalEvidence = isQQConnector && body.retry === true && (
+  const retryHasPhysicalEvidence = command.connector_kind === "qq" && body.retry === true && (
     body.ok === true || body.uncertain === true || body.dispatched === true ||
-    resultValue.ok === true || resultValue.uncertain === true || resultValue.dispatched === true ||
-    resultValue.receipt !== undefined || resultValue.externalId !== undefined
+    resultValue.ok === true || resultValue.uncertain === true || resultValue.dispatched === true
   );
   if (retryHasPhysicalEvidence) state = "manual_review";
-  let completionMessageId = command.message_id;
-  let mergeFromMessageId = null;
-  if (state === "completed" && isQQConnector && (!qqIdentity.present || !qqIdentity.valid)) {
-    state = "manual_review";
-  }
-  if (state === "completed" && isQQConnector && qqIdentity.present) {
-    if (!qqIdentity.valid || command.kind !== "send_text" || command.direction !== "outbound" ||
-        command.external_id !== null || command.content_type !== "text" ||
-        String(command.body || "") !== String(safeJson(command.payload_json, {}).body || "")) {
-      state = "manual_review";
-    } else {
-      const existing = await env.DB.prepare(`
-        SELECT id, conversation_id, direction, body, content_type, metadata_json, created_by, sender_name,
-          (SELECT COUNT(*) FROM attachments WHERE message_id = messages.id) AS attachment_count,
-          (SELECT COUNT(*) FROM agent_queue WHERE message_id = messages.id) AS agent_queue_count
-        FROM messages WHERE connector_id = ? AND external_id = ?
-      `).bind(connectorId, qqIdentity.externalId).first();
-      if (existing && existing.id !== command.message_id) {
-        const originalChildren = await env.DB.prepare(`
-          SELECT (SELECT COUNT(*) FROM attachments WHERE message_id = ?) AS attachment_count,
-            (SELECT COUNT(*) FROM agent_queue WHERE message_id = ?) AS agent_queue_count,
-            (SELECT COUNT(*) FROM commands WHERE message_id = ? AND id <> ?) AS other_command_count
-        `).bind(command.message_id, command.message_id, command.message_id, commandId).first();
-        if (existing.conversation_id !== command.conversation_id || existing.direction !== "outbound" ||
-            existing.body !== command.body || existing.content_type !== "text" ||
-            existing.attachment_count !== 0 || existing.agent_queue_count !== 0 ||
-            safeJson(existing.metadata_json, {}).isSelf !== true ||
-            originalChildren.attachment_count !== 0 || originalChildren.agent_queue_count !== 0 ||
-            originalChildren.other_command_count !== 0) {
-          state = "manual_review";
-        } else {
-          completionMessageId = existing.id;
-          mergeFromMessageId = command.message_id;
-        }
-      }
-    }
-  }
   const deliveryState = state === "completed" ? "delivered" : state === "pending" ? "queued" :
     state === "manual_review" ? "uncertain" : "failed";
   // Fence the lease exactly once. D1 batch statements are sequential, so checking the
@@ -2847,82 +2502,23 @@ async function completeCommand(request, env, commandId, batchRetry = false) {
     SELECT 1 FROM commands c WHERE c.id = ? AND c.connector_id = ?
       AND c.state = ? AND c.lease_token = ?
   )`;
-  const reconciliationGuard = mergeFromMessageId ? `AND EXISTS (
-      SELECT 1 FROM messages target WHERE target.id = ? AND target.connector_id = ?
-        AND target.conversation_id = ? AND target.external_id = ? AND target.direction = 'outbound'
-        AND target.content_type = 'text' AND target.body = ?
-        AND json_extract(target.metadata_json, '$.isSelf') = 1
-    ) AND EXISTS (
-      SELECT 1 FROM messages source WHERE source.id = ? AND source.connector_id = ?
-        AND source.conversation_id = ? AND source.direction = 'outbound'
-        AND source.external_id IS NULL AND source.content_type = 'text' AND source.body = ?
-    ) AND NOT EXISTS (SELECT 1 FROM attachments WHERE message_id = ?)
-      AND NOT EXISTS (SELECT 1 FROM agent_queue WHERE message_id = ?)
-      AND NOT EXISTS (SELECT 1 FROM commands WHERE message_id = ? AND id <> ?)` : "";
-  const reconciliationGuardArgs = mergeFromMessageId
-    ? [completionMessageId, connectorId, command.conversation_id, qqIdentity.externalId, command.body,
-      mergeFromMessageId, connectorId, command.conversation_id, command.body,
-      mergeFromMessageId, mergeFromMessageId, mergeFromMessageId, commandId]
-    : [];
-  let results;
-  try {
-    results = await env.DB.batch([
+  const results = await env.DB.batch([
     env.DB.prepare(`
-      UPDATE commands SET state = ?, result_json = ?, completed_at = ?, message_id = ?
+      UPDATE commands SET state = ?, result_json = ?, completed_at = ?
       WHERE id = ? AND connector_id = ? AND state = 'leased' AND lease_token = ?
         AND lease_expires_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-        ${reconciliationGuard}
     `).bind(state, JSON.stringify(body.result || { error: body.error || null }), state === "pending" ? null : stamp,
-      completionMessageId, commandId, connectorId, leaseToken, ...reconciliationGuardArgs),
-    mergeFromMessageId
-      ? env.DB.prepare(`
-          UPDATE messages SET created_by = ?, sender_name = ?, delivery_state = 'delivered'
-          WHERE id = ? AND direction = 'outbound' AND external_id = ? AND ${completionPredicate}
-        `).bind(command.created_by, command.sender_name, completionMessageId, qqIdentity.externalId,
-          commandId, connectorId, state, leaseToken)
-      : qqIdentity.present && state === "completed"
-        ? env.DB.prepare(`UPDATE messages SET external_id = ?, delivery_state = ? WHERE id = ? AND ${completionPredicate}`)
-          .bind(qqIdentity.externalId, deliveryState, command.message_id, commandId, connectorId, state, leaseToken)
-        : env.DB.prepare(`UPDATE messages SET delivery_state = ? WHERE id = ? AND ${completionPredicate}`)
-          .bind(deliveryState, command.message_id, commandId, connectorId, state, leaseToken),
+      commandId, connectorId, leaseToken),
+    env.DB.prepare(`UPDATE messages SET delivery_state = ? WHERE id = ? AND ${completionPredicate}`)
+      .bind(deliveryState, command.message_id, commandId, connectorId, state, leaseToken),
     env.DB.prepare(`UPDATE attachments SET state = ? WHERE message_id = ? AND ${completionPredicate}`)
       .bind(deliveryState, command.message_id, commandId, connectorId, state, leaseToken),
-    ...(mergeFromMessageId ? [env.DB.prepare(`
-      DELETE FROM messages WHERE id = ? AND external_id IS NULL AND direction = 'outbound'
-        AND NOT EXISTS (SELECT 1 FROM attachments WHERE message_id = messages.id)
-        AND NOT EXISTS (SELECT 1 FROM agent_queue WHERE message_id = messages.id)
-        AND NOT EXISTS (SELECT 1 FROM commands WHERE message_id = messages.id)
-        AND ${completionPredicate}
-    `).bind(mergeFromMessageId, commandId, connectorId, state, leaseToken)] : []),
     env.DB.prepare(`
       UPDATE commands SET lease_token = NULL, lease_expires_at = NULL
       WHERE id = ? AND connector_id = ? AND state = ? AND lease_token = ?
     `).bind(commandId, connectorId, state, leaseToken),
-    ]);
-  } catch (error) {
-    const isExternalIdRace = error instanceof Error &&
-      error.message.includes("UNIQUE constraint failed: messages.connector_id, messages.external_id");
-    if (!batchRetry && isExternalIdRace && state === "completed" && isQQConnector && qqIdentity.valid) {
-      const racedEvent = await env.DB.prepare(`
-        SELECT id, conversation_id, direction, body, content_type, metadata_json,
-          (SELECT COUNT(*) FROM attachments WHERE message_id = messages.id) AS attachment_count,
-          (SELECT COUNT(*) FROM agent_queue WHERE message_id = messages.id) AS agent_queue_count
-        FROM messages WHERE connector_id = ? AND external_id = ?
-      `).bind(connectorId, qqIdentity.externalId).first();
-      if (racedEvent && racedEvent.conversation_id === command.conversation_id &&
-          racedEvent.direction === "outbound" && racedEvent.body === command.body &&
-          racedEvent.content_type === "text" && safeJson(racedEvent.metadata_json, {}).isSelf === true &&
-          racedEvent.attachment_count === 0 && racedEvent.agent_queue_count === 0) {
-        const retryRequest = new Request(request.url, {
-          method: "POST", headers: request.headers, body: JSON.stringify(body),
-        });
-        return completeCommand(retryRequest, env, commandId, true);
-      }
-    }
-    throw error;
-  }
-  if (!count(results[0]?.meta?.changes) || !count(results.at(-1)?.meta?.changes) ||
-      (mergeFromMessageId && !count(results[3]?.meta?.changes))) {
+  ]);
+  if (!count(results[0]?.meta?.changes) || !count(results.at(-1)?.meta?.changes)) {
     throw new Error("invalid_command_lease");
   }
   await audit(env, `connector:${connectorId}`, "command_completed", commandId, { state });
@@ -3374,6 +2970,17 @@ function isHtmlNavigation(request, path) {
     new Set(["/", "/app", "/index.html", "/login"]).has(path);
 }
 
+async function nativeFrameSources(env) {
+  const { results } = await env.DB.prepare(
+    "SELECT DISTINCT native_url FROM connector_instances WHERE native_url IS NOT NULL",
+  ).all();
+  const origins = new Set();
+  for (const row of results || []) {
+    try { origins.add(new URL(row.native_url).origin); } catch { /* skip malformed legacy value */ }
+  }
+  return origins.size ? [...origins].join(" ") : "'none'";
+}
+
 async function appAssetResponse(request, env, assetPath) {
   if (!env.ASSETS || typeof env.ASSETS.fetch !== "function") {
     return fail("app_assets_unavailable", 503);
@@ -3402,6 +3009,7 @@ async function appAssetResponse(request, env, assetPath) {
     headers.set("content-security-policy",
       "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; " +
       "media-src 'self' blob:; connect-src 'self'; font-src 'self' data:; object-src 'none'; " +
+      `frame-src ${await nativeFrameSources(env)}; ` +
       "base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
   }
   return new Response(asset.body, { status: asset.status, statusText: asset.statusText, headers });
@@ -3445,12 +3053,6 @@ export default {
       }
       if (url.pathname === "/api/connectors/register" && request.method === "POST") return await registerConnector(request, env);
       if (url.pathname === "/api/connectors/heartbeat" && request.method === "POST") return await heartbeatConnector(request, env);
-      if (url.pathname === "/api/connectors/layout-control" && request.method === "GET") {
-        return await readConnectorLayoutControl(request, env, url);
-      }
-      if (url.pathname === "/api/connectors/layout-control/ack" && request.method === "POST") {
-        return await acknowledgeConnectorLayoutControl(request, env);
-      }
       if (url.pathname === "/api/connectors/events" && request.method === "POST") return await ingestEvents(request, env);
       if (url.pathname === "/api/connectors/group-text-backups" && request.method === "POST") {
         return await ingestGroupTextBackups(request, env);
@@ -3514,12 +3116,6 @@ export default {
       const stagedFile = url.pathname.match(/^\/api\/files\/([a-zA-Z0-9._:-]+)$/);
       if (stagedFile && request.method === "DELETE") return await discardHumanFile(env, ctx, identity, stagedFile[1]);
       if (url.pathname === "/api/messages/send" && request.method === "POST") return await sendHumanMessage(request, env, identity);
-      const connectorLayoutControl = url.pathname.match(
-        /^\/api\/connectors\/([a-zA-Z0-9._:-]+)\/layout-control$/,
-      );
-      if (connectorLayoutControl && request.method === "PUT") {
-        return await updateConnectorLayoutControl(request, env, identity, connectorLayoutControl[1]);
-      }
       const policy = url.pathname.match(/^\/api\/conversations\/([a-zA-Z0-9._:-]+)\/policy$/);
       if (policy && new Set(["GET", "PUT"]).has(request.method)) return await conversationPolicy(request, env, identity, policy[1]);
       return fail("not_found", 404);

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { FluentButton, FluentField, FluentSwitch, FluentTheme } from '@platform-kit/fluent/vue'
+import { FluentButton, FluentField, FluentTheme } from '@platform-kit/fluent/vue'
 import AppIcon from './AppIcon.vue'
 import type { IconName } from './icons'
 import { createInboxReadGate, createInboxRefreshLoop } from './inbox-refresh.mjs'
@@ -37,26 +37,6 @@ import {
 } from './presentation.mjs'
 import { parseMessageBody, previewText, type CardKind, type MediaKind, type MoneyKind } from './rich-body.mjs'
 
-type LayoutAcknowledgement = {
-  enabled: boolean
-  revision: number
-  updatedAt?: string | null
-  reason?: string | null
-}
-
-type LayoutControl = {
-  enabled: boolean
-  revision: number
-  updatedAt?: string | null
-  reason?: string | null
-  deviceGeneration: number | null
-  deviceActionId: string | null
-  deviceActionRevision: number | null
-  deviceActionEnabled: boolean | null
-  acknowledgement: LayoutAcknowledgement | null
-  synchronized: boolean
-}
-
 type ConnectorState = 'online' | 'offline' | 'degraded'
 
 type Connector = {
@@ -69,7 +49,7 @@ type Connector = {
   state: ConnectorState
   capabilities: string[]
   lastSeenAt?: string | null
-  layoutControl?: LayoutControl
+  nativeUrl: string | null
 }
 
 type Conversation = {
@@ -180,7 +160,6 @@ const draftCache = new Map<string, string>()
 const stagedCache = new Map<string, StagedAttachment[]>()
 const sendingConversationIds = ref(new Set<string>())
 const uploadingConversationIds = ref(new Set<string>())
-const updatingLayoutConnectorIds = ref(new Set<string>())
 const avatarRetryStates = ref(new Map<string, AvatarRetryState>())
 const loadedAttachmentImages = ref(new Set<string>())
 const AVATAR_RETRY_BASE_MS = 5_000
@@ -192,6 +171,12 @@ const selectedConversation = computed(() =>
 const selectedConversationConnector = computed(() =>
   snapshot.value.connectors.find((item) => item.id === selectedConversation.value?.connectorId) ?? null,
 )
+const nativeConnector = computed(() => {
+  const connector = activeConnectorId.value
+    ? snapshot.value.connectors.find((item) => item.id === activeConnectorId.value)
+    : selectedConversationConnector.value
+  return connector?.nativeUrl && connectorModes.value[connector.id] === 'native' ? connector : null
+})
 const filters = computed(() => {
   const labels = new Map<string, string>()
   for (const conversation of snapshot.value.conversations) {
@@ -378,7 +363,7 @@ function capLabel(capability: string) {
   return ({
     receive_text: '收文字', send_text: '发文字', receive_files: '收附件', send_files: '发附件',
     receive_images: '收图片', send_images: '发图片', receive_video: '收视频', send_video: '发视频',
-    threads: '会话串', reactions: '回应', layout_control: '布局控制',
+    threads: '会话串', reactions: '回应',
   } as Record<string, string>)[capability] || capability
 }
 
@@ -688,16 +673,7 @@ function sameInbox(left: Snapshot, right: Snapshot) {
     const b = right.connectors[index]
     if (a.id !== b.id || a.accountLabel !== b.accountLabel || a.displayName !== b.displayName
         || a.channelLabel !== b.channelLabel || a.mode !== b.mode || a.state !== b.state
-        || a.lastSeenAt !== b.lastSeenAt || a.layoutControl?.enabled !== b.layoutControl?.enabled
-        || a.layoutControl?.revision !== b.layoutControl?.revision
-        || a.layoutControl?.updatedAt !== b.layoutControl?.updatedAt || a.layoutControl?.reason !== b.layoutControl?.reason
-        || a.layoutControl?.deviceGeneration !== b.layoutControl?.deviceGeneration
-        || a.layoutControl?.deviceActionId !== b.layoutControl?.deviceActionId
-        || a.layoutControl?.deviceActionRevision !== b.layoutControl?.deviceActionRevision
-        || a.layoutControl?.deviceActionEnabled !== b.layoutControl?.deviceActionEnabled
-        || a.layoutControl?.acknowledgement?.revision !== b.layoutControl?.acknowledgement?.revision
-        || a.layoutControl?.acknowledgement?.updatedAt !== b.layoutControl?.acknowledgement?.updatedAt
-        || a.layoutControl?.synchronized !== b.layoutControl?.synchronized
+        || a.lastSeenAt !== b.lastSeenAt || a.nativeUrl !== b.nativeUrl
         || a.capabilities.length !== b.capabilities.length
         || a.capabilities.some((value, itemIndex) => value !== b.capabilities[itemIndex])) return false
   }
@@ -797,7 +773,6 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
       loadedAttachmentImages.value = new Set([...loadedAttachmentImages.value].filter((key) => currentImageKeys.has(key)))
     }
     advanceAvatarRetries(body.conversations, body.messages)
-    body.connectors = mergeConnectorLayoutControls(body.connectors)
     if (sameInbox(snapshot.value, body)) {
       if (reloadConversationId) void load(reloadConversationId, true)
       return
@@ -883,7 +858,9 @@ function showPreviousConversationPage() {
 
 function selectConversationById(conversationId: string) {
   const conversation = snapshot.value.conversations.find((item) => item.id === conversationId)
-  if (conversation) void selectConversation(conversation)
+  if (!conversation) return
+  setConnectorMode(conversation.connectorId, 'info')
+  void selectConversation(conversation)
 }
 
 function selectFilter(id: string, connectorId = '') {
@@ -929,94 +906,35 @@ function showConnectorManagement() {
   mobileThread.value = false
 }
 
-function connectorLayoutControl(connector: Connector): LayoutControl {
-  return connector.layoutControl ?? {
-    enabled: false,
-    revision: 0,
-    updatedAt: null,
-    reason: 'not_configured',
-    deviceGeneration: null,
-    deviceActionId: null,
-    deviceActionRevision: null,
-    deviceActionEnabled: null,
-    acknowledgement: null,
-    synchronized: false,
-  }
-}
+type ConnectorMode = 'info' | 'native'
 
-function supportsLayoutAutoRecovery(connector: Connector) {
-  return connector.mode === 'device_relay' && connector.capabilities.includes('layout_control')
-}
+const CONNECTOR_MODE_KEY = 'message-center:connector-modes'
 
-function mergeConnectorLayoutControls(connectors: Connector[]) {
-  const previousById = new Map(snapshot.value.connectors.map((connector) => [connector.id, connector]))
-  return connectors.map((connector) => {
-    const incoming = connector.layoutControl
-    const previous = previousById.get(connector.id)?.layoutControl
-    if (!supportsLayoutAutoRecovery(connector) || !incoming || !previous) return connector
-    if (incoming.revision < previous.revision) return { ...connector, layoutControl: previous }
-    if (incoming.revision > previous.revision) return connector
-    const incomingAcknowledgement = incoming.acknowledgement
-    const previousAcknowledgement = previous.acknowledgement
-    const incomingAcknowledgementRevision = incomingAcknowledgement?.revision ?? -1
-    const previousAcknowledgementRevision = previousAcknowledgement?.revision ?? -1
-    const incomingAcknowledgedAt = Date.parse(incomingAcknowledgement?.updatedAt || '') || 0
-    const previousAcknowledgedAt = Date.parse(previousAcknowledgement?.updatedAt || '') || 0
-    if (previousAcknowledgementRevision > incomingAcknowledgementRevision ||
-        (previousAcknowledgementRevision === incomingAcknowledgementRevision &&
-          previousAcknowledgedAt > incomingAcknowledgedAt)) {
-      const acknowledgement = previousAcknowledgement
-      return {
-        ...connector,
-        layoutControl: {
-          ...incoming,
-          acknowledgement,
-          synchronized: Boolean(acknowledgement && acknowledgement.revision === incoming.revision &&
-            acknowledgement.enabled === incoming.enabled),
-        },
-      }
-    }
-    return connector
-  })
-}
-
-function layoutControlStatus(connector: Connector) {
-  if (updatingLayoutConnectorIds.value.has(connector.id)) return '正在更新'
-  const state = connectorLayoutControl(connector)
-  if (state.enabled) return state.synchronized ? '已在设备启用' : '等待设备启用'
-  if (!state.acknowledgement && state.revision === 0) return '尚未启用'
-  return state.synchronized ? '已在设备关闭' : '等待设备停止'
-}
-
-async function setLayoutAutoRecovery(connector: Connector, enabled: boolean) {
-  if (updatingLayoutConnectorIds.value.has(connector.id)) return
-  const expectedRevision = connectorLayoutControl(connector).revision
-  updatingLayoutConnectorIds.value = new Set([...updatingLayoutConnectorIds.value, connector.id])
+function loadConnectorModes(): Record<string, ConnectorMode> {
   try {
-    const result = await api<{ layoutControl: LayoutControl }>(
-      `/api/connectors/${encodeURIComponent(connector.id)}/layout-control`,
-      {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ enabled, expectedRevision }),
-      },
-    )
-    const current = snapshot.value.connectors.find((item) => item.id === connector.id)
-    if (current) current.layoutControl = result.layoutControl
-    notify(enabled ? '已请求启用自动恢复布局' : '已请求关闭自动恢复布局')
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    if (message === 'layout_revision_conflict') {
-      notify('布局控制状态已更新，正在重新载入')
-      await load(selectedId.value, true).catch(() => {})
-    } else {
-      notify(`布局控制失败：${message}`)
-    }
-  } finally {
-    const remaining = new Set(updatingLayoutConnectorIds.value)
-    remaining.delete(connector.id)
-    updatingLayoutConnectorIds.value = remaining
+    const parsed = JSON.parse(localStorage.getItem(CONNECTOR_MODE_KEY) || '{}')
+    return Object.fromEntries(Object.entries(parsed).filter(([, mode]) => mode === 'native')) as Record<string, ConnectorMode>
+  } catch {
+    return {}
   }
+}
+
+const connectorModes = ref(loadConnectorModes())
+
+function setConnectorMode(connectorId: string, mode: ConnectorMode) {
+  const next = { ...connectorModes.value }
+  if (mode === 'native') next[connectorId] = mode
+  else delete next[connectorId]
+  connectorModes.value = next
+  try {
+    localStorage.setItem(CONNECTOR_MODE_KEY, JSON.stringify(next))
+  } catch { /* storage unavailable */ }
+}
+
+function openConnectorNative(connector: Connector) {
+  setConnectorMode(connector.id, 'native')
+  selectFilter(`channel:${channelLabel(connector)}`, connector.id)
+  mobileThread.value = true
 }
 
 async function uploadFiles(event: Event) {
@@ -1457,8 +1375,31 @@ onUnmounted(() => {
       </div>
     </section>
 
-    <section v-if="!showInstances" class="content-pane" aria-label="会话详情">
-      <template v-if="selectedConversation">
+    <section v-if="!showInstances" class="content-pane" :class="{ 'is-native': nativeConnector }" aria-label="会话详情">
+      <template v-if="nativeConnector">
+        <header class="thread-header native-header">
+          <button class="quiet-button mobile-back" type="button" aria-label="返回收件箱" title="返回收件箱" @click="mobileThread = false">
+            <AppIcon name="back" :size="18" />
+          </button>
+          <div class="thread-title">
+            <h2>{{ nativeConnector.accountLabel }}</h2>
+          </div>
+          <div class="segmented" role="group" aria-label="显示模式">
+            <button type="button" aria-pressed="false" @click="setConnectorMode(nativeConnector.id, 'info')">信息模式</button>
+            <button type="button" class="active" aria-pressed="true">原生模式</button>
+          </div>
+          <a class="native-open-link" :href="nativeConnector.nativeUrl!" target="_blank" rel="noopener noreferrer">在新窗口打开</a>
+        </header>
+        <iframe
+          :key="nativeConnector.id"
+          class="native-frame"
+          :src="nativeConnector.nativeUrl!"
+          :title="`${nativeConnector.accountLabel} 原生模式`"
+          allow="clipboard-read; clipboard-write; autoplay; fullscreen"
+          referrerpolicy="no-referrer"
+        />
+      </template>
+      <template v-else-if="selectedConversation">
         <header class="thread-header">
           <button class="quiet-button mobile-back" type="button" aria-label="返回收件箱" title="返回收件箱" @click="mobileThread = false">
             <AppIcon name="back" :size="18" />
@@ -1486,6 +1427,10 @@ onUnmounted(() => {
                 <span class="presence-dot" :class="selectedConversation.connectorState" />接入{{ statusLabel(selectedConversation.connectorState) }}
               </span>
             </p>
+          </div>
+          <div v-if="selectedConversationConnector?.nativeUrl" class="segmented" role="group" aria-label="显示模式">
+            <button type="button" class="active" aria-pressed="true">信息模式</button>
+            <button type="button" aria-pressed="false" @click="setConnectorMode(selectedConversationConnector.id, 'native')">原生模式</button>
           </div>
           <span v-if="aiUnreadCount" class="status-chip ai-unread-chip" :title="`AI 未读 ${aiUnreadCount} 条`">
             <span class="unread-dot" /><span class="chip-label">AI 未读</span> {{ aiUnreadCount }}
@@ -1749,19 +1694,6 @@ onUnmounted(() => {
               <span v-if="!connector.capabilities.length" class="capability-chip">未声明</span>
             </dd>
           </dl>
-          <section v-if="supportsLayoutAutoRecovery(connector)" class="instance-control" aria-label="布局控制">
-            <div class="instance-control-copy">
-              <strong>自动恢复布局</strong>
-              <span>{{ layoutControlStatus(connector) }}</span>
-            </div>
-            <FluentSwitch
-              class="toggle-switch"
-              :model-value="connectorLayoutControl(connector).enabled"
-              :aria-label="`${connector.accountLabel} 自动恢复布局`"
-              :disabled="updatingLayoutConnectorIds.has(connector.id)"
-              @change="setLayoutAutoRecovery(connector, $event)"
-            />
-          </section>
           <footer class="instance-actions">
             <FluentButton
               class="instance-open-button"
@@ -1770,6 +1702,13 @@ onUnmounted(() => {
               :disabled="!snapshot.conversations.some((conversation) => conversation.connectorId === connector.id)"
               @click="selectFilter(`channel:${channelLabel(connector)}`, connector.id)"
             ><span>查看此账号会话</span><AppIcon name="arrowRight" :size="14" /></FluentButton>
+            <FluentButton
+              v-if="connector.nativeUrl"
+              class="instance-open-button"
+              tone="subtle"
+              type="button"
+              @click="openConnectorNative(connector)"
+            ><span>原生模式</span><AppIcon name="arrowRight" :size="14" /></FluentButton>
           </footer>
         </article>
         <div v-if="!snapshot.connectors.length && !loading" class="empty-state">

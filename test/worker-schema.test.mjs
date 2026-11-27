@@ -5,8 +5,6 @@ import { DatabaseSync } from 'node:sqlite';
 import worker from '../cloudflare-worker/worker/index.js';
 import { createAdminTestAuth } from './helpers/oidc-fixture.mjs';
 import { testLateInboundImageReplay } from './inbound-late-attachment.test.mjs';
-import { testQuoteReplay } from './quote-replay.test.mjs';
-
 const stamp = new Date().toISOString();
 const freshMigrationDatabase = new DatabaseSync(':memory:');
 const migrationDirectory = new URL('../cloudflare-worker/migrations/', import.meta.url);
@@ -16,15 +14,6 @@ for (const fileName of readdirSync(migrationDirectory).filter((name) => name.end
 assert.equal(freshMigrationDatabase.prepare(`
   SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name = 'maintenance_state'
 `).get().total, 1);
-assert.equal(freshMigrationDatabase.prepare(`
-  SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name = 'connector_layout_control'
-`).get().total, 1);
-assert.deepEqual(freshMigrationDatabase.prepare('PRAGMA table_info(connector_layout_control)').all()
-  .map((row) => row.name).filter((name) => [
-    'device_generation', 'device_action_id', 'device_action_revision', 'device_action_enabled',
-  ].includes(name)), [
-    'device_generation', 'device_action_id', 'device_action_revision', 'device_action_enabled',
-  ]);
 assert.deepEqual(freshMigrationDatabase.prepare('PRAGMA table_info(connector_instances)').all()
   .map((row) => row.name).filter((name) => name === 'channel_label'), ['channel_label']);
 assert.deepEqual(freshMigrationDatabase.prepare('PRAGMA table_info(messages)').all()
@@ -34,7 +23,6 @@ assert.deepEqual(freshMigrationDatabase.prepare('PRAGMA table_info(conversation_
 assert.deepEqual(freshMigrationDatabase.prepare('PRAGMA table_info(attachments)').all()
   .map((row) => row.name).filter((name) => name === 'inbound_cleanup_marked_at'), ['inbound_cleanup_marked_at']);
 freshMigrationDatabase.close();
-
 const migrationDatabase = new DatabaseSync(':memory:');
 migrationDatabase.exec(`
   CREATE TABLE connector_instances (
@@ -87,7 +75,6 @@ assert.equal(migrationDatabase.prepare(`
   WHERE connector_id = ? AND external_id = ? AND title = ?
 `).get('instance-migration', 'profile-only-migration', 'Migrated profile').total, 1);
 migrationDatabase.close();
-
 const conflictMigrationDatabase = new DatabaseSync(':memory:');
 conflictMigrationDatabase.exec(readFileSync(new URL('../cloudflare-worker/worker/schema.sql', import.meta.url), 'utf8'));
 conflictMigrationDatabase.prepare(`
@@ -124,7 +111,6 @@ assert.equal(conflictMigrationDatabase.prepare(`
   SELECT COUNT(*) AS total FROM messages WHERE conversation_id = 'conversation-conflict-b'
 `).get().total, 0);
 conflictMigrationDatabase.close();
-
 const database = new DatabaseSync(':memory:');
 database.exec(readFileSync(new URL('../cloudflare-worker/worker/schema.sql', import.meta.url), 'utf8'));
 const profileColumns = database.prepare('PRAGMA table_info(conversation_profiles)').all().map((row) => row.name);
@@ -142,14 +128,6 @@ assert.ok(attachmentColumns.includes('inbound_cleanup_marked_at'));
 assert.equal(database.prepare(`
   SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name = 'maintenance_state'
 `).get().total, 1);
-assert.deepEqual(database.prepare('PRAGMA table_info(connector_layout_control)').all()
-  .map((row) => row.name).filter((name) => [
-    'desired_enabled', 'revision', 'reported_enabled', 'reported_revision',
-    'device_generation', 'device_action_id', 'device_action_revision', 'device_action_enabled',
-  ].includes(name)), [
-    'desired_enabled', 'revision', 'reported_enabled', 'reported_revision',
-    'device_generation', 'device_action_id', 'device_action_revision', 'device_action_enabled',
-  ]);
 assert.equal(database.prepare(`
   SELECT COUNT(*) AS total FROM sqlite_master
   WHERE type = 'index' AND name = 'idx_attachments_outbound_claim'
@@ -193,7 +171,6 @@ assert.equal(database.prepare(`
   WHERE m.queue_class = 'immediate'
 `).get().total, 1);
 assert.equal(database.prepare("SELECT queue_class FROM messages WHERE id = 'message-background'").get().queue_class, 'background');
-
 let beforeGraytipUpgrade;
 function d1Statement(sql, args = []) {
   const statement = database.prepare(sql);
@@ -213,36 +190,19 @@ function d1Statement(sql, args = []) {
     async all() { return { results: statement.all(...args) }; },
   };
 }
-
 const d1 = {
   prepare(sql) { return d1Statement(sql); },
   async batch(statements) { return Promise.all(statements.map((statement) => statement.run())); },
 };
 const connectorToken = 'c'.repeat(40);
-const nonOwnerConnectorToken = 'n'.repeat(40);
-const wrongModeConnectorToken = 'w'.repeat(40);
 const agentToken = 'g'.repeat(40);
 const connectorId = 'instance-device-test';
-const nonOwnerConnectorId = 'instance-device-secondary';
-const wrongModeConnectorId = 'instance-cloud-layout-test';
 database.prepare(`
   INSERT INTO connector_instances (
     id, kind, channel_label, account_label, display_name, mode, capabilities_json, created_at, updated_at
   ) VALUES (?, 'im', 'Test IM', 'device', 'Device', 'device_relay',
-    '["receive_text","receive_files","receive_images","send_text","send_files","layout_control"]', ?, ?)
+    '["receive_text","receive_files","receive_images","send_text","send_files"]', ?, ?)
 `).run(connectorId, stamp, stamp);
-database.prepare(`
-  INSERT INTO connector_instances (
-    id, kind, channel_label, account_label, display_name, mode, capabilities_json, created_at, updated_at
-  ) VALUES (?, 'im', 'Test IM', 'secondary', 'Secondary', 'device_relay',
-    '["receive_text"]', ?, ?)
-`).run(nonOwnerConnectorId, stamp, stamp);
-database.prepare(`
-  INSERT INTO connector_instances (
-    id, kind, channel_label, account_label, display_name, mode, capabilities_json, created_at, updated_at
-  ) VALUES (?, 'im', 'Test IM', 'cloud', 'Cloud', 'cloud_relay',
-    '["receive_text","layout_control"]', ?, ?)
-`).run(wrongModeConnectorId, stamp, stamp);
 database.prepare(`
   INSERT INTO group_text_backups (
     connector_id, conversation_external_id, conversation_title, external_id,
@@ -281,7 +241,6 @@ const authoritativeUpdatedAt = '2026-08-28T10:00:01.000Z';
 database.prepare(`
   UPDATE connector_instances SET state = 'offline', last_seen_at = ?, updated_at = ? WHERE id = ?
 `).run(authoritativeLastSeen, authoritativeUpdatedAt, connectorId);
-
 const r2Objects = new Map();
 const deletedR2Keys = [];
 const fixedLengthInboundStreams = new WeakMap();
@@ -368,20 +327,17 @@ const auth = await createAdminTestAuth({
   FILES: r2,
   CONNECTOR_TOKENS: JSON.stringify({
     [connectorId]: connectorToken,
-    [nonOwnerConnectorId]: nonOwnerConnectorToken,
-    [wrongModeConnectorId]: wrongModeConnectorToken,
   }),
   AGENT_TOKEN: agentToken,
 });
 const workerEnv = auth.env;
-
-const connectorLayoutHeaders = {
+const connectorHeaders = {
   authorization: `Bearer ${connectorToken}`,
   'x-connector-id': connectorId,
 };
 async function heartbeat(state) {
   return worker.fetch(new Request('https://message.example.com/api/connectors/heartbeat', {
-    method: 'POST', headers: { ...connectorLayoutHeaders, 'content-type': 'application/json' },
+    method: 'POST', headers: { ...connectorHeaders, 'content-type': 'application/json' },
     body: JSON.stringify({ connectorId, state }),
   }), workerEnv, {});
 }
@@ -395,267 +351,6 @@ for (const state of [undefined, null, 1]) {
   assert.equal((await invalid.json()).error, 'invalid_connector_state');
 }
 assert.equal((await heartbeat('offline')).status, 200);
-const crossConnectorLayoutResponse = await worker.fetch(new Request(
-  'https://message.example.com/api/connectors/layout-control?connectorId=instance-other-device',
-  { headers: connectorLayoutHeaders },
-), workerEnv, {});
-assert.equal(crossConnectorLayoutResponse.status, 403);
-assert.equal((await crossConnectorLayoutResponse.json()).error, 'connector_id_mismatch');
-const layoutBodyMismatchResponse = await worker.fetch(new Request(
-  'https://message.example.com/api/connectors/layout-control/ack', {
-    method: 'POST',
-    headers: { ...connectorLayoutHeaders, 'content-type': 'application/json' },
-    body: JSON.stringify({ connectorId: 'instance-other-device', revision: 0, enabled: false }),
-  },
-), workerEnv, {});
-assert.equal(layoutBodyMismatchResponse.status, 403);
-assert.equal((await layoutBodyMismatchResponse.json()).error, 'connector_id_mismatch');
-for (const [unsupportedConnectorId, unsupportedConnectorToken] of [
-  [nonOwnerConnectorId, nonOwnerConnectorToken],
-  [wrongModeConnectorId, wrongModeConnectorToken],
-]) {
-  const unsupportedLayoutResponse = await worker.fetch(new Request(
-    `https://message.example.com/api/connectors/layout-control?connectorId=${unsupportedConnectorId}`,
-    { headers: {
-      authorization: `Bearer ${unsupportedConnectorToken}`,
-      'x-connector-id': unsupportedConnectorId,
-    } },
-  ), workerEnv, {});
-  assert.equal(unsupportedLayoutResponse.status, 403);
-  assert.equal((await unsupportedLayoutResponse.json()).error, 'layout_control_not_supported');
-}
-const invalidLayoutOwnerRegistration = await worker.fetch(new Request(
-  'https://message.example.com/api/connectors/register', {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${wrongModeConnectorToken}`,
-      'content-type': 'application/json',
-      'x-connector-id': wrongModeConnectorId,
-    },
-    body: JSON.stringify({
-      id: wrongModeConnectorId,
-      kind: 'im',
-      accountLabel: 'cloud',
-      displayName: 'Cloud',
-      mode: 'cloud_relay',
-      capabilities: ['receive_text', 'layout_control'],
-    }),
-  },
-), workerEnv, {});
-assert.equal(invalidLayoutOwnerRegistration.status, 400);
-assert.equal((await invalidLayoutOwnerRegistration.json()).error, 'invalid_connector_capabilities');
-const unsupportedAdminLayoutUpdate = await worker.fetch(new Request(
-  `https://message.example.com/api/connectors/${nonOwnerConnectorId}/layout-control`, {
-    method: 'PUT',
-    headers: { ...auth.headers, 'content-type': 'application/json' },
-    body: JSON.stringify({ enabled: true, expectedRevision: 0 }),
-  },
-), workerEnv, {});
-assert.equal(unsupportedAdminLayoutUpdate.status, 403);
-assert.equal((await unsupportedAdminLayoutUpdate.json()).error, 'layout_control_not_supported');
-const unauthenticatedLayoutUpdate = await worker.fetch(new Request(
-  `https://message.example.com/api/connectors/${connectorId}/layout-control`, {
-    method: 'PUT', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ enabled: true, expectedRevision: 0 }),
-  },
-), workerEnv, {});
-assert.equal(unauthenticatedLayoutUpdate.status, 401);
-const initialLayoutResponse = await worker.fetch(new Request(
-  `https://message.example.com/api/connectors/layout-control?connectorId=${connectorId}`,
-  { headers: connectorLayoutHeaders },
-), workerEnv, {});
-assert.equal(initialLayoutResponse.status, 200);
-assert.deepEqual((await initialLayoutResponse.json()).layoutControl, {
-  enabled: false, revision: 0, updatedAt: null, reason: 'not_configured',
-  deviceGeneration: null, deviceActionId: null,
-  deviceActionRevision: null, deviceActionEnabled: null,
-  acknowledgement: null, synchronized: false,
-});
-
-async function updateLayout(enabled, expectedRevision) {
-  return worker.fetch(new Request(
-    `https://message.example.com/api/connectors/${connectorId}/layout-control`, {
-      method: 'PUT',
-      headers: { ...auth.headers, 'content-type': 'application/json' },
-      body: JSON.stringify({ enabled, expectedRevision }),
-    },
-  ), workerEnv, {});
-}
-
-async function acknowledgeLayout(body) {
-  return worker.fetch(new Request(
-    'https://message.example.com/api/connectors/layout-control/ack', {
-      method: 'POST',
-      headers: { ...connectorLayoutHeaders, 'content-type': 'application/json' },
-      body: JSON.stringify({ connectorId, ...body }),
-    },
-  ), workerEnv, {});
-}
-
-const enabledLayoutResponse = await updateLayout(true, 0);
-assert.equal(enabledLayoutResponse.status, 200);
-const enabledLayout = (await enabledLayoutResponse.json()).layoutControl;
-assert.deepEqual({ enabled: enabledLayout.enabled, revision: enabledLayout.revision,
-  reason: enabledLayout.reason, acknowledgement: enabledLayout.acknowledgement,
-  synchronized: enabledLayout.synchronized }, {
-  enabled: true, revision: 1, reason: 'administrator', acknowledgement: null, synchronized: false,
-});
-assert.ok(Number.isFinite(Date.parse(enabledLayout.updatedAt)));
-const staleAdminLayoutResponse = await updateLayout(false, 0);
-assert.equal(staleAdminLayoutResponse.status, 409);
-assert.equal((await staleAdminLayoutResponse.json()).layoutControl.revision, 1);
-
-const appliedLayoutResponse = await acknowledgeLayout({ revision: 1, enabled: true, reason: 'applied' });
-assert.equal(appliedLayoutResponse.status, 200);
-const appliedLayoutPayload = await appliedLayoutResponse.json();
-assert.deepEqual({ accepted: appliedLayoutPayload.accepted, idempotent: appliedLayoutPayload.idempotent },
-  { accepted: true, idempotent: false });
-const appliedLayout = appliedLayoutPayload.layoutControl;
-assert.equal(appliedLayout.synchronized, true);
-assert.deepEqual({ enabled: appliedLayout.acknowledgement.enabled, revision: appliedLayout.acknowledgement.revision },
-  { enabled: true, revision: 1 });
-
-const duplicateAppliedLayoutResponse = await acknowledgeLayout({
-  revision: 1, enabled: true, reason: 'must_not_replace_first_ack',
-});
-assert.equal(duplicateAppliedLayoutResponse.status, 200);
-const duplicateAppliedLayout = await duplicateAppliedLayoutResponse.json();
-assert.deepEqual({ accepted: duplicateAppliedLayout.accepted, idempotent: duplicateAppliedLayout.idempotent,
-  reason: duplicateAppliedLayout.layoutControl.acknowledgement.reason }, {
-  accepted: false, idempotent: true, reason: 'applied',
-});
-const reversedAppliedLayoutResponse = await acknowledgeLayout({ revision: 1, enabled: false, reason: 'reversed' });
-assert.equal(reversedAppliedLayoutResponse.status, 409);
-assert.equal((await reversedAppliedLayoutResponse.json()).error, 'layout_state_mismatch');
-
-const localStopActionId = 'layout-stop-action-0001';
-const localStopLayoutResponse = await acknowledgeLayout({
-  enabled: false, localStop: true, deviceGeneration: 1, actionId: localStopActionId,
-  reason: 'local_home_stop',
-});
-assert.equal(localStopLayoutResponse.status, 200);
-const stoppedLayoutPayload = await localStopLayoutResponse.json();
-assert.deepEqual({ accepted: stoppedLayoutPayload.accepted, idempotent: stoppedLayoutPayload.idempotent },
-  { accepted: true, idempotent: false });
-const stoppedLayout = stoppedLayoutPayload.layoutControl;
-assert.deepEqual({ enabled: stoppedLayout.enabled, revision: stoppedLayout.revision,
-  deviceGeneration: stoppedLayout.deviceGeneration, deviceActionId: stoppedLayout.deviceActionId,
-  deviceActionRevision: stoppedLayout.deviceActionRevision,
-  deviceActionEnabled: stoppedLayout.deviceActionEnabled,
-  acknowledgedEnabled: stoppedLayout.acknowledgement.enabled,
-  acknowledgedRevision: stoppedLayout.acknowledgement.revision, synchronized: stoppedLayout.synchronized }, {
-  enabled: false, revision: 2, deviceGeneration: 1, deviceActionId: localStopActionId,
-  deviceActionRevision: 2, deviceActionEnabled: false,
-  acknowledgedEnabled: false, acknowledgedRevision: 2, synchronized: true,
-});
-
-const duplicateLocalStopResponse = await acknowledgeLayout({
-  enabled: false, localStop: true, deviceGeneration: 1, actionId: localStopActionId,
-  reason: 'duplicate_after_lost_response',
-});
-assert.equal(duplicateLocalStopResponse.status, 200);
-const duplicateLocalStop = await duplicateLocalStopResponse.json();
-assert.deepEqual({ accepted: duplicateLocalStop.accepted, idempotent: duplicateLocalStop.idempotent,
-  revision: duplicateLocalStop.layoutControl.revision }, { accepted: false, idempotent: true, revision: 2 });
-const changedPayloadForSameActionResponse = await acknowledgeLayout({
-  enabled: true, localStart: true, deviceGeneration: 1, actionId: localStopActionId,
-});
-assert.equal(changedPayloadForSameActionResponse.status, 409);
-assert.equal((await changedPayloadForSameActionResponse.json()).error, 'layout_device_action_conflict');
-const reusedGenerationResponse = await acknowledgeLayout({
-  enabled: true, localStart: true, deviceGeneration: 1, actionId: 'layout-start-action-collision',
-});
-assert.equal(reusedGenerationResponse.status, 409);
-assert.equal((await reusedGenerationResponse.json()).error, 'layout_device_generation_conflict');
-const staleGenerationResponse = await acknowledgeLayout({
-  enabled: false, localStop: true, deviceGeneration: 0, actionId: 'layout-stop-action-0000',
-});
-assert.equal(staleGenerationResponse.status, 409);
-assert.equal((await staleGenerationResponse.json()).error, 'layout_device_generation_stale');
-
-const delayedEnabledAckResponse = await acknowledgeLayout({ revision: 1, enabled: true, reason: 'delayed' });
-assert.equal(delayedEnabledAckResponse.status, 409);
-const delayedEnabledAck = await delayedEnabledAckResponse.json();
-assert.equal(delayedEnabledAck.error, 'layout_revision_conflict');
-assert.deepEqual({ enabled: delayedEnabledAck.layoutControl.enabled,
-  revision: delayedEnabledAck.layoutControl.revision,
-  acknowledgedEnabled: delayedEnabledAck.layoutControl.acknowledgement.enabled,
-  acknowledgedRevision: delayedEnabledAck.layoutControl.acknowledgement.revision }, {
-  enabled: false, revision: 2, acknowledgedEnabled: false, acknowledgedRevision: 2,
-});
-
-const enabledAfterLostStopResponse = await updateLayout(true, 2);
-assert.equal(enabledAfterLostStopResponse.status, 200);
-assert.equal((await enabledAfterLostStopResponse.json()).layoutControl.revision, 3);
-const lostStopRetryAfterAdminResponse = await acknowledgeLayout({
-  enabled: false, localStop: true, deviceGeneration: 1, actionId: localStopActionId,
-});
-assert.equal(lostStopRetryAfterAdminResponse.status, 200);
-const lostStopRetryAfterAdmin = await lostStopRetryAfterAdminResponse.json();
-assert.deepEqual({
-  accepted: lostStopRetryAfterAdmin.accepted,
-  idempotent: lostStopRetryAfterAdmin.idempotent,
-  currentEnabled: lostStopRetryAfterAdmin.layoutControl.enabled,
-  currentRevision: lostStopRetryAfterAdmin.layoutControl.revision,
-  actionEnabled: lostStopRetryAfterAdmin.layoutControl.deviceActionEnabled,
-  actionRevision: lostStopRetryAfterAdmin.layoutControl.deviceActionRevision,
-}, {
-  accepted: false, idempotent: true,
-  currentEnabled: true, currentRevision: 3,
-  actionEnabled: false, actionRevision: 2,
-});
-
-const localStartActionId = 'layout-start-action-0002';
-const reenabledLayoutResponse = await acknowledgeLayout({
-  enabled: true, localStart: true, deviceGeneration: 2, actionId: localStartActionId,
-  reason: 'local_icon_start',
-});
-assert.equal(reenabledLayoutResponse.status, 200);
-const reenabledLayout = (await reenabledLayoutResponse.json()).layoutControl;
-assert.equal(reenabledLayout.enabled, true);
-assert.equal(reenabledLayout.revision, 4);
-assert.equal(reenabledLayout.deviceGeneration, 2);
-assert.equal(reenabledLayout.deviceActionId, localStartActionId);
-assert.equal(reenabledLayout.deviceActionRevision, 4);
-assert.equal(reenabledLayout.deviceActionEnabled, true);
-assert.equal(reenabledLayout.synchronized, true);
-const reorderedOldStopResponse = await acknowledgeLayout({
-  enabled: false, localStop: true, deviceGeneration: 1, actionId: localStopActionId,
-});
-assert.equal(reorderedOldStopResponse.status, 409);
-const reorderedOldStop = await reorderedOldStopResponse.json();
-assert.equal(reorderedOldStop.error, 'layout_device_generation_stale');
-assert.deepEqual({ enabled: reorderedOldStop.layoutControl.enabled, revision: reorderedOldStop.layoutControl.revision },
-  { enabled: true, revision: 4 });
-const disabledByAdminResponse = await updateLayout(false, 4);
-assert.equal(disabledByAdminResponse.status, 200);
-assert.equal((await disabledByAdminResponse.json()).layoutControl.revision, 5);
-const duplicateStartAfterAdminResponse = await acknowledgeLayout({
-  enabled: true, localStart: true, deviceGeneration: 2, actionId: localStartActionId,
-});
-assert.equal(duplicateStartAfterAdminResponse.status, 200);
-const duplicateStartAfterAdmin = await duplicateStartAfterAdminResponse.json();
-assert.deepEqual({ accepted: duplicateStartAfterAdmin.accepted, idempotent: duplicateStartAfterAdmin.idempotent,
-  enabled: duplicateStartAfterAdmin.layoutControl.enabled,
-  revision: duplicateStartAfterAdmin.layoutControl.revision,
-  actionEnabled: duplicateStartAfterAdmin.layoutControl.deviceActionEnabled,
-  actionRevision: duplicateStartAfterAdmin.layoutControl.deviceActionRevision }, {
-  accepted: false, idempotent: true, enabled: false, revision: 5,
-  actionEnabled: true, actionRevision: 4,
-});
-const enabledByAdminResponse = await updateLayout(true, 5);
-assert.equal(enabledByAdminResponse.status, 200);
-assert.equal((await enabledByAdminResponse.json()).layoutControl.revision, 6);
-const olderAckResponse = await acknowledgeLayout({ revision: 2, enabled: false, reason: 'older' });
-assert.equal(olderAckResponse.status, 409);
-assert.equal((await olderAckResponse.json()).error, 'layout_revision_conflict');
-const wrongCurrentAckResponse = await acknowledgeLayout({ revision: 6, enabled: false, reason: 'wrong_current' });
-assert.equal(wrongCurrentAckResponse.status, 409);
-assert.equal((await wrongCurrentAckResponse.json()).error, 'layout_state_mismatch');
-const actuallyFutureAckResponse = await acknowledgeLayout({ revision: 7, enabled: true, reason: 'future' });
-assert.equal(actuallyFutureAckResponse.status, 409);
-assert.equal((await actuallyFutureAckResponse.json()).layoutControl.revision, 6);
-
 async function callAgentToolResult(name, args) {
   const response = await worker.fetch(new Request('https://message.example.com/mcp', {
     method: 'POST',
@@ -666,13 +361,11 @@ async function callAgentToolResult(name, args) {
   const payload = await response.json();
   return payload.result;
 }
-
 async function callAgentTool(name, args) {
   const result = await callAgentToolResult(name, args);
   assert.notEqual(result?.isError, true, result?.content?.[0]?.text);
   return result.structuredContent;
 }
-
 database.prepare(`
   INSERT INTO messages (
     id, conversation_id, connector_id, external_id, direction, sender_name, body,
@@ -735,12 +428,10 @@ assert.equal(database.prepare(`
 `).get().state, 'leased');
 database.prepare("DELETE FROM agent_queue WHERE message_id = 'message-agent-expired-lease'").run();
 database.prepare("DELETE FROM messages WHERE id = 'message-agent-expired-lease'").run();
-
 database.prepare(`
   UPDATE conversations SET trust_tier = 'trusted', agent_policy_json = ? WHERE id = 'conversation-row'
 `).run(JSON.stringify({ enabled: true, requiredPrefix: '', allowedSenderIds: [], projectIds: [],
   allowedActions: ['send_text'], replyPolicy: 'informational' }));
-
 database.prepare(`
   INSERT INTO messages (
     id, conversation_id, connector_id, external_id, direction, sender_name, body,
@@ -782,7 +473,6 @@ assert.equal(database.prepare(`
 `).get().total, 0);
 database.prepare("DELETE FROM agent_queue WHERE message_id = 'message-agent-reply-race'").run();
 database.prepare("DELETE FROM messages WHERE id = 'message-agent-reply-race'").run();
-
 database.prepare(`
   INSERT INTO messages (
     id, conversation_id, connector_id, external_id, direction, sender_name, body,
@@ -824,7 +514,6 @@ database.prepare("DELETE FROM messages WHERE id = 'message-agent-reply-reclaimed
 database.prepare(`
   UPDATE conversations SET trust_tier = 'untrusted', agent_policy_json = '{}' WHERE id = 'conversation-row'
 `).run();
-
 async function putInboundFile(fileId, externalId, bytes, conversationExternalId = 'conversation-file-test', mimeType = 'application/octet-stream', announcedSize = bytes.byteLength) {
   const sha256 = createHash('sha256').update(bytes).digest('hex');
   return worker.fetch(new Request(`https://message.example.com/api/connectors/files/${fileId}`, {
@@ -842,7 +531,6 @@ async function putInboundFile(fileId, externalId, bytes, conversationExternalId 
     body: bytes,
   }), workerEnv, {});
 }
-
 const inboundBytes = new Uint8Array([1, 2, 3, 4]);
 const firstInboundFile = await putInboundFile('file-upload-one', 'external-file-one', inboundBytes);
 assert.equal(firstInboundFile.status, 201);
@@ -882,7 +570,6 @@ const crossConversationInbound = await putInboundFile(
 );
 assert.equal(crossConversationInbound.status, 400);
 assert.equal((await crossConversationInbound.json()).error, 'file_external_id_conflict');
-
 const invalidAttachmentMetadata = await requestEvents([{
   externalId: 'message-size-over-limit', conversationExternalId: 'conversation-size-over-limit',
   conversationTitle: 'Attachment size check', senderName: 'Member', body: '[图片]', contentType: 'mixed',
@@ -924,7 +611,6 @@ const staleReplyText = await requestEvents([{
 }]);
 assert.equal(staleReplyText.status, 400);
 assert.equal((await staleReplyText.json()).error, 'invalid_reply_preview');
-
 const originalPrepare = d1.prepare;
 let failInboundInsertAfterCommit = true;
 const wrapAmbiguousInboundStatement = (statement, sql) => ({
@@ -961,7 +647,6 @@ assert.equal(repairedInbound.status, 200);
 assert.equal(r2Objects.has(ambiguousInboundRow.object_key), true);
 assert.deepEqual(r2Objects.get(ambiguousInboundRow.object_key).bytes, ambiguousInboundBytes,
   'a put that writes the expected object before throwing is reconciled by HEAD');
-
 r2Objects.delete(ambiguousInboundRow.object_key);
 r2Faults.wrongPutResultKeys.add(ambiguousInboundRow.object_key);
 const wrongPutMetadataRepair = await putInboundFile(
@@ -969,7 +654,6 @@ const wrongPutMetadataRepair = await putInboundFile(
 );
 assert.equal(wrongPutMetadataRepair.status, 200,
   'HEAD reconciles a mismatched put result only when the stored object has the expected size and digest');
-
 r2Objects.delete(ambiguousInboundRow.object_key);
 r2Faults.throwAfterWriteKeys.add(ambiguousInboundRow.object_key);
 r2Faults.failHeadAfterWriteKeys.add(ambiguousInboundRow.object_key);
@@ -983,7 +667,6 @@ const retryAfterHeadFailure = await putInboundFile(
   'file-upload-head-failure-retry', 'external-file-ambiguous', ambiguousInboundBytes, 'conversation-file-ambiguous',
 );
 assert.equal(retryAfterHeadFailure.status, 200, 'a later retry recognizes the valid object left by an ambiguous put');
-
 const badChecksum = new Uint8Array(32).buffer;
 r2Objects.set(ambiguousInboundRow.object_key, {
   bytes: new Uint8Array([8, 8, 8]), options: {}, uploaded: new Date(), checksum: badChecksum,
@@ -996,7 +679,6 @@ assert.equal(replacedMismatchedObject.status, 200,
 assert.deepEqual(r2Objects.get(ambiguousInboundRow.object_key).bytes, ambiguousInboundBytes);
 assert.equal(deletedR2Keys.includes(ambiguousInboundRow.object_key), false,
   'repair never deletes a canonical object, including one verified as correct after an ambiguous write');
-
 const canonicalRaceBytes = new Uint8Array([31, 32, 33, 34]);
 const canonicalRaceExternalId = 'external-file-canonical-race';
 const canonicalRaceConversation = 'conversation-file-canonical-race';
@@ -1051,7 +733,6 @@ assert.deepEqual(r2Objects.get(canonicalRaceKey).bytes, canonicalRaceBytes);
 assert.equal(deletedR2Keys.includes(canonicalRaceKey), false,
   'canonical repair never deletes a mismatched or successfully repaired canonical key');
 const inboundObjectCount = r2Objects.size;
-
 const fakeImage = new File([new Uint8Array([0x6e, 0x6f, 0x74, 0x2d, 0x70, 0x6e, 0x67])], 'fake.png', { type: 'image/png' });
 const stagedForm = new FormData();
 stagedForm.append('file', fakeImage);
@@ -1069,7 +750,6 @@ const discardedResponse = await worker.fetch(new Request(
 assert.equal(discardedResponse.status, 200);
 assert.equal(r2Objects.size, inboundObjectCount);
 assert.equal(database.prepare('SELECT COUNT(*) AS total FROM attachments WHERE id = ?').get(stagedAttachment.id).total, 0);
-
 let failStagedInsertAfterCommit = true;
 const wrapAmbiguousStagedStatement = (statement, sql) => ({
   bind(...values) { return wrapAmbiguousStagedStatement(statement.bind(...values), sql); },
@@ -1106,7 +786,6 @@ const ambiguousDiscard = await worker.fetch(new Request(
 ), workerEnv, {});
 assert.equal(ambiguousDiscard.status, 200);
 assert.equal(r2Objects.has(ambiguousStagedRow.object_key), false);
-
 async function putProfile(conversationExternalId, headers = {}) {
   const avatarBody = headers.avatarBody;
   const avatarBytes = headers.avatarBytes ? new Uint8Array(headers.avatarBytes) : null;
@@ -1141,7 +820,6 @@ async function putProfile(conversationExternalId, headers = {}) {
   await Promise.all(waitUntilTasks);
   return response;
 }
-
 const explicitProfileResponse = await putProfile('profile-only-live', {
   displayName: 'Profile only', channelLabel: 'Channel A', conversationType: 'direct', placement: 'normal',
   pinned: true, unreadCount: 3, unreadObservedAt: '2000-01-01T00:00:00.000Z',
@@ -1254,7 +932,6 @@ assert.deepEqual({ ...database.prepare(`
   state: 'queued', message_id: (await outboundSend.clone().json()).messageId,
   outbound_claim_token: null, outbound_claimed_at: null,
 });
-
 async function stageOutbound(name, bytes) {
   const form = new FormData();
   form.append('file', new File([bytes], name, { type: 'application/octet-stream' }));
@@ -1264,7 +941,6 @@ async function stageOutbound(name, bytes) {
   assert.equal(response.status, 201);
   return (await response.json()).attachment;
 }
-
 const concurrentAttachment = await stageOutbound('concurrent.bin', new Uint8Array([10, 11, 12]));
 const concurrentBody = JSON.stringify({ conversationId: profileOnlyConversation.id, body: '',
   attachmentIds: [concurrentAttachment.id], clientRequestId: 'web-claim-concurrent-0001' });
@@ -1291,7 +967,6 @@ const idempotencyConflict = await worker.fetch(new Request('https://message.exam
 }), workerEnv, {});
 assert.equal(idempotencyConflict.status, 409);
 assert.equal((await idempotencyConflict.json()).error, 'idempotency_key_conflict');
-
 const retryAttachment = await stageOutbound('retry.bin', new Uint8Array([13, 14, 15]));
 const originalBatch = d1.batch;
 let failOutboundBatch = true;
@@ -1317,7 +992,6 @@ const retriedOutbound = await worker.fetch(new Request('https://message.example.
 d1.batch = originalBatch;
 assert.equal(retriedOutbound.status, 202);
 assert.equal(database.prepare('SELECT state FROM attachments WHERE id = ?').get(retryAttachment.id).state, 'queued');
-
 const fencedAttachment = await stageOutbound('fenced.bin', new Uint8Array([16, 17, 18]));
 const fencePrepare = d1.prepare;
 let reclaimBeforeClaimRefresh = true;
@@ -1353,7 +1027,6 @@ assert.equal(database.prepare(`
 assert.deepEqual({ ...database.prepare(`
   SELECT state, message_id FROM attachments WHERE id = ?
 `).get(fencedAttachment.id) }, { state: 'queued', message_id: fencedResult.messageId });
-
 const refreshFailureAttachment = await stageOutbound('refresh-failure.bin', new Uint8Array([19, 20, 21]));
 const refreshFailurePrepare = d1.prepare;
 let failClaimRefreshOnce = true;
@@ -1389,7 +1062,6 @@ assert.deepEqual({ ...database.prepare(`
 `).get(refreshFailureAttachment.id) }, {
   state: 'queued', message_id: refreshFailureResult.messageId, outbound_claim_token: null,
 });
-
 const ambiguousClaimAttachment = await stageOutbound('ambiguous-claim.bin', new Uint8Array([22, 23, 24]));
 const ambiguousClaimPrepare = d1.prepare;
 let throwAfterClaimCommit = true;
@@ -1450,7 +1122,6 @@ assert.equal(database.prepare(`
 assert.equal(database.prepare(`
   SELECT COUNT(*) AS total FROM conversations WHERE connector_id = ? AND external_id = ?
 `).get(connectorId, 'profile-only-live').total, 1);
-
 const oldAvatar = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]);
 const newAvatar = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 2]);
 assert.equal((await putProfile('profile-avatar-race', {
@@ -1495,7 +1166,6 @@ assert.equal(database.prepare(`
 `).get(connectorId).avatar_object_key, newAvatarKey);
 assert.equal(r2Objects.has(newAvatarKey), true);
 assert.equal(r2Objects.has(oldAvatarKey), false);
-
 const avatarBatch = d1.batch;
 let failAvatarBatchAfterCommit = true;
 d1.batch = async (statements) => {
@@ -1516,7 +1186,6 @@ const ambiguousAvatarKey = database.prepare(`
   WHERE connector_id = ? AND conversation_external_id = 'profile-avatar-ambiguous'
 `).get(connectorId).avatar_object_key;
 assert.equal(r2Objects.has(ambiguousAvatarKey), true);
-
 await putProfile('profile-monotonic', {
   displayName: 'Monotonic profile', conversationType: 'direct', placement: 'normal',
   unreadCount: 7, unreadObservedAt: '2026-08-28T12:00:01.000Z',
@@ -1582,19 +1251,6 @@ const invalidStoredStateInbox = await worker.fetch(new Request('https://message.
 assert.equal((await invalidStoredStateInbox.json()).connectors.find((item) => item.id === connectorId).state, 'offline');
 database.prepare('UPDATE connector_instances SET state = ?, last_seen_at = ? WHERE id = ?')
   .run('offline', null, connectorId);
-assert.deepEqual({ enabled: inboxConnector.layoutControl.enabled, revision: inboxConnector.layoutControl.revision,
-  synchronized: inboxConnector.layoutControl.synchronized,
-  deviceActionRevision: inboxConnector.layoutControl.deviceActionRevision,
-  deviceActionEnabled: inboxConnector.layoutControl.deviceActionEnabled }, {
-  enabled: true, revision: 6, synchronized: false,
-  deviceActionRevision: 4, deviceActionEnabled: true,
-});
-assert.equal(Object.hasOwn(
-  inboxBody.connectors.find((item) => item.id === nonOwnerConnectorId), 'layoutControl',
-), false);
-assert.equal(Object.hasOwn(
-  inboxBody.connectors.find((item) => item.id === wrongModeConnectorId), 'layoutControl',
-), false);
 database.prepare(`
   INSERT INTO conversations (
     id, connector_id, external_id, title, last_message_preview, last_message_at, created_at, updated_at
@@ -1607,7 +1263,6 @@ database.prepare(`
   ) VALUES ('message-promotion-row', 'conversation-promotion-row', ?, 'message-promotion',
     'inbound', 'Member', 'background', 'background', '{}', ?, ?)
 `).run(connectorId, stamp, stamp);
-
 async function requestEvents(messages) {
   return worker.fetch(new Request('https://message.example.com/api/connectors/events', {
     method: 'POST',
@@ -1619,13 +1274,11 @@ async function requestEvents(messages) {
     body: JSON.stringify({ connectorId, messages }),
   }), workerEnv, {});
 }
-
 async function postEvents(messages) {
   const response = await requestEvents(messages);
   assert.equal(response.status, 200);
   return response.json();
 }
-
 const stickerBytes = new Uint8Array([21, 22, 23, 24]);
 const stickerConversationExternalId = 'conversation-sticker-contract';
 const stickerFileExternalId = 'file-sticker-contract';
@@ -1662,7 +1315,6 @@ assert.equal(Object.hasOwn(stickerMessage.attachments[0], 'externalId'), false);
 assert.deepEqual(stickerMessage.reply, {
   sourceText: 'quoted source text', sourceTextTruncated: true, sourceExpired: false,
 });
-
 await postEvents([{
   externalId: 'message-no-watermark', conversationExternalId: 'profile-no-watermark',
   conversationTitle: 'No watermark', senderName: 'Member', body: 'must remain unread',
@@ -1688,7 +1340,6 @@ assert.equal((await conflictingImmediate.json()).error, 'message_external_id_con
 assert.equal(database.prepare(`
   SELECT COUNT(*) AS total FROM conversations WHERE connector_id = ? AND external_id = 'conversation-event-conflict'
 `).get(connectorId).total, 0);
-
 await putProfile('profile-observed-order', {
   displayName: 'Observed order', conversationType: 'direct', placement: 'normal',
   unreadCount: 0, unreadObservedAt: '2026-08-28T12:00:00.500Z',
@@ -1707,7 +1358,6 @@ await postEvents([
 assert.equal(database.prepare(`
   SELECT unread_count FROM conversations WHERE connector_id = ? AND external_id = 'profile-observed-order'
 `).get(connectorId).unread_count, 1);
-
 await putProfile('profile-observed-reserved', {
   displayName: 'Observed reserved field', conversationType: 'direct', placement: 'normal',
   unreadCount: 0, unreadObservedAt: '2026-08-28T12:00:00.500Z',
@@ -1730,7 +1380,6 @@ assert.deepEqual(database.prepare(`
   WHERE connector_id = ? AND external_id IN ('message-observed-injected-future', 'message-observed-injected-past')
   ORDER BY external_id
 `).all(connectorId).map((row) => row.observed_at), [null, null]);
-
 const observedEventAt = new Date(Date.parse(stamp) + 500).toISOString();
 await postEvents([{
   externalId: 'message-observed-unread', conversationExternalId: 'profile-only-live',
@@ -1754,11 +1403,9 @@ assert.equal(database.prepare(`
   SELECT COUNT(*) AS total FROM agent_queue q JOIN messages m ON m.id = q.message_id
   WHERE m.connector_id = ? AND m.external_id = 'message-observed-unread'
 `).get(connectorId).total, 1);
-
 await testLateInboundImageReplay({
   database, connectorId, stamp, createHash, postEvents, putInboundFile, r2Objects,
 });
-
 database.prepare(`
   INSERT INTO messages (
     id, conversation_id, connector_id, direction, sender_name, body,
@@ -1881,7 +1528,6 @@ assert.equal((await uncertainCompletion.json()).state, 'manual_review');
 assert.equal(database.prepare("SELECT state FROM commands WHERE id = 'command-lease-test'").get().state, 'manual_review');
 assert.equal(database.prepare("SELECT delivery_state FROM messages WHERE id = 'message-command-test'").get().delivery_state, 'uncertain');
 assert.equal(database.prepare("SELECT state FROM attachments WHERE id = 'attachment-command-test'").get().state, 'uncertain');
-
 const promoted = await postEvents([{
   externalId: 'message-promotion', conversationExternalId: 'conversation-promotion',
   conversationTitle: 'Promotion', senderId: 'member-test', senderName: 'Member',
@@ -1896,7 +1542,6 @@ database.prepare('UPDATE connector_instances SET state = ?, last_seen_at = ?, up
 assert.deepEqual({ ...database.prepare(`
   SELECT state, last_seen_at, updated_at FROM connector_instances WHERE id = ?
 `).get(connectorId) }, { state: 'offline', last_seen_at: authoritativeLastSeen, updated_at: authoritativeUpdatedAt });
-
 const later = new Date(Date.parse(stamp) + 2_000).toISOString();
 const earlier = new Date(Date.parse(stamp) + 1_000).toISOString();
 await postEvents([
@@ -1910,7 +1555,6 @@ const summary = database.prepare(`
 `).get();
 assert.equal(summary.last_message_preview, 'latest body');
 assert.equal(summary.last_message_at, later);
-
 await postEvents([
   { externalId: 'message-offset-later', conversationExternalId: 'conversation-offset-order',
     conversationTitle: 'Offset order', senderName: 'Member', body: 'actual later',
@@ -1925,7 +1569,6 @@ assert.deepEqual({ ...database.prepare(`
 `).get(connectorId) }, {
   last_message_preview: 'actual later', last_message_at: '2026-08-28T17:00:00.000Z',
 });
-
 async function requestBackups(messages) {
   return worker.fetch(new Request('https://message.example.com/api/connectors/group-text-backups', {
     method: 'POST',
@@ -1937,13 +1580,11 @@ async function requestBackups(messages) {
     body: JSON.stringify({ connectorId, messages }),
   }), workerEnv, {});
 }
-
 async function postBackups(messages) {
   const response = await requestBackups(messages);
   assert.equal(response.status, 200);
   return response.json();
 }
-
 const backupMessage = {
   externalId: 'message-backup-only', conversationExternalId: 'conversation-backup-only',
   conversationTitle: 'Backup group', senderId: 'member-backup', senderName: 'Member', body: 'background text',
@@ -1992,7 +1633,6 @@ assert.equal(normalizedBackup.title, backupMessage.conversationTitle);
 assert.equal(normalizedBackup.conversation_external_id, backupMessage.conversationExternalId);
 assert.equal(database.prepare('SELECT COUNT(*) AS total FROM agent_queue WHERE message_id = ?')
   .get(normalizedBackup.id).total, 0);
-
 const groupImageBytes = new Uint8Array([8, 9, 10, 11]);
 const groupImageConversation = 'conversation-group-image';
 const groupImageExternalId = 'message-group-image';
@@ -2029,7 +1669,6 @@ assert.equal(replayedGroupImage.inserted, 0);
 assert.equal(database.prepare(`
   SELECT count(*) AS total FROM attachments WHERE connector_id = ? AND external_id = ?
 `).get(connectorId, groupImageFileExternalId).total, 1);
-
 const attachmentBodyOriginal = '原文\n后文';
 const attachmentBodyWithLineSpace = '原文 \n后文';
 const attachmentBodyOccurredAt = new Date(stamp).toISOString();
@@ -2064,7 +1703,6 @@ function seedAttachmentBodyReplay(suffix, options = {}) {
     attachmentBodyOccurredAt.replace('Z', '+00:00'), stamp);
   return { conversationExternalId, externalId, messageId, senderId, senderName };
 }
-
 async function requestAttachmentBodyReplay(suffix, options = {}) {
   const seeded = seedAttachmentBodyReplay(suffix, options);
   const requestConversationExternalId = options.conversationExternalId || seeded.conversationExternalId;
@@ -2094,7 +1732,6 @@ async function requestAttachmentBodyReplay(suffix, options = {}) {
   };
   return { seeded, fileExternalId, item, response: await requestBackups([item]) };
 }
-
 const validAttachmentBodyReplay = await requestAttachmentBodyReplay('valid');
 assert.equal(validAttachmentBodyReplay.response.status, 200);
 const validAttachmentBodyResult = await validAttachmentBodyReplay.response.json();
@@ -2117,7 +1754,6 @@ assert.deepEqual({ ...database.prepare(`
 const repeatedAttachmentBodyReplay = await requestBackups([validAttachmentBodyReplay.item]);
 assert.equal(repeatedAttachmentBodyReplay.status, 200,
   'an exact replay of the already-linked attachment must remain idempotent');
-
 for (const [suffix, body] of [
   ['word-space', '原 文\n后文'],
   ['non-ascii-space', '原文\u00a0\n后文'],
@@ -2156,7 +1792,6 @@ assert.equal((await rejectedWithoutAttachment.response.json()).error, 'message_e
 const rejectedSelfMessage = await requestAttachmentBodyReplay('self', { isSelf: true });
 assert.equal(rejectedSelfMessage.response.status, 400);
 assert.equal((await rejectedSelfMessage.response.json()).error, 'self_message_requires_event_ingest');
-
 const unavailableGroupImage = await requestBackups([{
   ...groupImageMessage,
   externalId: 'message-image-not-uploaded',
@@ -2170,9 +1805,6 @@ assert.equal(database.prepare(`
 assert.deepEqual({ ...database.prepare(`
   SELECT state, last_seen_at, updated_at FROM connector_instances WHERE id = ?
 `).get(connectorId) }, { state: 'offline', last_seen_at: authoritativeLastSeen, updated_at: authoritativeUpdatedAt });
-
-await testQuoteReplay({ database, d1, connectorId, stamp, requestEvents, requestBackups, putInboundFile });
-
 const inferredProfileResponse = await putProfile(backupMessage.conversationExternalId, { displayName: 'Backup group profile' });
 assert.equal(inferredProfileResponse.status, 201);
 assert.deepEqual({ ...database.prepare(`
@@ -2181,7 +1813,6 @@ assert.deepEqual({ ...database.prepare(`
 `).get(connectorId, backupMessage.conversationExternalId) }, {
   channel_label: 'Test IM', conversation_type: 'group', placement: 'folded',
 });
-
 const expiredAt = '2000-01-01T00:00:00.000Z';
 const canonicalAt = '2026-01-01T00:00:00.000Z';
 database.prepare(`
@@ -2203,7 +1834,6 @@ database.prepare(`
   ) VALUES ('message-expired-orphan-row', 'legacy-runtime-uuid', ?, 'message-expired-orphan',
     'inbound', 'Member', 'expired', 'background', ?, ?)
 `).run(connectorId, expiredAt, expiredAt);
-
 database.prepare(`
   INSERT INTO conversations (
     id, connector_id, external_id, title, unread_count, last_message_preview, last_message_at, created_at, updated_at
@@ -2230,7 +1860,6 @@ database.prepare(`
   ) VALUES ('message-native-expired-row', 'conversation-native-retention', ?, 'message-native-expired',
     'inbound', 'Member', 'expired', 'background', ?, ?)
 `).run(connectorId, expiredAt, expiredAt);
-
 database.prepare(`
   INSERT INTO conversations (
     id, connector_id, external_id, title, unread_count, last_message_preview, last_message_at, created_at, updated_at
@@ -2258,7 +1887,6 @@ database.prepare(`
   ) VALUES ('message-canonical-expired-row', 'conversation-canonical-retention', ?, 'message-canonical-expired',
     'inbound', 'Member', 'expired newest', 'background', ?, ?)
 `).run(connectorId, expiredAt, expiredAt);
-
 database.prepare(`
   INSERT INTO conversations (
     id, connector_id, external_id, title, unread_count, created_at, updated_at
@@ -2288,7 +1916,6 @@ database.prepare(`
     'message-migration-observed-after', 'inbound', 'Member', 'after', 'immediate',
     '{}', '2026-08-28T12:00:00.600Z', ?)
 `).run(connectorId, stamp);
-
 database.exec(readFileSync(new URL('../cloudflare-worker/migrations/0006_reconcile_backup_retention.sql', import.meta.url), 'utf8'));
 assert.equal(database.prepare("SELECT count(*) AS total FROM conversations WHERE id = 'legacy-runtime-uuid'").get().total, 0);
 assert.deepEqual({ ...database.prepare(`
@@ -2399,7 +2026,6 @@ assert.deepEqual({ ...database.prepare(`
   SELECT state, message_id IS NOT NULL AS linked FROM attachments
   WHERE connector_id = ? AND external_id = 'external-unbound-expired'
 `).get(connectorId) }, { state: 'received', linked: 1 });
-
 paginatedInboundSweep = true;
 const firstCursorSweep = [];
 await worker.scheduled({}, workerEnv, { waitUntil(promise) { firstCursorSweep.push(promise); } });
@@ -2416,7 +2042,6 @@ assert.equal(deletedR2Keys.includes('inbound/virtual-page-20'), true);
 assert.equal(database.prepare(`
   SELECT COUNT(*) AS total FROM maintenance_state WHERE key = 'r2-sweep:inbound/'
 `).get().total, 0);
-
 database.prepare("UPDATE connector_instances SET kind = 'qq' WHERE id = ?").run(connectorId);
 const graytipBody = '一位新成员加入了群聊';
 const graytipMessage = {
@@ -2437,7 +2062,6 @@ assert.equal(database.prepare(`
   SELECT COUNT(*) AS total FROM agent_queue q JOIN messages m ON m.id = q.message_id
   WHERE m.connector_id = ? AND m.external_id = 'qq-graytip-new'
 `).get(connectorId).total, 0, 'system lines are visible to users but never queued as agent prompts');
-
 for (const invalid of [
   { ...graytipMessage, externalId: 'qq-graytip-self', isSelf: true },
   { ...graytipMessage, externalId: 'qq-graytip-no-direction', isSelf: undefined },
@@ -2453,14 +2077,12 @@ for (const invalid of [
   assert.equal(database.prepare('SELECT COUNT(*) AS total FROM messages WHERE connector_id = ? AND external_id = ?')
     .get(connectorId, invalid.externalId).total, 0);
 }
-
 database.prepare("UPDATE connector_instances SET kind = 'im' WHERE id = ?").run(connectorId);
 const nonQqSystemResponse = await requestEvents([{ ...graytipMessage, externalId: 'non-qq-system' }]);
 assert.equal(nonQqSystemResponse.status, 400, 'the marker is accepted only from the QQ connector kind');
 assert.equal(database.prepare('SELECT COUNT(*) AS total FROM messages WHERE connector_id = ? AND external_id = ?')
   .get(connectorId, 'non-qq-system').total, 0);
 database.prepare("UPDATE connector_instances SET kind = 'qq' WHERE id = ?").run(connectorId);
-
 await postEvents([{
   externalId: 'qq-graytip-metadata-only', conversationExternalId: 'qq-graytip-metadata-only-conversation',
   conversationTitle: '普通文本', senderName: '群成员', body: '[类型:8]', contentType: 'text',
@@ -2471,7 +2093,6 @@ assert.equal(database.prepare(`
   SELECT json_extract(metadata_json, '$.presentation') AS presentation FROM messages
   WHERE connector_id = ? AND external_id = 'qq-graytip-metadata-only'
 `).get(connectorId).presentation, null, 'body and caller metadata cannot fabricate presentation');
-
 database.prepare(`
   INSERT INTO conversations (
     id, connector_id, external_id, title, avatar_label, trust_tier, agent_policy_json,
@@ -2552,7 +2173,6 @@ const graytipClaim = await callAgentTool('claim_message', {
 assert.equal(graytipClaim.acquired, false, 'the explicit claim path also rejects upgraded system rows');
 assert.equal(database.prepare('SELECT state FROM agent_queue WHERE message_id = ?')
   .get('graytip-legacy-row').state, 'leased', 'system exclusions do not consume the old queue lease');
-
 database.prepare(`
   INSERT INTO messages (
     id, conversation_id, connector_id, external_id, direction, sender_id, sender_name, body,
@@ -2594,7 +2214,6 @@ assert.equal(database.prepare(`
 assert.equal(database.prepare(`
   SELECT state FROM agent_queue WHERE message_id = 'graytip-reply-race-row'
 `).get().state, 'leased');
-
 database.prepare(`
   INSERT INTO conversations (
     id, connector_id, external_id, title, avatar_label, trust_tier, agent_policy_json,
@@ -2620,7 +2239,6 @@ assert.deepEqual({ ...database.prepare(`
   conversation_id: 'graytip-wrong-target-conversation', sender_id: 'sender-kept',
   sender_name: 'Sender kept', body: '[类型:8]',
 });
-
 database.prepare(`
   INSERT INTO conversations (
     id, connector_id, external_id, title, avatar_label, trust_tier, agent_policy_json,
@@ -2650,7 +2268,6 @@ const attachedPlaceholderConflict = await requestEvents([{
 assert.equal(attachedPlaceholderConflict.status, 400);
 assert.equal((await attachedPlaceholderConflict.json()).error, 'message_external_id_conflict');
 assert.equal(database.prepare('SELECT body FROM messages WHERE id = ?').get('graytip-attached-row').body, '[类型:8]');
-
 database.prepare(`
   INSERT INTO conversations (
     id, connector_id, external_id, title, avatar_label, trust_tier, agent_policy_json,
@@ -2683,7 +2300,6 @@ assert.deepEqual({ ...database.prepare(`
 `).get() }, {
   body: '[类型:8]', metadata_json: JSON.stringify({ attachments: [{ externalId: 'racing-file' }] }),
 });
-
 database.prepare(`
   INSERT INTO conversations (
     id, connector_id, external_id, title, avatar_label, trust_tier, agent_policy_json,
@@ -2705,7 +2321,6 @@ const legitimateConflict = await requestEvents([{
 assert.equal(legitimateConflict.status, 400);
 assert.equal((await legitimateConflict.json()).error, 'message_external_id_conflict');
 assert.equal(database.prepare('SELECT body FROM messages WHERE id = ?').get('graytip-legit-row').body, 'real text');
-
 const graytipInboxResponse = await worker.fetch(new Request(
   `https://message.example.com/api/inbox?conversationId=${encodeURIComponent(
     database.prepare("SELECT id FROM conversations WHERE external_id = 'qq-graytip-new-conversation'").get().id,
@@ -2729,7 +2344,6 @@ const metadataOnlyInbox = await metadataOnlyInboxResponse.json();
 const metadataOnlyMessage = metadataOnlyInbox.messages.find((message) => message.body === '[类型:8]');
 assert.ok(metadataOnlyMessage);
 assert.equal(metadataOnlyMessage.presentation, undefined, 'the API does not infer system presentation from body or supplied metadata');
-
 database.prepare(`
   INSERT INTO messages (
     id, conversation_id, connector_id, external_id, direction, sender_id, sender_name, body,
@@ -2750,9 +2364,7 @@ for (const id of ['graytip-blank-marked-row', 'graytip-nontext-marked-row']) {
   assert.equal(constrainedInbox.messages.find((message) => message.id === id).presentation, undefined,
     'malformed legacy system metadata must not create a presentation marker');
 }
-
 database.prepare("UPDATE connector_instances SET kind = 'im' WHERE id = ?").run(connectorId);
 database.close();
 console.log('schema multi-instance tests passed');
-
 auth.restore();

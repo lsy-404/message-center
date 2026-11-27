@@ -437,7 +437,6 @@ export class DeviceSessionAdapter implements BridgeAdapter {
   private readonly discoveryCoveredConversations = new Set<string>();
   private readonly profileHealth = new Map<string, { state: "online" | "offline"; observedAt: string }>();
   private readonly cliExecutor = new SerialExecutor();
-  private readonly layoutControlExecutor = new SerialExecutor();
   private readonly discoveryCliModes = new Map<string, "modern" | "message-20" | "legacy">();
   private lastIdempotencyPruneAt = 0;
 
@@ -472,28 +471,6 @@ export class DeviceSessionAdapter implements BridgeAdapter {
 
   connectorHealth(): Record<string, { state: "online" | "offline"; observedAt: string }> {
     return Object.fromEntries(this.profileHealth.entries());
-  }
-
-  async controlDeviceLayout(
-    action: "status" | "enable" | "disable" | "recover",
-    command?: { reason?: string; serverRevision?: number; actionId?: string }
-  ): Promise<Record<string, unknown>> {
-    return this.layoutControlExecutor.run(async () => {
-      const argumentsList = [this.config.device.layoutControl.cliPath, action];
-      if (action !== "status" && command?.reason) argumentsList.push("--reason", command.reason);
-      if (action !== "status" && command?.serverRevision !== undefined) {
-        argumentsList.push("--server-revision", String(command.serverRevision));
-      }
-      if (action !== "status" && command?.actionId) argumentsList.push("--action-id", command.actionId);
-      const { stdout } = await execFileAsync(this.config.device.pythonPath, argumentsList, {
-        cwd: this.config.runtimeDir,
-        env: process.env,
-        timeout: 60_000,
-        maxBuffer: 512 * 1024,
-        windowsHide: true
-      });
-      return parseLastJson(stdout);
-    });
   }
 
   async sendReply(message: IncomingBridgeMessage, text: string, idempotencyKey: string): Promise<string> {

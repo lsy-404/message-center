@@ -5,12 +5,12 @@
 ## 目录
 
 - `cloudflare-worker/`：生产 Worker、D1 schema、R2 附件接口、登录 UI、连接器协议和远程 MCP。
-- `bridge/device-runtime/`：Python 3.9 设备端 HTTPS 运行器，串行调度连接实例，并持久化队列、游标和发送结果。
+- `bridge/device-runtime/`：Python 3.9 设备端 HTTPS 运行器，串行调度连接实例，并持久化队列、游标和发送结果；自带读取 wechat-selkies 容器中官方微信/QQ Linux 客户端的设备适配器。
 - `bridge/`：通用策略、MCP、连接器进程边界与其他主机渠道的 relay。
 
-设备端运行器不要求个人电脑常驻、USB 或同一局域网。它需要设备本机已可用的私有采集适配器；配置和部署方式见 [设备端运行器](./bridge/device-runtime/README.md)。当前运行器支持文本事件，附件传输仍由现有桥接实现提供。云端 UI 使用 `@platform-kit/fluent`。
+设备端运行器在能访问 wechat-selkies 容器的 macOS 或 Linux 主机上运行，只读取客户端会话列表中的最新消息预览，不打开会话、不标记已读，也不发送消息（连接器须设为 `receiveOnly`）。配置和部署方式见 [设备端运行器](./bridge/device-runtime/README.md)。当前运行器支持文本事件，附件传输仍由现有桥接实现提供。云端 UI 使用 `@platform-kit/fluent`。
 
-实际客户端适配器、登录态、私钥、真实配置、运行记录和下载内容不进入仓库。核心与适配器通过 [连接器契约](./bridge/docs/device-adapter-contract.md) 解耦。
+登录态、私钥、真实配置、运行记录和下载内容不进入仓库。核心与适配器通过 [连接器契约](./bridge/docs/device-adapter-contract.md) 解耦。
 
 ## 消息触发模型
 
@@ -51,4 +51,4 @@ Set-Location ..
 python -m unittest discover -s test -v
 ```
 
-生产部署和密钥管理分别见 `cloudflare-worker/README.md` 与 `bridge/README.md`。公开仓库不包含运行时适配器，并且不应提交任何凭据或设备数据。
+生产部署和密钥管理分别见 `cloudflare-worker/README.md` 与 `bridge/README.md`。仓库内的设备适配器不含任何凭据或设备数据，也不应提交这类内容。

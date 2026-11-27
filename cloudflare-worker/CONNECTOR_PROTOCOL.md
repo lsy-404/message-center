@@ -24,9 +24,12 @@
   "displayName": "设备 relay · 主账号",
   "note": "负责工程群；仅在无人值守策略允许时自动处理",
   "mode": "device_relay",
-  "capabilities": ["receive_text", "send_text", "receive_files", "send_files", "layout_control"]
+  "capabilities": ["receive_text", "send_text", "receive_files", "send_files"],
+  "nativeUrl": "https://desktop.example.com/"
 }
 ```
+
+`nativeUrl` 可选：该实例原生客户端的浏览器远程桌面地址，必须是绝对 `http:` / `https:` URL，不含用户名密码，最长 500 字符；缺省或 `null` 表示清除。网页据此为该实例提供“原生模式”，并把这些地址的 origin 加入页面 CSP 的 `frame-src`（远程桌面需允许本站 origin 嵌入）。
 
 同一个 `kind` 可以注册任意数量的实例。仅接收短信可声明：
 
@@ -110,45 +113,6 @@ relay 每 5 分钟把未触发即时事件的普通群聊纯文本批量提交�
 relay 必须按 `idempotencyKey` 去重。暂时故障回执 `retry: true`，确定失败使用 `ok: false`。
 
 网页/MCP 排队使用稳定 `clientRequestId`，并发重试仍只产生一个命令。设备执行账本提供保守的物理发送至多一次语义：原生调用结果不确定时进入人工检查，不自动重发。
-
-## 设备布局控制
-
-布局自动恢复不属于消息命令队列。只有同时满足 `mode: "device_relay"` 且显式声明
-`layout_control` capability 的实例才是布局控制 owner；其他实例即使属于同一设备也不能读取、确认或修改布局状态。
-每台物理设备只能指定一个 owner，设备上的其他账号只声明各自的消息能力。Worker 不硬编码实例 ID 或渠道，owner 由注册能力决定。
-
-布局 owner 的期望状态：
-
-- `GET /api/connectors/layout-control?connectorId=<id>`：connector 轮询 `layoutControl.enabled`、单调递增的 `revision`、最近设备确认，以及最后一次本地动作不可变的 `deviceActionRevision` / `deviceActionEnabled`。请求头仍必须同时携带实例 bearer 与相同的 `x-connector-id`。
-- `POST /api/connectors/layout-control/ack`：普通设备确认 JSON 为 `{ "connectorId": "...", "revision": 3, "enabled": true, "reason": "applied" }`。仅当 `revision` 恰好等于当前期望 revision 且 `enabled` 恰好等于当前期望状态时才接受；同 revision、同状态的重试幂等返回，不更新时间或反向覆盖，其他旧、未来或反向确认返回 `409`。
-- `PUT /api/connectors/<id>/layout-control`：管理员网页更新期望状态。JSON 为 `{ "enabled": true, "expectedRevision": 3 }`；这是 compare-and-set，revision 已变化时返回 `409 layout_revision_conflict`，避免旧网页覆盖较新的设备或管理员操作。
-
-每个新的设备本地动作必须先把停止锁/启动状态、严格递增的 `deviceGeneration` 和新的稳定 `actionId`
-原子持久化，再联网回执。长按 Home 停止示例：
-
-```json
-{
-  "connectorId": "instance-device-primary",
-  "enabled": false,
-  "localStop": true,
-  "deviceGeneration": 41,
-  "actionId": "layout-action-018f6d91",
-  "reason": "local_home_stop"
-}
-```
-
-桌面图标启动使用对称的 `enabled: true`、`localStart: true`。本地动作不携带也不依赖云端
-`expectedRevision`：Worker 只接受严格大于已记录 generation 的新动作，接受时原子把 desired/reported
-设为本地状态并令 revision 加一，同时把这次结果的 revision/enabled 固化为
-`deviceActionRevision` / `deviceActionEnabled`。相同 `deviceGeneration + actionId` 的网络重试幂等返回且不增加 revision；
-更旧 generation、相同 generation 携带不同 actionId，或原 pair 携带不同 enabled/action 类型，均返回 `409` 且绝不改变状态。因此丢失响应时必须逐字段重发原动作，
-不能基于服务端冲突临时生成新 generation。relay 还必须按 revision 丢弃延迟轮询结果；新本地物理动作、管理员 CAS 和普通确认
-由这两个独立的单调水位共同防止旧状态倒灌。
-
-幂等重试响应中的 `layoutControl.revision/enabled` 是当前云端期望，可能已被后续管理员操作推进；relay 不得用它改写
-先前本地动作的停止/启动水位。它必须只使用同一响应里的 `deviceActionRevision/deviceActionEnabled` 确认原动作。
-例如 Stop 在 revision 2 被接受、响应丢失，管理员随后启用 revision 3；重试原 Stop 时响应仍报告
-`deviceActionRevision: 2, deviceActionEnabled: false`，不能把停止锁错误抬到 revision 3。
 
 入站事件按 `connectorId + externalId` 去重。相同正文的重复事件可以补充先前缺少的附件；Worker 仅接受已上传且会话、文件名、MIME、大小与 SHA-256 均匹配的对象，并保留已有附件。附件 ID 已关联到其他消息时不能重绑。相同 ID 的正文或既有附件元数据冲突会拒绝请求。解析器升级后，Worker 仍允许把同一消息的旧 `[file:asset]` 占位正文原地升级为 `[转账]`、`[拍一拍]` 或 `[卡片]`；消息 ID、时间、队列类别和 Agent 租约状态保持不变。
 

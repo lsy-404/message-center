@@ -540,6 +540,10 @@ button { color: inherit; }
 }
 
 .thread-header { gap: 12px; padding: 10px 20px; }
+.content-pane.is-native { grid-template-rows: auto minmax(0, 1fr); }
+.native-frame { display: block; width: 100%; height: 100%; min-height: 0; border: 0; background: var(--layer-default); }
+.native-open-link { flex: 0 0 auto; color: var(--accent-base); font-size: 13px; white-space: nowrap; text-decoration: none; }
+.native-open-link:hover { text-decoration: underline; }
 .thread-avatar { width: 40px; height: 40px; font-size: 14px; }
 .thread-title { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 4px; }
 .thread-header h2 { margin: 0; overflow: hidden; font-size: 16px; font-weight: 600; line-height: 1.25; text-overflow: ellipsis; white-space: nowrap; }
@@ -927,14 +931,9 @@ button { color: inherit; }
 .capability-group-label { min-width: 28px; color: var(--text-tertiary); font-size: 12px; }
 .capability-chip { padding: 1px 7px; border: 1px solid var(--ctrl-border); border-radius: 10px; color: var(--text-secondary); background: var(--ctrl-fill-secondary); font-size: 12px; line-height: 18px; }
 .capability-group.is-send .capability-chip { border-color: var(--bubble-owner-border); color: var(--accent-soft-text); background: var(--accent-soft); }
-.instance-control { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 16px; border-top: 1px solid var(--stroke-divider); }
-.instance-control-copy { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
-.instance-control-copy strong { color: var(--text-primary); font-size: 13px; font-weight: 600; }
-.instance-control-copy span { color: var(--text-tertiary); font-size: 12px; }
-.instance-actions { display: flex; justify-content: flex-end; margin-top: auto; padding: 8px 10px 10px; border-top: 1px solid var(--stroke-divider); }
+.instance-actions { display: flex; justify-content: flex-end; gap: 4px; margin-top: auto; padding: 8px 10px 10px; border-top: 1px solid var(--stroke-divider); }
 .instance-open-button.fluent-button { display: inline-flex; align-items: center; gap: 6px; padding: 0 10px; color: var(--accent-base); font-size: 13px; }
 .instance-open-button.fluent-button:hover:not(:disabled) { background: var(--row-hover); }
-.toggle-switch { flex: 0 0 auto; }
 
 .toast { position: fixed; z-index: 20; right: 18px; bottom: 18px; max-width: min(380px, calc(100vw - 36px)); padding: 10px 14px; border: 1px solid var(--stroke-surface-flyout); border-radius: 8px; color: var(--text-primary); background: var(--flyout-bg); box-shadow: 0 8px 24px rgba(0, 0, 0, .2); font-size: 13px; }
 .toast-enter-active, .toast-leave-active { transition: opacity .16s ease, transform .16s ease; }

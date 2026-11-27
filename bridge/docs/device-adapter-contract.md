@@ -1,8 +1,19 @@
-# Current-session device adapter contract
+# Device adapter contract
 
-设备会话接入必须实现 `BridgeAdapter`，并与 MCP、策略和 Agent 执行器保持进程边界。
+设备适配器是被设备端运行器直接启动的独立进程，与 MCP、策略和 Agent 执行器保持进程边界。仓库内的 `bridge/device-runtime/selkies_adapter.py` 是该契约的参考实现：读取 wechat-selkies 容器中官方微信/QQ Linux 客户端的会话列表，只收不发。适配器本身不含凭据或设备数据；连接信息写在适配器旁受 `0600` 保护的本地配置中，不进入仓库。
 
-## 入站要求
+## 进程契约
+
+- 运行器每次调用只传一个 UTF-8 JSON 请求（stdin），适配器必须只输出一个 UTF-8 JSON 对象（stdout），诊断写 stderr，调用受超时约束。
+- `scan` 返回 `sourceReadStatus` 为 `complete` 或 `failed`：`complete` 须带 `ok: true`、`health`、`cursor`、`messages`，可附 `conversationProfiles`、`active`、`more`；`failed` 须带 `ok: false`，运行器据此标记数据源失败并退避，不提交任何进度。
+- `send` 不支持时返回 `{"ok":false,"dispatched":false,"error":"send_unsupported"}`，对应连接器必须配置 `receiveOnly`。
+- 完整字段、限额和附件暂存规则见 [设备端运行器](../device-runtime/README.md)。
+
+## 桥接适配器要求
+
+经桥接核心接入的会话还须实现 `BridgeAdapter`，并满足以下入站与出站要求。
+
+### 入站要求
 
 适配器向核心提交规范化 `IncomingBridgeMessage`：
 
@@ -13,7 +24,7 @@
 
 如果只能取得群名、昵称或 OCR 文本，`assurance` 必须是 `display_only`。核心会阻止此类事件获得项目访问权。
 
-## 出站要求
+### 出站要求
 
 `sendReply(message, text, idempotencyKey)`：
 

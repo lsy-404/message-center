@@ -22,12 +22,6 @@
     "pollIntervalMs": 3000,
     "messageLimit": 100,
     "ingestHistory": false,
-    "layoutControl": {
-      "enabled": false,
-      "cliPath": "./local-adapters/layout_control.py",
-      "pollIntervalMs": 60000,
-      "administratorOverrideLocalLock": true
-    },
     "profiles": [
       {
         "id": "profile-a",

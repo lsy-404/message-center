@@ -3,29 +3,22 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>local.message-center.device-runtime</string>
+  <string>com.example.message-center.device-runtime</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/var/jb/usr/local/libexec/message-center/native-runtime-launcher</string>
-    <string>/var/jb/usr/bin/python3</string>
-    <string>/var/mobile/Library/MessageCenter/device_runtime.py</string>
-    <string>/var/mobile/Library/MessageCenter/private-config.json</string>
+    <string>/usr/bin/python3</string>
+    <string>/path/to/message-center/bridge/device-runtime/device_runtime.py</string>
+    <string>/path/to/private/runtime-config.json</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>/var/mobile/Library/MessageCenter</string>
+  <string>/path/to/message-center/bridge/device-runtime</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
-  <key>ThrottleInterval</key>
-  <integer>30</integer>
-  <key>Nice</key>
-  <integer>10</integer>
-  <key>ProcessType</key>
-  <string>Interactive</string>
   <key>StandardOutPath</key>
-  <string>/var/mobile/Library/MessageCenter/runtime.log</string>
+  <string>/path/to/private/logs/device-runtime.out.log</string>
   <key>StandardErrorPath</key>
-  <string>/var/mobile/Library/MessageCenter/runtime-error.log</string>
+  <string>/path/to/private/logs/device-runtime.err.log</string>
 </dict>
 </plist>

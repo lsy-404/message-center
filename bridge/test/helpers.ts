@@ -34,12 +34,6 @@ export function testConfig(root: string, overrides: Partial<AppConfig> = {}): Ap
       pollIntervalMs: 3000,
       messageLimit: 100,
       ingestHistory: false,
-      layoutControl: {
-        enabled: false,
-        cliPath: join(root, "local-adapters", "layout_control.py"),
-        pollIntervalMs: 60_000,
-        administratorOverrideLocalLock: true
-      },
       profiles: []
     },
     defaultUntrustedReplyPolicy: "informational",

@@ -515,12 +515,6 @@ test("forces revision replay mentions onto the background text path", () => {
       pollIntervalMs: 3000,
       messageLimit: 100,
       ingestHistory: false,
-      layoutControl: {
-        enabled: false,
-        cliPath: join(root, "local-adapters", "layout_control.py"),
-        pollIntervalMs: 60_000,
-        administratorOverrideLocalLock: true
-      },
       profiles: [profile]
     }
   } satisfies AppConfig;
@@ -603,12 +597,6 @@ test("uses discovery profiles without one CLI attach per conversation", async ()
       pollIntervalMs: 3000,
       messageLimit: 100,
       ingestHistory: false,
-      layoutControl: {
-        enabled: false,
-        cliPath: join(root, "local-adapters", "layout_control.py"),
-        pollIntervalMs: 60_000,
-        administratorOverrideLocalLock: true
-      },
       profiles: [profile]
     }
   } satisfies AppConfig;
@@ -836,12 +824,6 @@ test("configured conversations consume discovery history and commit only after e
       pollIntervalMs: 3000,
       messageLimit: 100,
       ingestHistory: false,
-      layoutControl: {
-        enabled: false,
-        cliPath: join(root, "local-adapters", "layout_control.py"),
-        pollIntervalMs: 60_000,
-        administratorOverrideLocalLock: true
-      },
       profiles: [profile]
     }
   } satisfies AppConfig;

@@ -2,18 +2,10 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import {
-  assignLayoutControlOwner,
   parseConnectorInstances,
   parseConnectorTokens,
   uniqueConnectorInstances,
 } from '../src/unified-connectors.js';
-
-function deviceConnector(id: string, mode: 'device_relay' | 'cloud_relay' = 'device_relay') {
-  return {
-    id, kind: 'im', channelLabel: 'generic', accountLabel: id, displayName: id,
-    note: '', mode, capabilities: ['receive_text'] as Array<'receive_text' | 'layout_control'>,
-  };
-}
 
 test('parses multiple instances of one channel with independent capabilities', () => {
   const values = parseConnectorInstances(JSON.stringify({
@@ -45,31 +37,6 @@ test('requires every account profile to have an independent connector id', () =>
   assert.throws(
     () => parseConnectorInstances(JSON.stringify({ one: descriptor, two: descriptor }), undefined),
     /duplicate_connector_id/,
-  );
-});
-
-test('declares layout control only on the explicit device relay owner', () => {
-  const ownerId = 'instance-device-primary';
-  const connectors = assignLayoutControlOwner([
-    deviceConnector(ownerId),
-    deviceConnector('instance-device-secondary'),
-  ], ownerId);
-  assert.deepEqual(connectors.find((item) => item.id === ownerId)?.capabilities,
-    ['receive_text', 'layout_control']);
-  assert.deepEqual(connectors.find((item) => item.id !== ownerId)?.capabilities, ['receive_text']);
-});
-
-test('rejects ambiguous or non-device layout control ownership', () => {
-  const ownerId = 'instance-device-primary';
-  assert.throws(
-    () => assignLayoutControlOwner([deviceConnector(ownerId, 'cloud_relay')], ownerId),
-    /layout_control_owner_requires_device_relay/,
-  );
-  assert.throws(
-    () => assignLayoutControlOwner([{
-      ...deviceConnector('instance-device-secondary'), capabilities: ['receive_text', 'layout_control'],
-    }], undefined),
-    /layout_control_owner_required/,
   );
 });
 

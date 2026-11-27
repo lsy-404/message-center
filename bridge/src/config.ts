@@ -82,18 +82,6 @@ const ConfigSchema = z.object({
     pollIntervalMs: z.number().int().min(500).max(60_000).default(3000),
     messageLimit: z.number().int().min(1).max(100).default(100),
     ingestHistory: z.boolean().default(false),
-    layoutControl: z.object({
-      enabled: z.boolean().default(false),
-      ownerConnectorId: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._:-]{7,199}$/).optional(),
-      cliPath: z.string().min(1).default("./local-adapters/layout_control.py"),
-      pollIntervalMs: z.number().int().min(15_000).max(10 * 60_000).default(60_000),
-      administratorOverrideLocalLock: z.boolean().default(true)
-    }).default({
-      enabled: false,
-      cliPath: "./local-adapters/layout_control.py",
-      pollIntervalMs: 60_000,
-      administratorOverrideLocalLock: true
-    }),
     profiles: z.array(DeviceProfileSchema).default([])
   }).default({
     pythonPath: "python",
@@ -101,12 +89,6 @@ const ConfigSchema = z.object({
     pollIntervalMs: 3000,
     messageLimit: 100,
     ingestHistory: false,
-    layoutControl: {
-      enabled: false,
-      cliPath: "./local-adapters/layout_control.py",
-      pollIntervalMs: 60_000,
-      administratorOverrideLocalLock: true
-    },
     profiles: []
   }),
   defaultUntrustedReplyPolicy: z.enum(["none", "ack", "informational"]).default("informational"),
@@ -134,11 +116,7 @@ export function loadConfig(configPathInput?: string): AppConfig {
       pythonPath: isAbsolute(parsed.device.pythonPath)
         ? parsed.device.pythonPath
         : parsed.device.pythonPath,
-      cliPath: resolve(baseDir, parsed.device.cliPath),
-      layoutControl: {
-        ...parsed.device.layoutControl,
-        cliPath: resolve(baseDir, parsed.device.layoutControl.cliPath)
-      }
+      cliPath: resolve(baseDir, parsed.device.cliPath)
     }
   };
 }

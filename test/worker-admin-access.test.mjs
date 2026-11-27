@@ -15,7 +15,6 @@ const humanRoutes = [
   ['POST', '/api/files'],
   ['DELETE', '/api/files/private-file'],
   ['POST', '/api/messages/send'],
-  ['PUT', '/api/connectors/device/layout-control'],
   ['GET', '/api/conversations/conversation/policy'],
   ['PUT', '/api/conversations/conversation/policy'],
 ];
