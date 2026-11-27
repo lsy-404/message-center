@@ -214,13 +214,7 @@ class Desktop:
             raise AdapterError("desktop_input_failed")
 
     def control(self, window_id, pattern):
-        """The first control in the window's tree whose ``role "name"`` line matches `pattern`, as `look` writes it."""
-        for node in walk(self.tree(window_id)):
-            name = node.get("name")
-            line = "{} \"{}\"".format(node.get("role"), name) if name else str(node.get("role"))
-            if node.get("bounds") and re.match(pattern, line):
-                return node
-        return None
+        return control_in(self.tree(window_id), pattern)
 
     def press(self, control):
         self.click(control["bounds"])
@@ -267,6 +261,16 @@ class Desktop:
         if window and window.get("rect"):
             x, y, w, _ = window["rect"]
             self.point(x + w / 2, y + 12)
+
+
+def control_in(tree, pattern):
+    """The first control in `tree` whose ``role "name"`` line matches `pattern`, as Pelorus `look` writes it."""
+    for node in walk(tree):
+        name = node.get("name")
+        line = "{} \"{}\"".format(node.get("role"), name) if name else str(node.get("role"))
+        if node.get("bounds") and re.match(pattern, line):
+            return node
+    return None
 
 
 def walk(node):
@@ -909,7 +913,8 @@ def open_conversation(desktop, driver, window_id, tree, name, folded):
     else:
         # QQ's search results hold still while the chat list reorders, so chats are always opened from search.
         # The search box is QQ's only entry; it loses its "搜索" name once text has been typed and cleared.
-        search = desktop.control(window_id, r'entry\b')
+        # Activating the maximized window moves nothing, so the tree read before it still places the controls.
+        search = control_in(tree, r'entry\b')
         if not search:
             raise AdapterError("conversation_not_found")
         type_into(desktop, name, search, replace=True)
@@ -1168,7 +1173,7 @@ def send(request, config):
         name = target["name"]
         staged = outgoing_files(entry, attachments, request.get("commandId")) if attachments else []
         window_id, tree = open_client(desktop, driver)
-        desktop.activate(window_id)
+        # open_conversation raises the window when it has to open the chat; an open chat's input is checked after typing.
         tree = open_conversation(desktop, driver, window_id, tree, name, bool(target.get("folder")))
         node, draft = chat_input(driver, tree, name, loose=True)
         if collapse(draft):
@@ -1186,14 +1191,17 @@ def send(request, config):
             save_state(state)
             return {"ok": True, "receipt": "{}:{}:{}".format(conversation, digest(json.dumps(
                 [a["fileName"] for a in attachments], ensure_ascii=False)), now)}
-        tree = desktop.tree(window_id)
+        if staged:
+            tree = desktop.tree(window_id)
         before_text, before_count = last_message(driver, tree)
         type_text(desktop, driver, window_id, tree, name, body)
 
         def typed_in():
-            node, typed = chat_input(driver, desktop.tree(window_id), name, loose=True)
-            return node is not None and collapse(typed) == collapse(body)
-        if not wait_for(typed_in, 2, every=0.1):
+            current = desktop.tree(window_id)
+            node, typed = chat_input(driver, current, name, loose=True)
+            return current if node is not None and collapse(typed) == collapse(body) else None
+        tree = wait_for(typed_in, 2, every=0.1)
+        if not tree:
             clear_input(desktop)
             return refused("input_mismatch")
     except AdapterError as error:
@@ -1202,7 +1210,7 @@ def send(request, config):
         return refused("attachment_staging_failed")
 
     try:
-        send_button = desktop.control(window_id, r'button "发送"') if driver == "qq" else None
+        send_button = control_in(tree, r'button "发送"') if driver == "qq" else None
         if send_button:
             desktop.press(send_button)
         else:

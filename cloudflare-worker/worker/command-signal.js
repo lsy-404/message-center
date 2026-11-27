@@ -1,6 +1,8 @@
-// The socket only says "command"; the device leases commands over HTTP, so a missed signal waits for its next poll.
+// Sockets only carry wake-ups: devices hear "command" and lease it over HTTP; the owner's pages hear "changed" and
+// reload the inbox. A missed signal waits for the next poll either way.
 // Devices ping every 60 seconds, under the edge's 100-second idle limit.
 const SIGNAL_LIVE_MS = 150_000;
+const OWNER_TAG = "owner";
 
 export class CommandSignal {
   constructor(state) {
@@ -11,11 +13,12 @@ export class CommandSignal {
 
   async fetch(request) {
     if (new URL(request.url).pathname === "/live") return Response.json({ connectors: [...this.live()] });
-    const connectorId = request.headers.get("x-connector-id") || "";
+    const owner = new URL(request.url).pathname === "/owner";
+    const tag = owner ? OWNER_TAG : request.headers.get("x-connector-id") || "";
     if (request.method === "POST") {
-      for (const socket of this.state.getWebSockets(connectorId)) {
+      for (const socket of this.state.getWebSockets(tag)) {
         try {
-          socket.send("command");
+          socket.send(owner ? "changed" : "command");
         } catch {
           // A socket closing at this moment reconnects and polls on its own.
         }
@@ -26,7 +29,7 @@ export class CommandSignal {
       return new Response("websocket_required", { status: 426 });
     }
     const [client, server] = Object.values(new WebSocketPair());
-    this.state.acceptWebSocket(server, [connectorId]);
+    this.state.acceptWebSocket(server, [tag]);
     server.serializeAttachment({ acceptedAt: Date.now() });
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -38,7 +41,7 @@ export class CommandSignal {
       const pinged = this.state.getWebSocketAutoResponseTimestamp(socket)?.getTime() || 0;
       const accepted = socket.deserializeAttachment()?.acceptedAt || 0;
       if (Date.now() - Math.max(pinged, accepted) <= SIGNAL_LIVE_MS) {
-        for (const tag of this.state.getTags(socket)) connectors.add(tag);
+        for (const tag of this.state.getTags(socket)) if (tag !== OWNER_TAG) connectors.add(tag);
       }
     }
     return connectors;
@@ -88,5 +91,19 @@ export async function liveSignals(env) {
     console.error(JSON.stringify({ event: "command_signal_live_failed",
       message: error instanceof Error ? error.message : String(error) }));
     return new Set();
+  }
+}
+
+export function openOwnerSignal(request, env) {
+  return signalStub(env).fetch(new Request("https://command-signal/owner", { method: "GET", headers: request.headers }));
+}
+
+export async function signalOwner(env) {
+  if (!env.COMMAND_SIGNAL) return;
+  try {
+    await signalStub(env).fetch("https://command-signal/owner", { method: "POST" });
+  } catch (error) {
+    console.error(JSON.stringify({ event: "owner_signal_failed",
+      message: error instanceof Error ? error.message : String(error) }));
   }
 }

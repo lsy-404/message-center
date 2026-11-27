@@ -1,5 +1,5 @@
 import PostalMime from "postal-mime";
-import { liveSignals, openCommandSignal, signalCommand } from "./command-signal.js";
+import { liveSignals, openCommandSignal, openOwnerSignal, signalCommand, signalOwner } from "./command-signal.js";
 import { evaluateMessageFilter, normalizeFilterSettings, parseFilterSettings } from "./message-filter.js";
 import { normalizeContactName, suggestContactMatches } from "./contacts.js";
 import { handleStickerPackRoute, stickerPackObjectKeys } from "./sticker-packs.js";
@@ -1507,6 +1507,7 @@ async function ingestEvents(request, env, ctx) {
   await reconcileConnectorSummaries(env, connectorId, stamp);
   await audit(env, `connector:${connectorId}`, "messages_ingested", connectorId,
     { received: body.messages.length, inserted, upgraded, promoted, suppressed });
+  if (inserted || upgraded || promoted) await signalOwner(env);
   return json({ ok: true, received: body.messages.length, inserted, upgraded, promoted, suppressed });
 }
 
@@ -1872,6 +1873,7 @@ async function ingestGroupTextBackups(request, env) {
   await reconcileConnectorSummaries(env, connectorId, stamp);
   await audit(env, `connector:${connectorId}`, "group_text_backup_ingested", connectorId,
     { received: body.messages.length, inserted, retentionDays: 30 });
+  if (inserted) await signalOwner(env);
   return json({ ok: true, received: body.messages.length, inserted, normalizedInserted, retentionDays: 30 });
 }
 
@@ -2952,7 +2954,11 @@ async function completeCommand(request, env, commandId) {
       AND lease_expires_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
   `).bind(commandId, connectorId, leaseToken).first();
   if (!command) throw new Error("invalid_command_lease");
-  if (command.kind === "fetch_media") return completeMediaFetch(env, commandId, connectorId, leaseToken, command, body);
+  if (command.kind === "fetch_media") {
+    const response = await completeMediaFetch(env, commandId, connectorId, leaseToken, command, body);
+    await signalOwner(env);
+    return response;
+  }
   const resultValue = body.result && typeof body.result === "object" ? body.result : {};
   let state = body.retry === true ? "pending" : body.uncertain === true ? "manual_review" : body.ok === true ? "completed" : "failed";
   const retryHasPhysicalEvidence = command.connector_kind === "qq" && body.retry === true && (
@@ -2991,6 +2997,7 @@ async function completeCommand(request, env, commandId) {
     throw new Error("invalid_command_lease");
   }
   await audit(env, `connector:${connectorId}`, "command_completed", commandId, { state });
+  await signalOwner(env);
   return json({ ok: true, state });
 }
 
@@ -3789,6 +3796,12 @@ export default {
       if (!identity && (url.pathname === "/" || url.pathname === "/app" || url.pathname === "/index.html") && request.method === "GET") return redirect("/login");
       if (!identity) return fail("access_required", 401, "Administrator sign-in is required at /login.");
       if (["POST", "PUT", "PATCH", "DELETE"].includes(request.method) && !sameOrigin(request)) return fail("cross_origin_denied", 403);
+      if (url.pathname === "/api/live" && request.method === "GET") {
+        if (!sameOrigin(request)) return fail("cross_origin_denied", 403);
+        if ((request.headers.get("upgrade") || "").toLowerCase() !== "websocket") return fail("websocket_required", 426);
+        if (!env.COMMAND_SIGNAL) return fail("signal_unavailable", 503);
+        return await openOwnerSignal(request, env);
+      }
 
       if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/app" || url.pathname === "/index.html")) {
         return await appAssetResponse(request, env, "/index.html");

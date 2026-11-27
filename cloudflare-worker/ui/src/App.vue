@@ -4,6 +4,7 @@ import { FluentButton, FluentField, FluentTheme } from '@platform-kit/fluent/vue
 import AppIcon from './AppIcon.vue'
 import type { IconName } from './icons'
 import { createInboxReadGate, createInboxRefreshLoop } from './inbox-refresh.mjs'
+import { createLiveSignal } from './live-signal.mjs'
 import {
   clearPendingSendRequestKey,
   getPendingSendRequestKey,
@@ -217,6 +218,7 @@ const toast = ref('')
 const inboxReads = createInboxReadGate()
 let inboxTimeout: number | undefined
 let refreshLoop: ReturnType<typeof createInboxRefreshLoop> | undefined
+const liveSignal = createLiveSignal(() => { if (refreshAllowed()) refreshLoop?.wake() })
 let toastTimer: number | undefined
 let clockTimer: number | undefined
 let pendingScrollToBottomId: string | null = null
@@ -1889,6 +1891,7 @@ onMounted(() => {
     }
   }, refreshAllowed)
   refreshLoop.start(true)
+  liveSignal.start()
   clockTimer = window.setInterval(() => { nowTick.value = Date.now() }, 60_000)
   window.addEventListener('pageshow', onPageShow)
   document.addEventListener('pointerdown', onStickerPointer)
@@ -1905,6 +1908,7 @@ onUnmounted(() => {
   document.removeEventListener('keydown', onStickerKeydown)
   document.removeEventListener('keydown', onPackDialogKeydown)
   refreshLoop?.stop()
+  liveSignal.stop()
   cancelInboxRead()
   if (toastTimer) window.clearTimeout(toastTimer)
   if (clockTimer) window.clearInterval(clockTimer)
