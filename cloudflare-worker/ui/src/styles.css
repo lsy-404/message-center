@@ -823,6 +823,8 @@ button { color: inherit; }
 }
 .compose-surface:focus-within { border-color: var(--accent-base); box-shadow: 0 0 0 1px var(--accent-base); }
 .compose-surface.disabled { background: var(--subtle-tertiary); }
+/* The sticker popover rises above the composer, outside the clipped surface. */
+.compose-surface:has(.sticker-popover) { overflow: visible; }
 .compose-surface textarea {
   display: block;
   width: 100%;
