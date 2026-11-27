@@ -1,3 +1,4 @@
+import PostalMime from "postal-mime";
 import { OidcAuthError, beginOidcLogin, completeOidcLogin, oidcIdentity, logoutOidc, cleanupOidcSessions, clearOidcSessionCookie } from "./oidc.js";
 
 const JSON_HEADERS = {
@@ -3071,7 +3072,134 @@ function statusForError(message) {
   return 400;
 }
 
+const EMAIL_CONNECTOR_ID = "email-routing";
+const MAX_EMAIL_RAW_BYTES = 25 * 1024 * 1024;
+const MAX_EMAIL_PARSE_BYTES = 10 * 1024 * 1024;
+const MAX_EMAIL_BODY_CHARS = 20_000;
+
+function emailHtmlToText(html) {
+  const entities = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
+  return String(html || "")
+    .replace(/<(style|script|head)[\s\S]*?<\/\1>/gi, "")
+    .replace(/<br\s*\/?>|<\/(p|div|tr|li|h[1-6]|table)>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (match, name) => {
+      if (name[0] === "#") {
+        const code = name[1].toLowerCase() === "x" ? parseInt(name.slice(2), 16) : parseInt(name.slice(1), 10);
+        return Number.isInteger(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : match;
+      }
+      return entities[name.toLowerCase()] ?? match;
+    })
+    .replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+async function ensureEmailConnector(env, stamp) {
+  await env.DB.prepare(`
+    INSERT INTO connector_instances (
+      id, kind, channel_label, account_label, display_name, note, mode, state, capabilities_json,
+      configuration_json, last_seen_at, created_at, updated_at, native_desktop
+    ) VALUES (?, 'email', '邮件', 'Cloudflare Email Routing', '邮件', '只收不发的 catch-all 收件箱', 'webhook',
+      'online', '["receive_text","receive_files"]', '{}', ?, ?, ?, NULL)
+    ON CONFLICT(id) DO UPDATE SET state = 'online', last_seen_at = excluded.last_seen_at
+  `).bind(EMAIL_CONNECTOR_ID, stamp, stamp, stamp).run();
+}
+
+async function receiveEmail(message, env) {
+  const stamp = now();
+  const recipient = String(message.to || "unknown").trim().toLowerCase().slice(0, 320) || "unknown";
+  const envelopeFrom = String(message.from || "").slice(0, 320);
+  const declaredSize = Number(message.rawSize) || 0;
+  const emailId = crypto.randomUUID();
+  const objectKey = `email/${stamp.slice(0, 7)}/${emailId}.eml`;
+
+  let raw = null;
+  if (declaredSize <= MAX_EMAIL_RAW_BYTES) {
+    raw = new Uint8Array(await new Response(message.raw).arrayBuffer());
+    await env.FILES.put(objectKey, raw, { httpMetadata: { contentType: "message/rfc822" } });
+  }
+
+  let parsed = null;
+  let parseFailed = false;
+  if (raw && raw.byteLength <= MAX_EMAIL_PARSE_BYTES) {
+    try { parsed = await PostalMime.parse(raw); } catch { parseFailed = true; }
+  } else parseFailed = true;
+
+  const subject = String(parsed?.subject || "").trim();
+  const plain = String(parsed?.text || "").trim() || emailHtmlToText(parsed?.html);
+  const fromAddress = String(parsed?.from?.address || envelopeFrom || "unknown").toLowerCase().slice(0, 320);
+  const fromName = String(parsed?.from?.name || "").trim() || fromAddress;
+  let body;
+  if (parsed) {
+    body = [subject || "(无主题)", plain].filter(Boolean).join("\n\n");
+  } else {
+    body = `(邮件无法解析${raw ? "" : "，超过大小上限未保存"}；发件人 ${envelopeFrom || "未知"})`;
+  }
+  body = body.slice(0, MAX_EMAIL_BODY_CHARS);
+  const dateMs = Date.parse(String(parsed?.date || ""));
+  const occurredAt = Number.isFinite(dateMs) && dateMs <= Date.now() ? new Date(dateMs).toISOString() : stamp;
+  const rawMessageId = String(parsed?.messageId || "").trim();
+  const externalId = rawMessageId
+    ? `${recipient}|${rawMessageId}`.length <= 190 ? `${recipient}|${rawMessageId}`
+      : `${recipient}|${await sha256Hex(ENCODER.encode(rawMessageId))}`
+    : `email:${emailId}`;
+
+  await ensureEmailConnector(env, stamp);
+  const conversationExternalId = `to:${recipient}`;
+  await env.DB.prepare(`
+    INSERT OR IGNORE INTO conversations (
+      id, connector_id, external_id, title, avatar_label, trust_tier, agent_policy_json,
+      unread_count, last_message_preview, last_message_at, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 'untrusted', '{}', 0, '', NULL, ?, ?)
+  `).bind(crypto.randomUUID(), EMAIL_CONNECTOR_ID, conversationExternalId, recipient,
+    (recipient[0] || "@").toUpperCase(), stamp, stamp).run();
+  const conversation = await env.DB.prepare(
+    "SELECT id, title, avatar_label FROM conversations WHERE connector_id = ? AND external_id = ?",
+  ).bind(EMAIL_CONNECTOR_ID, conversationExternalId).first();
+  if (!conversation) throw new Error("conversation_not_found");
+
+  const messageId = crypto.randomUUID();
+  const attachmentNames = (parsed?.attachments || []).slice(0, 50)
+    .map((item) => cleanName(item.filename || "attachment"));
+  const metadata = JSON.stringify({
+    conversationType: "direct", trigger: "direct", mentioned: false, placement: "normal",
+    context: [], attachments: [], observedAt: null, isSelf: false,
+    email: { subject, from: fromAddress, to: recipient, envelopeFrom, parseFailed,
+      attachmentNames, rawObjectKey: raw ? objectKey : null },
+  });
+  const inserted = await env.DB.prepare(`
+    INSERT OR IGNORE INTO messages (
+      id, conversation_id, connector_id, external_id, direction, sender_id, sender_name, body,
+      content_type, delivery_state, queue_class, metadata_json, occurred_at, created_by, created_at
+    ) VALUES (?, ?, ?, ?, 'inbound', ?, ?, ?, 'text', 'received', 'immediate', ?, ?, NULL, ?)
+  `).bind(messageId, conversation.id, EMAIL_CONNECTOR_ID, externalId, fromAddress,
+    fromName.slice(0, 200), body, metadata, occurredAt, stamp).run();
+  if (!count(inserted.meta?.changes)) {
+    if (raw) await env.FILES.delete(objectKey).catch(() => {});
+    return;
+  }
+  if (raw) {
+    const digest = await sha256Hex(raw);
+    await env.DB.prepare(`
+      INSERT INTO attachments (
+        id, message_id, connector_id, external_id, conversation_external_id, owner_user_id,
+        object_key, file_name, mime_type, size_bytes, sha256, state, created_at
+      ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, 'message/rfc822', ?, ?, 'received', ?)
+    `).bind(crypto.randomUUID(), messageId, EMAIL_CONNECTOR_ID, `raw:${emailId}`, conversationExternalId,
+      objectKey, `${cleanName((subject || "message").slice(0, 80), "message")}.eml`,
+      raw.byteLength, digest, stamp).run();
+  }
+  await ensureImmediateMessageState(env, {
+    messageId, connectorId: EMAIL_CONNECTOR_ID, conversationId: conversation.id, conversationExternalId,
+    conversationTitle: conversation.title, avatarLabel: conversation.avatar_label,
+    preview: (subject || plain || body).slice(0, 500), occurredAt, attachments: [], stamp,
+    isSelf: false, enqueueForAgents: false,
+  });
+}
+
 export default {
+  async email(message, env) {
+    await receiveEmail(message, env);
+  },
   async scheduled(controller, env, ctx) {
     ctx.waitUntil(Promise.all([
       cleanupOidcSessions(env),
