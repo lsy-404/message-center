@@ -49,7 +49,8 @@ type Connector = {
   state: ConnectorState
   capabilities: string[]
   lastSeenAt?: string | null
-  nativeUrl: string | null
+  native: boolean
+  nativeDesktop: string | null
 }
 
 type Conversation = {
@@ -171,12 +172,29 @@ const selectedConversation = computed(() =>
 const selectedConversationConnector = computed(() =>
   snapshot.value.connectors.find((item) => item.id === selectedConversation.value?.connectorId) ?? null,
 )
-const nativeConnector = computed(() => {
-  const connector = activeConnectorId.value
-    ? snapshot.value.connectors.find((item) => item.id === activeConnectorId.value)
-    : selectedConversationConnector.value
-  return connector?.nativeUrl && connectorModes.value[connector.id] === 'native' ? connector : null
+const nativeDesktops = computed(() => {
+  const groups = new Map<string, { key: string, connectors: Connector[] }>()
+  for (const connector of snapshot.value.connectors) {
+    if (!connector.native) continue
+    const key = connector.nativeDesktop || connector.id
+    const group = groups.get(key)
+    if (group) group.connectors.push(connector)
+    else groups.set(key, { key, connectors: [connector] })
+  }
+  return [...groups.values()].map((group) => {
+    const labels = [...new Set(group.connectors.map((connector) => channelLabel(connector)))]
+    return {
+      key: group.key,
+      label: labels.join(' · '),
+      connector: group.connectors[0],
+      src: `/native/${encodeURIComponent(group.connectors[0].id)}/`,
+    }
+  })
 })
+const activeNativeDesktop = computed(() =>
+  nativeDesktops.value.find((item) => item.key === nativeDesktopKey.value) ?? nativeDesktops.value[0] ?? null,
+)
+const nativeViewActive = computed(() => viewMode.value === 'native' && !!activeNativeDesktop.value)
 const filters = computed(() => {
   const labels = new Map<string, string>()
   for (const conversation of snapshot.value.conversations) {
@@ -673,7 +691,7 @@ function sameInbox(left: Snapshot, right: Snapshot) {
     const b = right.connectors[index]
     if (a.id !== b.id || a.accountLabel !== b.accountLabel || a.displayName !== b.displayName
         || a.channelLabel !== b.channelLabel || a.mode !== b.mode || a.state !== b.state
-        || a.lastSeenAt !== b.lastSeenAt || a.nativeUrl !== b.nativeUrl
+        || a.lastSeenAt !== b.lastSeenAt || a.native !== b.native || a.nativeDesktop !== b.nativeDesktop
         || a.capabilities.length !== b.capabilities.length
         || a.capabilities.some((value, itemIndex) => value !== b.capabilities[itemIndex])) return false
   }
@@ -822,6 +840,7 @@ async function selectConversation(conversation: Conversation, openMobileThread =
   restoreComposer(conversation.id)
   mobileThread.value = openMobileThread
   showInstances.value = false
+  showInfoView()
   loadedAttachmentImages.value = new Set()
   detailLoading.value = true
   snapshot.value.messages = []
@@ -859,7 +878,7 @@ function showPreviousConversationPage() {
 function selectConversationById(conversationId: string) {
   const conversation = snapshot.value.conversations.find((item) => item.id === conversationId)
   if (!conversation) return
-  setConnectorMode(conversation.connectorId, 'info')
+  showInfoView()
   void selectConversation(conversation)
 }
 
@@ -869,6 +888,7 @@ function selectFilter(id: string, connectorId = '') {
   activeConnectorId.value = connectorId
   showInstances.value = false
   mobileThread.value = false
+  showInfoView()
   applyConversationSelection(conversationListModel.value.selectionConversations)
 }
 
@@ -906,35 +926,45 @@ function showConnectorManagement() {
   mobileThread.value = false
 }
 
-type ConnectorMode = 'info' | 'native'
+const VIEW_MODE_KEY = 'message-center:view-mode'
+const NATIVE_DESKTOP_KEY = 'message-center:native-desktop'
 
-const CONNECTOR_MODE_KEY = 'message-center:connector-modes'
-
-function loadConnectorModes(): Record<string, ConnectorMode> {
+function readStored(key: string) {
   try {
-    const parsed = JSON.parse(localStorage.getItem(CONNECTOR_MODE_KEY) || '{}')
-    return Object.fromEntries(Object.entries(parsed).filter(([, mode]) => mode === 'native')) as Record<string, ConnectorMode>
+    return localStorage.getItem(key) || ''
   } catch {
-    return {}
+    return ''
   }
 }
 
-const connectorModes = ref(loadConnectorModes())
-
-function setConnectorMode(connectorId: string, mode: ConnectorMode) {
-  const next = { ...connectorModes.value }
-  if (mode === 'native') next[connectorId] = mode
-  else delete next[connectorId]
-  connectorModes.value = next
+function writeStored(key: string, value: string) {
   try {
-    localStorage.setItem(CONNECTOR_MODE_KEY, JSON.stringify(next))
+    localStorage.setItem(key, value)
   } catch { /* storage unavailable */ }
 }
 
-function openConnectorNative(connector: Connector) {
-  setConnectorMode(connector.id, 'native')
-  selectFilter(`channel:${channelLabel(connector)}`, connector.id)
-  mobileThread.value = true
+const viewMode = ref<'info' | 'native'>(readStored(VIEW_MODE_KEY) === 'native' ? 'native' : 'info')
+const nativeDesktopKey = ref(readStored(NATIVE_DESKTOP_KEY))
+
+function showInfoView() {
+  viewMode.value = 'info'
+  writeStored(VIEW_MODE_KEY, 'info')
+}
+
+function showNativeView(connector?: Connector | null) {
+  if (connector) {
+    nativeDesktopKey.value = connector.nativeDesktop || connector.id
+    writeStored(NATIVE_DESKTOP_KEY, nativeDesktopKey.value)
+  }
+  viewMode.value = 'native'
+  writeStored(VIEW_MODE_KEY, 'native')
+  showInstances.value = false
+  mobileThread.value = false
+}
+
+function selectNativeDesktop(key: string) {
+  nativeDesktopKey.value = key
+  writeStored(NATIVE_DESKTOP_KEY, key)
 }
 
 async function uploadFiles(event: Event) {
@@ -1143,6 +1173,11 @@ onUnmounted(() => {
         </span>
       </div>
 
+      <div v-if="nativeDesktops.length" class="view-switch" role="group" aria-label="视图">
+        <button type="button" :class="{ active: !nativeViewActive }" :aria-pressed="!nativeViewActive" @click="showInfoView(); showInstances = false">信息</button>
+        <button type="button" :class="{ active: nativeViewActive }" :aria-pressed="nativeViewActive" @click="showNativeView()">原生</button>
+      </div>
+
       <nav class="nav-scroll" aria-label="收件箱分类">
         <div class="nav-section">
           <p class="nav-label">收件箱</p>
@@ -1150,10 +1185,10 @@ onUnmounted(() => {
             v-for="filter in filters"
             :key="filter.id"
             class="nav-item"
-            :class="{ active: activeFilter === filter.id && !showInstances }"
+            :class="{ active: activeFilter === filter.id && !showInstances && !nativeViewActive }"
             type="button"
             :title="filter.label"
-            :aria-current="activeFilter === filter.id && !showInstances ? 'page' : undefined"
+            :aria-current="activeFilter === filter.id && !showInstances && !nativeViewActive ? 'page' : undefined"
             :data-channel="filter.channel || undefined"
             :data-unread-count="filter.unread"
             @click="selectFilter(filter.id)"
@@ -1208,7 +1243,33 @@ onUnmounted(() => {
       </div>
     </aside>
 
-    <section v-if="!showInstances" class="conversation-pane" aria-label="会话列表">
+    <section v-if="nativeViewActive && !showInstances" class="native-pane" aria-label="原生桌面">
+      <header class="thread-header native-header">
+        <div class="segmented native-tabs" role="tablist" aria-label="原生桌面">
+          <button
+            v-for="desktop in nativeDesktops"
+            :key="desktop.key"
+            type="button"
+            role="tab"
+            :class="{ active: desktop.key === activeNativeDesktop?.key }"
+            :aria-selected="desktop.key === activeNativeDesktop?.key"
+            @click="selectNativeDesktop(desktop.key)"
+          >{{ desktop.label }}</button>
+        </div>
+        <a v-if="activeNativeDesktop" class="native-open-link" :href="activeNativeDesktop.src" target="_blank" rel="noopener noreferrer">在新窗口打开</a>
+      </header>
+      <iframe
+        v-if="activeNativeDesktop"
+        :key="activeNativeDesktop.key"
+        class="native-frame"
+        :src="activeNativeDesktop.src"
+        :title="`${activeNativeDesktop.label} 原生桌面`"
+        allow="clipboard-read; clipboard-write; autoplay; fullscreen"
+        referrerpolicy="no-referrer"
+      />
+    </section>
+
+    <section v-if="!showInstances && !nativeViewActive" class="conversation-pane" aria-label="会话列表">
       <header class="pane-header">
         <div class="pane-title">
           <h1>{{ conversationListTitle }}</h1>
@@ -1375,31 +1436,8 @@ onUnmounted(() => {
       </div>
     </section>
 
-    <section v-if="!showInstances" class="content-pane" :class="{ 'is-native': nativeConnector }" aria-label="会话详情">
-      <template v-if="nativeConnector">
-        <header class="thread-header native-header">
-          <button class="quiet-button mobile-back" type="button" aria-label="返回收件箱" title="返回收件箱" @click="mobileThread = false">
-            <AppIcon name="back" :size="18" />
-          </button>
-          <div class="thread-title">
-            <h2>{{ nativeConnector.accountLabel }}</h2>
-          </div>
-          <div class="segmented" role="group" aria-label="显示模式">
-            <button type="button" aria-pressed="false" @click="setConnectorMode(nativeConnector.id, 'info')">信息模式</button>
-            <button type="button" class="active" aria-pressed="true">原生模式</button>
-          </div>
-          <a class="native-open-link" :href="nativeConnector.nativeUrl!" target="_blank" rel="noopener noreferrer">在新窗口打开</a>
-        </header>
-        <iframe
-          :key="nativeConnector.id"
-          class="native-frame"
-          :src="nativeConnector.nativeUrl!"
-          :title="`${nativeConnector.accountLabel} 原生模式`"
-          allow="clipboard-read; clipboard-write; autoplay; fullscreen"
-          referrerpolicy="no-referrer"
-        />
-      </template>
-      <template v-else-if="selectedConversation">
+    <section v-if="!showInstances && !nativeViewActive" class="content-pane" aria-label="会话详情">
+      <template v-if="selectedConversation">
         <header class="thread-header">
           <button class="quiet-button mobile-back" type="button" aria-label="返回收件箱" title="返回收件箱" @click="mobileThread = false">
             <AppIcon name="back" :size="18" />
@@ -1428,9 +1466,9 @@ onUnmounted(() => {
               </span>
             </p>
           </div>
-          <div v-if="selectedConversationConnector?.nativeUrl" class="segmented" role="group" aria-label="显示模式">
+          <div v-if="selectedConversationConnector?.native" class="segmented" role="group" aria-label="显示模式">
             <button type="button" class="active" aria-pressed="true">信息模式</button>
-            <button type="button" aria-pressed="false" @click="setConnectorMode(selectedConversationConnector.id, 'native')">原生模式</button>
+            <button type="button" aria-pressed="false" @click="showNativeView(selectedConversationConnector)">原生模式</button>
           </div>
           <span v-if="aiUnreadCount" class="status-chip ai-unread-chip" :title="`AI 未读 ${aiUnreadCount} 条`">
             <span class="unread-dot" /><span class="chip-label">AI 未读</span> {{ aiUnreadCount }}
@@ -1703,11 +1741,11 @@ onUnmounted(() => {
               @click="selectFilter(`channel:${channelLabel(connector)}`, connector.id)"
             ><span>查看此账号会话</span><AppIcon name="arrowRight" :size="14" /></FluentButton>
             <FluentButton
-              v-if="connector.nativeUrl"
+              v-if="connector.native"
               class="instance-open-button"
               tone="subtle"
               type="button"
-              @click="openConnectorNative(connector)"
+              @click="showNativeView(connector)"
             ><span>原生模式</span><AppIcon name="arrowRight" :size="14" /></FluentButton>
           </footer>
         </article>

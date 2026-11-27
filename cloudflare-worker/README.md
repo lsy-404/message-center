@@ -7,8 +7,10 @@
 - `worker/index.js`：唯一生产运行时入口；不依赖 Pages、Sites、服务器或入站设备端口。
 - `ui/`：Vue 3 + Vite 前端。Worker 在认证后通过静态资产绑定返回带哈希的构建产物；页面与 API 均显式禁用缓存。图标为内联的 Fluent UI System Icons；会话行与消息带 `data-*` 状态属性、`<time datetime>` 时间与 ARIA 语义，供浏览器中的 AI agent 直接读取。收件箱在页面可见且联网时轮询，请求结束后才安排下一次刷新；失败时指数退避至最多 60 秒，页面隐藏或离线时暂停，恢复后立即刷新。
 - `worker/schema.sql`：D1 schema。`connector_instances` 是连接实例表，不对渠道类型设置唯一约束。
-- `connector_instances.native_url`：实例可选的原生客户端远程桌面地址，由 `POST /api/connectors/register` 的 `nativeUrl` 写入，随 `/api/inbox` 的 `connectors[].nativeUrl` 返回。页面 CSP 的 `frame-src` 取所有已登记地址的 origin，没有登记时为 `'none'`。
-- 网页有两种模式：信息模式是会话列表、消息线程与输入框；原生模式在内容区以 iframe 嵌入该实例的 `nativeUrl`，直接操作真实客户端。会话标题栏和“接入管理”卡片在实例有 `nativeUrl` 时提供切换，每个实例的上次模式保存在浏览器 localStorage。- `wrangler.jsonc`：本地开发与 Wrangler 生产部署配置。
+- `connector_instances.native_desktop`：实例所在原生客户端远程桌面的名称，由 `POST /api/connectors/register` 的 `nativeDesktop` 写入。`/api/inbox` 的 `connectors[]` 返回 `nativeDesktop` 与 `native`（该桌面已在 Worker 中配置）。
+- 原生桌面由 Worker 在本站转发：`/native/<实例 ID>/` 经 Workers VPC 服务绑定，通过 Cloudflare Tunnel 访问设备上的 wechat-selkies 容器，包括 WebSocket 串流。访问与网页一样需要管理员登录；Worker 在上游请求中补上桌面的 Selkies 会话令牌，浏览器拿不到令牌，也拿不到桌面地址。Pelorus 自动化接口不经此路径转发，上游 `Set-Cookie` 被丢弃，本站 cookie 不会发往上游。配置方式：在 `wrangler.local.jsonc` 的 `vpc_services` 为每个桌面加一个绑定（名称即 `nativeDesktop`），并把 `{"<绑定名>": "<浏览器会话令牌>"}` 写入 secret `NATIVE_DESKTOPS`。页面 CSP 只允许同源 iframe（`frame-src 'self'`）。
+- 网页有两种视图：信息视图是会话列表、消息线程与输入框；原生视图嵌入原生客户端的远程桌面，直接操作真实客户端，多个桌面用标签切换（同一桌面上的实例合为一个标签）。导航栏的“信息 / 原生”切换在至少一个实例可用原生桌面时出现，会话标题栏和“接入管理”卡片也可直接进入对应桌面；所选视图与桌面保存在浏览器 localStorage。
+- `wrangler.jsonc`：本地开发与 Wrangler 生产部署配置。
 - 客户端登录态和供应商凭据只保留在设备 relay 或对应云 relay 中。
 - relay 只向 `message.example.com` 发起出站 HTTPS。
 

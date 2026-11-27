@@ -15,10 +15,10 @@ Store a UTF-8 JSON configuration at a private local path with mode `0600`. Relat
   "connectors": [
     {"id":"instance-selkies-wechat","token":"injected-token-a",
      "kind":"wechat","accountLabel":"Account A","displayName":"WeChat A","profile":"main",
-     "receiveOnly":true,"nativeUrl":"http://localhost:13000/?token=browser-token"},
+     "receiveOnly":true,"nativeDesktop":"DESKTOP_MAIN"},
     {"id":"instance-selkies-qq","token":"injected-token-b",
      "kind":"qq","accountLabel":"Account A","displayName":"QQ A","profile":"main",
-     "receiveOnly":true,"nativeUrl":"http://localhost:13000/?token=browser-token"}
+     "receiveOnly":true,"nativeDesktop":"DESKTOP_MAIN"}
   ],
   "outboxMaxBytes": 134217728,
   "pageLimit": 20
@@ -29,7 +29,7 @@ Use a real HTTPS origin and keep each bearer token private; the sample values ar
 
 `receiveOnly` must be `true` for every connector served by `selkies_adapter.py`: the adapter reads chat lists and never sends. With `receiveOnly` the connector registers only `receive_text` and `receive_images` and the runtime does not poll for commands. Connectors that are not `receiveOnly` keep the command and send-ledger path for other adapters.
 
-`nativeUrl` is optional: the browser-facing `http://` or `https://` address (at most 500 characters) of the connector's `wechat-selkies` desktop. The runtime validates it when it loads the configuration and sends it as `nativeUrl` in `POST /api/connectors/register`, so the web UI can embed the desktop in its native mode. `nativeUrl` is the address a browser reaches, which can differ from the `desktopUrl` the adapter uses, and carries the container's browser token as `?token=` (see below). The Worker returns it only to signed-in administrators.
+`nativeDesktop` is optional: the name of the Worker's VPC service binding that reaches this connector's `wechat-selkies` desktop (`^[A-Z][A-Z0-9_]{0,63}$`). The runtime validates it when it loads the configuration and sends it in `POST /api/connectors/register`. The Worker serves the desktop at `/native/<connector id>/` behind the administrator sign-in, reaching the container privately through Cloudflare Tunnel and Workers VPC, so the desktop needs no public hostname. See the Worker README for the binding and the `NATIVE_DESKTOPS` secret.
 
 ## Device adapter
 
@@ -52,7 +52,7 @@ Use a real HTTPS origin and keep each bearer token private; the sample values ar
 
 The adapter reads the desktop through the container's accessibility API. WeChat exposes it by default. QQ exposes its chat list only when started with `--force-renderer-accessibility`. `/usr/bin/qq` in the stock image is a symlink to `/opt/QQ/qq`, so bind-mounting a wrapper over it would overwrite the real binary.
 
-The web UI's native mode embeds the desktop in an iframe, where browsers do not show an HTTP basic-auth prompt, so the container runs in Selkies secure mode instead: a master token protects every API and stream, and a controller token in the page address (`?token=`) signs the browser in. The stock start script forces basic auth on, so the derived image also lets `SELKIES_ENABLE_BASIC_AUTH` turn it off (the build fails if that line of the upstream script changes):
+The container runs in Selkies secure mode: a master token protects every API and stream for the adapter, and a controller session token, which the Worker adds to every request it forwards, serves the web UI's native view. The stock start script forces basic auth on, so the derived image also lets `SELKIES_ENABLE_BASIC_AUTH` turn it off (the build fails if that line of the upstream script changes):
 
 ```dockerfile
 FROM ghcr.io/nickrunning/wechat-selkies:latest
@@ -61,13 +61,14 @@ RUN grep -qx 'export SELKIES_ENABLE_BASIC_AUTH=true' /wechat-container-start \
  && sed -i 's/^export SELKIES_ENABLE_BASIC_AUTH=true$/export SELKIES_ENABLE_BASIC_AUTH=${SELKIES_ENABLE_BASIC_AUTH:-true}/' /wechat-container-start
 ```
 
-Generate two random tokens (for example `openssl rand -hex 32`), keep them in mode-`0600` files, and write the browser token into a tokens file inside the container's config volume, also mode `0600`: `{"<browser-token>": {"role": "controller", "mk_control": true}}`. Then run the container with:
+Generate two random tokens (for example `openssl rand -hex 32`), keep them in mode-`0600` files, and write the session token into a tokens file inside the container's config volume, also mode `0600`: `{"<session-token>": {"role": "controller", "mk_control": true}}`. The same session token goes into the Worker's `NATIVE_DESKTOPS` secret. Then run the container with:
 
 - `SELKIES_ENABLE_BASIC_AUTH=false`, `SELKIES_MASTER_TOKEN=<master-token>`, `SELKIES_TOKENS_FILE=/config/selkies-tokens.json`
 - `SELKIES_FRAME_ANCESTORS=<Message Center origin>` so only Message Center can frame the desktop
+- the published port bound to `127.0.0.1` only; the Worker reaches it through a Cloudflare Tunnel (`cloudflared` on the same machine, QUIC transport) and a Workers VPC HTTP service pointing at `127.0.0.1:<port>`
 - `AUTO_START_WECHAT=true`, `AUTO_START_QQ=true`, and a non-empty `PASSWORD` (the start script still requires one)
 
-Sign each client in once in the browser desktop (`<desktop>/?token=<browser-token>`). Tick QQ's 自动登录 so it signs in again after a restart; WeChat asks for a confirmation on the phone after each container restart.
+Sign each client in once in Message Center's native view. Tick QQ's 自动登录 so it signs in again after a restart; WeChat asks for a confirmation on the phone after each container restart.
 
 ### What is read
 

@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS connector_instances (
   last_seen_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  native_url TEXT
+  native_desktop TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_connector_instances_kind ON connector_instances(kind);
 CREATE INDEX IF NOT EXISTS idx_connector_instances_state ON connector_instances(state);

@@ -51,7 +51,6 @@ const assetBodies = new Map([
 const auth = await createAdminTestAuth({
   ADMIN_TOKEN: adminToken,
   AGENT_TOKEN: agentToken,
-  DB: { prepare: () => ({ all: async () => ({ results: [] }) }) },
   ASSETS: {
     async fetch(request) {
       const value = assetBodies.get(new URL(request.url).pathname);

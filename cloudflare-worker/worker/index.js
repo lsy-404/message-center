@@ -306,17 +306,65 @@ function liveState(row) {
 
 function capabilitySet(row) { return new Set(safeJson(row.capabilities_json, [])); }
 
-function normalizeNativeUrl(value) {
+const NATIVE_DESKTOP_NAME = /^[A-Z][A-Z0-9_]{0,63}$/;
+
+function normalizeNativeDesktop(value) {
   if (value === undefined || value === null) return null;
-  if (typeof value !== "string" || value.length > 500) throw new Error("invalid_native_url");
-  let parsed;
-  try { parsed = new URL(value.trim()); } catch { throw new Error("invalid_native_url"); }
-  if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || parsed.username || parsed.password) {
-    throw new Error("invalid_native_url");
+  if (typeof value !== "string" || !NATIVE_DESKTOP_NAME.test(value)) throw new Error("invalid_native_desktop");
+  return value;
+}
+
+// NATIVE_DESKTOPS maps a VPC service binding name to the desktop's Selkies session token; only listed bindings are served.
+function nativeDesktops(env) {
+  const desktops = new Map();
+  const parsed = typeof env.NATIVE_DESKTOPS === "string" ? safeJson(env.NATIVE_DESKTOPS, null) : null;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return desktops;
+  for (const [name, token] of Object.entries(parsed)) {
+    if (NATIVE_DESKTOP_NAME.test(name) && typeof token === "string" && /^[A-Za-z0-9._~-]{32,512}$/.test(token) &&
+        typeof env[name]?.fetch === "function") {
+      desktops.set(name, token);
+    }
   }
-  const normalized = parsed.href;
-  if (normalized.length > 500) throw new Error("invalid_native_url");
-  return normalized;
+  return desktops;
+}
+
+const NATIVE_REQUEST_HEADERS = ["accept", "accept-language", "content-type", "content-length", "range",
+  "if-none-match", "if-modified-since", "upgrade", "connection", "sec-websocket-key", "sec-websocket-version",
+  "sec-websocket-protocol", "sec-websocket-extensions", "user-agent"];
+
+async function proxyNativeDesktop(request, env, connectorId, rest) {
+  const url = new URL(request.url);
+  if (rest === undefined) {
+    url.pathname = `/native/${connectorId}/`;
+    return redirect(url.pathname + url.search);
+  }
+  // The automation API stays reachable only to the device adapter, never through the browser.
+  if (/^\/(api\/pelorus|pelorus)(\/|$)/.test(rest)) return fail("native_path_not_allowed", 404);
+  const row = await env.DB.prepare("SELECT native_desktop FROM connector_instances WHERE id = ?").bind(connectorId).first();
+  const name = row?.native_desktop;
+  const token = name ? nativeDesktops(env).get(name) : null;
+  if (!token) return fail("native_desktop_not_found", 404);
+  const upgrade = (request.headers.get("upgrade") || "").toLowerCase() === "websocket";
+  if (upgrade && !sameOrigin(request)) return fail("cross_origin_denied", 403);
+  const target = new URL(rest, "http://localhost");
+  target.search = url.search;
+  target.searchParams.set("token", token);
+  const headers = new Headers();
+  for (const header of NATIVE_REQUEST_HEADERS) {
+    const value = request.headers.get(header);
+    if (value !== null) headers.set(header, value);
+  }
+  const body = request.method === "GET" || request.method === "HEAD" ? undefined : request.body;
+  const upstream = await env[name].fetch(new Request(target, { method: request.method, headers, body, redirect: "manual" }));
+  if (upgrade) return upstream;
+  const responseHeaders = new Headers(upstream.headers);
+  responseHeaders.delete("set-cookie");
+  responseHeaders.set("referrer-policy", "no-referrer");
+  responseHeaders.set("x-content-type-options", "nosniff");
+  responseHeaders.set("x-robots-tag", "noindex, nofollow");
+  const location = responseHeaders.get("location");
+  if (location && location.startsWith("/")) responseHeaders.set("location", `/native/${connectorId}${location}`);
+  return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers: responseHeaders });
 }
 
 function canSendAttachment(capabilities, mimeType, fileName) {
@@ -347,7 +395,7 @@ async function registerConnector(request, env) {
   const note = String(body.note || "").trim();
   const mode = String(body.mode || "device_relay");
   const capabilities = normalizeCapabilities(body.capabilities);
-  const nativeUrl = normalizeNativeUrl(body.nativeUrl);
+  const nativeDesktop = normalizeNativeDesktop(body.nativeDesktop);
   if (!validId(id) || !/^[a-z0-9][a-z0-9_-]{1,39}$/.test(kind) || !accountLabel || !displayName) {
     throw new Error("invalid_connector_registration");
   }
@@ -405,15 +453,15 @@ async function registerConnector(request, env) {
   registrationStatements.push(env.DB.prepare(`
     INSERT INTO connector_instances (
       id, kind, channel_label, account_label, display_name, note, mode, state, capabilities_json,
-      configuration_json, last_seen_at, created_at, updated_at, native_url
+      configuration_json, last_seen_at, created_at, updated_at, native_desktop
     ) VALUES (?, ?, ?, ?, ?, ?, ?, 'offline', ?, '{}', NULL, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, channel_label = excluded.channel_label, account_label = excluded.account_label,
       display_name = excluded.display_name, note = excluded.note, mode = excluded.mode,
       capabilities_json = excluded.capabilities_json, updated_at = excluded.updated_at,
-      native_url = excluded.native_url
+      native_desktop = excluded.native_desktop
   `).bind(
     id, kind, channelLabel.slice(0, 80), accountLabel.slice(0, 200), displayName.slice(0, 200), note.slice(0, 1000), mode,
-    JSON.stringify(capabilities), stamp, stamp, nativeUrl,
+    JSON.stringify(capabilities), stamp, stamp, nativeDesktop,
   ));
   await env.DB.batch(registrationStatements);
   await audit(env, `connector:${id}`, "connector_registered", id, { kind, accountLabel, capabilities });
@@ -1827,12 +1875,14 @@ async function readInbox(env, selectedConversationId) {
       AND p.conversation_external_id = c.external_id
     ORDER BY COALESCE(p.is_pinned, 0) DESC, COALESCE(c.last_message_at, c.created_at) DESC LIMIT 512
   `).all();
+  const desktops = nativeDesktops(env);
   const connectors = (connectorsResult.results || []).map((row) => ({
     id: row.id, kind: row.kind, channelLabel: row.channel_label || row.kind,
     accountLabel: row.account_label, displayName: row.display_name,
     note: row.note, mode: row.mode, state: liveState(row), capabilities: safeJson(row.capabilities_json, []),
     lastSeenAt: row.last_seen_at,
-    nativeUrl: row.native_url || null,
+    native: Boolean(row.native_desktop && desktops.has(row.native_desktop)),
+    nativeDesktop: row.native_desktop || null,
   }));
   const conversations = (conversationResult.results || []).map((row) => ({
     id: row.id, connectorId: row.connector_id, connectorKind: row.connector_kind,
@@ -2970,17 +3020,6 @@ function isHtmlNavigation(request, path) {
     new Set(["/", "/app", "/index.html", "/login"]).has(path);
 }
 
-async function nativeFrameSources(env) {
-  const { results } = await env.DB.prepare(
-    "SELECT DISTINCT native_url FROM connector_instances WHERE native_url IS NOT NULL",
-  ).all();
-  const origins = new Set();
-  for (const row of results || []) {
-    try { origins.add(new URL(row.native_url).origin); } catch { /* skip malformed legacy value */ }
-  }
-  return origins.size ? [...origins].join(" ") : "'none'";
-}
-
 async function appAssetResponse(request, env, assetPath) {
   if (!env.ASSETS || typeof env.ASSETS.fetch !== "function") {
     return fail("app_assets_unavailable", 503);
@@ -3009,7 +3048,7 @@ async function appAssetResponse(request, env, assetPath) {
     headers.set("content-security-policy",
       "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; " +
       "media-src 'self' blob:; connect-src 'self'; font-src 'self' data:; object-src 'none'; " +
-      `frame-src ${await nativeFrameSources(env)}; ` +
+      "frame-src 'self'; " +
       "base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
   }
   return new Response(asset.body, { status: asset.status, statusText: asset.statusText, headers });
@@ -3094,6 +3133,8 @@ export default {
       if (request.method === "GET" && (url.pathname.startsWith("/assets/") || url.pathname.startsWith("/vendor/fluent/"))) {
         return await appAssetResponse(request, env, url.pathname);
       }
+      const nativeDesktop = url.pathname.match(/^\/native\/([a-zA-Z0-9._:-]+)(\/.*)?$/);
+      if (nativeDesktop) return await proxyNativeDesktop(request, env, nativeDesktop[1], nativeDesktop[2]);
       const avatarDownload = url.pathname.match(
         /^\/api\/avatars\/([a-zA-Z0-9._:-]+)\/([a-zA-Z0-9._:-]+)$/,
       );

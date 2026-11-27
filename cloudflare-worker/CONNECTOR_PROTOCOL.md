@@ -25,11 +25,11 @@
   "note": "负责工程群；仅在无人值守策略允许时自动处理",
   "mode": "device_relay",
   "capabilities": ["receive_text", "send_text", "receive_files", "send_files"],
-  "nativeUrl": "https://desktop.example.com/"
+  "nativeDesktop": "DESKTOP_MAIN"
 }
 ```
 
-`nativeUrl` 可选：该实例原生客户端的浏览器远程桌面地址，必须是绝对 `http:` / `https:` URL，不含用户名密码，最长 500 字符；缺省或 `null` 表示清除。网页据此为该实例提供“原生模式”，并把这些地址的 origin 加入页面 CSP 的 `frame-src`（远程桌面需允许本站 origin 嵌入）。
+`nativeDesktop` 可选：该实例原生客户端所在远程桌面的名称，即 Worker 中对应 VPC 服务绑定的名字（`^[A-Z][A-Z0-9_]{0,63}$`）；缺省或 `null` 表示清除。只有同时出现在 Worker secret `NATIVE_DESKTOPS` 中的名称才会启用“原生模式”。实例只上报名称，桌面地址和令牌都只在 Worker 配置里。
 
 同一个 `kind` 可以注册任意数量的实例。仅接收短信可声明：
 

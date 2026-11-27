@@ -260,12 +260,10 @@ class Relay:
             if (not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._:-]{7,199}", connector["id"]) or
                     len(connector["token"]) < 32):
                 raise ValueError("invalid_connector_configuration")
-            native_url = connector.get("nativeUrl")
-            if native_url is not None and (
-                    not isinstance(native_url, str) or len(native_url) > 500
-                    or urllib.parse.urlsplit(native_url).scheme not in ("http", "https")
-                    or not urllib.parse.urlsplit(native_url).netloc):
-                raise ValueError("invalid_native_url")
+            native_desktop = connector.get("nativeDesktop")
+            if native_desktop is not None and (
+                    not isinstance(native_desktop, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", native_desktop)):
+                raise ValueError("invalid_native_desktop")
         self.connector_by_id = {item["id"]: item for item in self.connectors}
         self.connector = self.connectors[0]["id"]
         self.health = {item["id"]: False for item in self.connectors}
@@ -905,8 +903,8 @@ class Relay:
                     "accountLabel": connector["accountLabel"], "displayName": connector["displayName"],
                     "mode": "device_relay", "capabilities": capabilities,
                 }
-                if connector.get("nativeUrl"):
-                    payload["nativeUrl"] = connector["nativeUrl"]
+                if connector.get("nativeDesktop"):
+                    payload["nativeDesktop"] = connector["nativeDesktop"]
                 self.http_call("POST", "/api/connectors/register", payload)
                 self.registered.add(connector["id"])
                 self.succeeded(connector["id"])
