@@ -229,7 +229,8 @@ def adapter_timeout_for_request(request):
     if operation == "scan":
         return ADAPTER_SCAN_TIMEOUT
     if operation == "send":
-        return ADAPTER_SEND_TIMEOUT
+        # Each file goes through the client's picker and upload before the next one.
+        return ADAPTER_SEND_TIMEOUT + 120 * len(request.get("attachments") or [])
     raise ValueError("unsupported_adapter_operation")
 
 
@@ -844,26 +845,26 @@ class Relay:
             self.db.execute("INSERT INTO command_ledger(connector_id,idempotency_key,fingerprint,state) "
                             "VALUES(?,?,?,'started')", (self.connector, key, fingerprint))
             self.db.commit()
-        if payload.get("attachments"):
-            outcome, retryable = {"ok": False, "error": "adapter_file_send_not_supported"}, 0
-            self.db.execute("UPDATE command_ledger SET state='done',result=? WHERE connector_id=? AND idempotency_key=?",
-                            (compact(outcome), self.connector, key))
-            self.db.commit()
-            self.complete(command, outcome)
-            return
+        downloaded = []
         try:
             connector = self.connector_by_id[self.connector]
             driver = connector.get("kind")
             if driver not in {"qq", "wechat"}:
                 raise RuntimeError("unsupported_connector_driver")
-            request = {"op": "send", "driver": driver,
-                       "profile": profile, "commandId": command["id"],
-                       "idempotencyKey": key,
-                       "conversationExternalId": payload.get("externalConversationId"),
-                       "body": payload.get("body", ""),
-                       "confirmed": True, "targetConfirmed": True,
-                       "attachments": payload.get("attachments", [])}
-            result = self.adapter_call(request)
+            try:
+                for attachment in payload.get("attachments") or []:
+                    downloaded.append(self.download_attachment(attachment))
+            except Exception:
+                result = {"ok": False, "retryable": True, "dispatched": False, "error": "attachment_download_failed"}
+            else:
+                request = {"op": "send", "driver": driver,
+                           "profile": profile, "commandId": command["id"],
+                           "idempotencyKey": key,
+                           "conversationExternalId": payload.get("externalConversationId"),
+                           "body": payload.get("body", ""),
+                           "confirmed": True, "targetConfirmed": True,
+                           "attachments": downloaded}
+                result = self.adapter_call(request)
             if result.get("ok") is True and isinstance(result.get("receipt"), str) and result.get("receipt"):
                 outcome = {"ok": True, "result": {"receipt": result["receipt"]}}
                 retryable = 0
@@ -883,11 +884,62 @@ class Relay:
                 retryable = 0
         except Exception:
             outcome, retryable = {"uncertain": True, "error": "device_send_outcome_uncertain"}, 0
+        finally:
+            for attachment in downloaded:
+                try:
+                    os.unlink(attachment["localPath"])
+                except OSError:
+                    pass
         if not retryable:
             self.db.execute("UPDATE command_ledger SET state='done',result=?,retryable=? WHERE connector_id=? AND idempotency_key=?",
                             (compact(outcome), retryable, self.connector, key))
         self.db.commit()
         self.complete(command, outcome)
+
+    def download_attachment(self, attachment):
+        """Fetches one outbound file of the leased command into the outgoing media folder and checks its size and
+        SHA-256; returns the adapter's attachment entry with `localPath`."""
+        if not isinstance(attachment, dict):
+            raise RuntimeError("invalid_attachment")
+        file_id = str(attachment.get("id") or "")
+        size = attachment.get("sizeBytes")
+        sha256 = str(attachment.get("sha256") or "")
+        if (not re.fullmatch(r"[a-zA-Z0-9._:-]{1,200}", file_id)
+                or attachment.get("downloadPath") != "/api/files/" + file_id
+                or isinstance(size, bool) or not isinstance(size, int) or not 0 < size <= MAX_ATTACHMENT_BYTES
+                or not re.fullmatch(r"[0-9a-f]{64}", sha256)):
+            raise RuntimeError("invalid_attachment")
+        folder = os.path.join(self.media_directory, "outgoing")
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        path = os.path.join(folder, sha256 + "-" + str(int(time.time() * 1000)))
+        headers = dict(self.headers(), Accept="*/*")
+        request = urllib.request.Request(self.base + attachment["downloadPath"], headers=headers, method="GET")
+        digest = hashlib.sha256()
+        written = 0
+        try:
+            with urllib.request.build_opener(NoRedirect()).open(request, timeout=60) as response, \
+                    open(path, "wb") as handle:
+                if response.geturl() != request.full_url:
+                    raise RuntimeError("redirect_refused")
+                while True:
+                    chunk = response.read(65536)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > size:
+                        raise RuntimeError("attachment_size_mismatch")
+                    digest.update(chunk)
+                    handle.write(chunk)
+            if written != size or digest.hexdigest() != sha256:
+                raise RuntimeError("attachment_digest_mismatch")
+        except BaseException:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
+        return {"fileName": str(attachment.get("fileName") or ""), "mimeType": str(attachment.get("mimeType") or ""),
+                "sizeBytes": size, "sha256": sha256, "localPath": path}
 
     def register_connectors(self):
         for connector in self.connectors:
@@ -897,7 +949,7 @@ class Relay:
             try:
                 capabilities = ["receive_text", "receive_images"]
                 if connector.get("receiveOnly") is not True:
-                    capabilities.append("send_text")
+                    capabilities.extend(["send_text", "send_files", "send_images"])
                 payload = {
                     "id": connector["id"], "kind": connector["kind"],
                     "accountLabel": connector["accountLabel"], "displayName": connector["displayName"],

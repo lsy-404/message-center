@@ -90,24 +90,22 @@ export function buildConversationListModel(conversations, options = {}) {
       conversations: folderConversations,
       scopeConversations: folderConversations,
       selectionConversations: folderConversations,
-      folder: null,
+      folders: [],
     }
   }
 
-  const scopeFolder = CONVERSATION_FOLDERS.find((folder) => folder.scopeKind === options.scopeKind) || null
-  const folderConversations = scopeFolder ? items.filter(scopeFolder.contains) : []
-  const rootConversations = scopeFolder
-    ? items.filter((conversation) => !scopeFolder.contains(conversation))
+  const scopeKinds = Array.isArray(options.scopeKinds) ? options.scopeKinds : []
+  const scopeFolders = CONVERSATION_FOLDERS.filter((folder) => scopeKinds.includes(folder.scopeKind))
+  const membersOf = scopeFolders.map((folder) => items.filter(folder.contains))
+  const rootConversations = scopeFolders.length
+    ? items.filter((conversation) => !scopeFolders.some((folder) => folder.contains(conversation)))
     : items
   const selectedInFolder = options.selectedId
-    ? folderConversations.find((conversation) => conversation.id === options.selectedId)
+    ? membersOf.flat().find((conversation) => conversation.id === options.selectedId)
     : null
   const selectionConversations = selectedInFolder
     ? [...rootConversations, selectedInFolder]
     : rootConversations
-  const unreadCount = folderConversations.reduce(
-    (total, conversation) => total + Math.max(0, Number(conversation.unreadCount) || 0), 0,
-  )
 
   return {
     path: [],
@@ -116,14 +114,18 @@ export function buildConversationListModel(conversations, options = {}) {
     conversations: rootConversations,
     scopeConversations: items,
     selectionConversations,
-    folder: scopeFolder && folderConversations.length ? {
-      kind: 'folder',
-      id: scopeFolder.id,
-      title: scopeFolder.title,
-      count: folderConversations.length,
-      unreadCount,
-      active: Boolean(selectedInFolder),
-    } : null,
+    folders: scopeFolders.flatMap((folder, index) => {
+      const members = membersOf[index]
+      if (!members.length) return []
+      return [{
+        kind: 'folder',
+        id: folder.id,
+        title: folder.title,
+        count: members.length,
+        unreadCount: unreadTotal(members),
+        active: members.includes(selectedInFolder),
+      }]
+    }),
   }
 }
 

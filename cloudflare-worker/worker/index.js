@@ -410,7 +410,7 @@ async function registerConnector(request, env) {
     const leasedReview = JSON.stringify({ error: "capability_enabled_old_lease_review",
       uncertain: true, transitionId });
     registrationStatements.push(env.DB.prepare(`
-      UPDATE commands SET state = 'manual_review',
+      UPDATE commands SET state = CASE state WHEN 'pending' THEN 'failed' ELSE 'manual_review' END,
         result_json = CASE state WHEN 'pending' THEN ? ELSE ? END,
         lease_token = NULL, lease_expires_at = NULL, completed_at = ?
       WHERE connector_id = ? AND state IN ('pending', 'leased')
@@ -423,28 +423,34 @@ async function registerConnector(request, env) {
         )
     `).bind(pendingReview, leasedReview, stamp, id));
     registrationStatements.push(env.DB.prepare(`
-      UPDATE messages SET delivery_state = 'uncertain'
+      UPDATE messages SET delivery_state = CASE WHEN id IN (
+          SELECT message_id FROM commands
+          WHERE connector_id = ? AND state = 'failed' AND completed_at = ? AND result_json = ?
+        ) THEN 'failed' ELSE 'uncertain' END
       WHERE direction = 'outbound' AND delivery_state = 'queued'
         AND id IN (
           SELECT message_id FROM commands
-          WHERE connector_id = ? AND state = 'manual_review'
+          WHERE connector_id = ? AND state IN ('failed', 'manual_review')
             AND completed_at = ? AND result_json IN (?, ?)
         )
-    `).bind(id, stamp, pendingReview, leasedReview));
+    `).bind(id, stamp, pendingReview, id, stamp, pendingReview, leasedReview));
     registrationStatements.push(env.DB.prepare(`
-      UPDATE attachments SET state = 'uncertain'
+      UPDATE attachments SET state = CASE WHEN message_id IN (
+          SELECT message_id FROM commands
+          WHERE connector_id = ? AND state = 'failed' AND completed_at = ? AND result_json = ?
+        ) THEN 'failed' ELSE 'uncertain' END
       WHERE state = 'queued' AND message_id IN (
         SELECT message_id FROM commands
-        WHERE connector_id = ? AND state = 'manual_review'
+        WHERE connector_id = ? AND state IN ('failed', 'manual_review')
           AND completed_at = ? AND result_json IN (?, ?)
       )
-    `).bind(id, stamp, pendingReview, leasedReview));
+    `).bind(id, stamp, pendingReview, id, stamp, pendingReview, leasedReview));
     registrationStatements.push(env.DB.prepare(`
       INSERT INTO audit_log (occurred_at, actor, action, target_id, details_json)
       SELECT ?, ?, 'connector_send_commands_manual_review', ?, ?
       WHERE EXISTS (
         SELECT 1 FROM commands
-        WHERE connector_id = ? AND state = 'manual_review'
+        WHERE connector_id = ? AND state IN ('failed', 'manual_review')
           AND completed_at = ? AND result_json IN (?, ?)
       )
     `).bind(stamp, `connector:${id}`, id,
@@ -1862,6 +1868,27 @@ async function readGroupTextBackups(env, url) {
     receivedAt: row.received_at,
   }));
   return json({ ok: true, backups, retentionDays: 30 });
+}
+
+async function readStickers(env) {
+  // GIFs count as stickers too: chat clients deliver them that way, and older imports carry no presentation mark.
+  const rows = await env.DB.prepare(`
+    SELECT a.id, a.file_name, a.mime_type, a.size_bytes, a.sha256, MAX(a.created_at) AS newest, COUNT(*) AS uses
+    FROM attachments a JOIN messages m ON m.id = a.message_id
+    WHERE a.state = 'received' AND a.object_key IS NOT NULL AND a.mime_type LIKE 'image/%'
+      AND a.size_bytes <= 3145728
+      AND (a.mime_type = 'image/gif' OR EXISTS (
+        SELECT 1 FROM json_each(
+          CASE WHEN json_valid(m.metadata_json) THEN m.metadata_json ELSE '{}' END, '$.attachments') j
+        WHERE json_extract(j.value, '$.externalId') = a.external_id
+          AND json_extract(j.value, '$.presentation') = 'sticker'))
+    GROUP BY a.sha256
+    ORDER BY uses DESC, newest DESC
+    LIMIT 60
+  `).all();
+  return (rows.results || []).map((row) => ({
+    id: row.id, fileName: row.file_name, mimeType: row.mime_type, sizeBytes: row.size_bytes, sha256: row.sha256,
+  }));
 }
 
 async function readInbox(env, selectedConversationId) {
@@ -3285,6 +3312,9 @@ export default {
       }
       if (url.pathname === "/api/inbox" && request.method === "GET") {
         return json({ ok: true, ...(await readInbox(env, url.searchParams.get("conversationId"))) });
+      }
+      if (url.pathname === "/api/stickers" && request.method === "GET") {
+        return json({ ok: true, stickers: await readStickers(env) });
       }
       if (url.pathname === "/api/group-text-backups" && request.method === "GET") {
         return await readGroupTextBackups(env, url);

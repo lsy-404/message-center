@@ -5,7 +5,8 @@ The runtime runs this executable once per request with one JSON object on stdin.
 ``selkies_adapter.json`` beside this file and a file holding the container's Selkies master token. A scan reads the
 client's chat list, and the chats folded into 群助手 / 折叠的聊天, through the container's Pelorus accessibility API and
 reports every chat whose last message changed. Scans never open a chat, so nothing is marked read. A send opens the
-chat, types the text, sends it and checks the message list before it reports a receipt.
+chat, sends each file through the client's file picker and then the text, and checks the message list after each one
+before it reports a receipt.
 """
 
 import base64
@@ -14,12 +15,15 @@ import hashlib
 import json
 import os
 import re
+import secrets
+import shutil
 import stat
 import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
+import zlib
 
 REQUEST_TIMEOUT = 15
 MAX_REMEMBERED = 300
@@ -29,6 +33,9 @@ MAX_STATE_CONVERSATIONS = 1000
 FOLDER_REFRESH_MS = 10 * 60 * 1000
 RECENT_SEND_MS = 15 * 60 * 1000
 SCROLL_PAGES = 8
+MAX_ATTACHMENTS = 20
+OUTGOING_KEEP_S = 24 * 3600
+FILE_SEND_WAIT_S = 90
 CONFIG_PATH = os.path.splitext(os.path.abspath(__file__))[0] + ".json"
 STATE_PATH = os.path.splitext(os.path.abspath(__file__))[0] + ".state.json"
 
@@ -51,6 +58,10 @@ TIME_LABEL = re.compile(r"^(\d{1,4}[:/]\d{1,2}(/\d{1,2})?|昨天|前天|星期.)
 # Row-level markers the client prints in front of a preview; they describe the row, not the message.
 ROW_MARKERS = re.compile(r"^(\[(有人@我|有新文件|有人@你|草稿)\])+")
 SENDER = re.compile(r"^([^:：\[\]\n]{1,64})(?:: |：)(.*)$", re.S)
+# Typing these produces 〈〉 in the container, so they are pressed as keysyms instead.
+TYPED_AS_KEYS = {"「": "U300C", "」": "U300D"}
+IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+SAFE_FILE_NAME = re.compile(r"^[^/\\\x00-\x1f]{1,200}$")
 
 
 class AdapterError(Exception):
@@ -188,6 +199,27 @@ class Desktop:
         self.call("/window/{}/activate".format(window_id), "POST")
         time.sleep(0.3)
 
+    def windows(self):
+        return self.call("/desktop").get("windows") or []
+
+    def screenshot(self, window_id):
+        """The window's picture as PNG bytes, and the (x, y, scale) that maps a screen point into it."""
+        result = self.call("/tool", "POST", {"name": "screenshot", "arguments": {"window": window_id}})
+        match = re.search(r"screen point (-?\d+),(-?\d+) and it is (\d+)x(\d+)", result.get("text") or "")
+        image = (result.get("image") or "").split(",", 1)[-1]
+        if result.get("failed") or not match or not image:
+            raise AdapterError("desktop_action_failed")
+        png = base64.b64decode(image)
+        width = int.from_bytes(png[16:20], "big")
+        return png, (int(match.group(1)), int(match.group(2)), width / max(1, int(match.group(3))))
+
+    def park_pointer(self, window_id):
+        """Moves the pointer onto the window's title bar so no list row is drawn hovered."""
+        window = next((w for w in self.windows() if int(w.get("id", -1)) == window_id), None)
+        if window and window.get("rect"):
+            x, y, w, _ = window["rect"]
+            self.tool("scroll", at=[int(x + w / 2), int(y + 12)], direction="up", amount=1)
+
 
 def walk(node):
     yield node
@@ -201,6 +233,66 @@ def text_of(node):
 
 def find(tree, predicate):
     return next((node for node in walk(tree) if predicate(node)), None)
+
+
+def type_chars(desktop, text, ref=None):
+    """Types `text` where the keyboard focus is (after clicking `ref`), pressing TYPED_AS_KEYS characters as keysyms."""
+    if not any(char in text for char in TYPED_AS_KEYS):
+        if ref:
+            desktop.tool("type", ref=ref, text=text)
+        else:
+            desktop.tool("type", text=text)
+        return
+    if ref:
+        desktop.tool("click", ref=ref)
+    for part in re.split("([{}])".format("".join(TYPED_AS_KEYS)), text):
+        if part in TYPED_AS_KEYS:
+            desktop.tool("key", keys=TYPED_AS_KEYS[part])
+        elif part:
+            desktop.tool("type", text=part)
+
+
+def png_left_columns(png, columns):
+    """RGB(A) rows of an 8-bit, non-interlaced PNG, each cut to its first `columns` pixels. PNG filters only refer to
+    the pixels left of and above a byte, so decoding that prefix of every row is exact and avoids decoding the rest."""
+    position, chunks, header = 8, [], None
+    while position + 8 <= len(png):
+        length = int.from_bytes(png[position:position + 4], "big")
+        kind = png[position + 4:position + 8]
+        data = png[position + 8:position + 8 + length]
+        position += 12 + length
+        if kind == b"IHDR":
+            header = data
+        elif kind == b"IDAT":
+            chunks.append(data)
+    if header is None or header[8] != 8 or header[9] not in (2, 6) or header[12] != 0:
+        raise AdapterError("screenshot_unsupported")
+    width, height = int.from_bytes(header[0:4], "big"), int.from_bytes(header[4:8], "big")
+    bpp = 4 if header[9] == 6 else 3
+    raw = zlib.decompress(b"".join(chunks))
+    stride, span = width * bpp + 1, min(columns, width) * bpp
+    rows, previous = [], bytearray(span)
+    for y in range(height):
+        kind = raw[y * stride]
+        line = bytearray(raw[y * stride + 1:y * stride + 1 + span])
+        for i in range(span):
+            left = line[i - bpp] if i >= bpp else 0
+            up = previous[i]
+            if kind == 1:
+                line[i] = (line[i] + left) & 255
+            elif kind == 2:
+                line[i] = (line[i] + up) & 255
+            elif kind == 3:
+                line[i] = (line[i] + ((left + up) >> 1)) & 255
+            elif kind == 4:
+                corner = previous[i - bpp] if i >= bpp else 0
+                estimate = left + up - corner
+                distances = abs(estimate - left), abs(estimate - up), abs(estimate - corner)
+                line[i] = (line[i] + (left if distances[0] <= distances[1] and distances[0] <= distances[2]
+                                      else up if distances[1] <= distances[2] else corner)) & 255
+        rows.append(bytes(line))
+        previous = line
+    return rows, bpp
 
 
 def wechat_list_rows(chats, placement):
@@ -292,6 +384,77 @@ def qq_owner(tree):
         name = node.get("name") or ""
         if node.get("role") == "button" and name.endswith("的头像"):
             return name[:-len("的头像")]
+    return None
+
+
+def qq_open_chat(tree):
+    """The open chat's name: its input box is named after it."""
+    node = find(tree, lambda n: n.get("role") == "section" and (n.get("states") or {}).get("editable") and n.get("name"))
+    return node.get("name") if node else None
+
+
+def qq_scroll_top(desktop, window_id, tree):
+    chats = find(tree, lambda n: n.get("name") == "会话列表")
+    bounds = chats.get("bounds") if chats else None
+    if not bounds:
+        return tree
+    desktop.tool("scroll", at=[int(bounds["x"] + bounds["w"] / 2), int(bounds["y"] + bounds["h"] / 2)],
+                 direction="up", amount=30)
+    time.sleep(0.5)
+    return desktop.tree(window_id)
+
+
+def qq_mark_pinned(desktop, window_id, rows, open_name):
+    """QQ draws pinned rows on their own background and does not say so in the accessibility tree, so each row's
+    background is sampled from a screenshot: a row whose colour differs from the most common row colour is pinned.
+    The open chat's row is highlighted either way; it and any row that cannot be sampled get `pinned: None`."""
+    for row in rows:
+        row["pinned"] = None
+    placed = [row for row in rows if row.get("bounds")]
+    if len(placed) < 5:
+        return rows
+    desktop.park_pointer(window_id)
+    time.sleep(0.3)
+    png, (left, top, scale) = desktop.screenshot(window_id)
+    points = [(row, int((row["bounds"]["x"] + 3 - left) * scale),
+               int((row["bounds"]["y"] + row["bounds"]["h"] / 2 - top) * scale)) for row in placed]
+    points = [(row, x, y) for row, x, y in points if x >= 0 and y >= 0]
+    if not points:
+        return rows
+    pixels, bpp = png_left_columns(png, max(x for _, x, _ in points) + 1)
+    colours = [(row, pixels[y][x * bpp:x * bpp + 3]) for row, x, y in points if y < len(pixels)]
+    tally = {}
+    for _, colour in colours:
+        tally[colour] = tally.get(colour, 0) + 1
+    if not tally:
+        return rows
+    common = max(tally, key=tally.get)
+    for row, colour in colours:
+        if row["name"] != open_name:
+            row["pinned"] = colour != common
+    # The list puts pinned chats first and the rest newest first, so an open chat older than an unpinned chat
+    # below it must be pinned.
+    for index, row in enumerate(rows):
+        if row["pinned"] is None and row["name"] == open_name and time_rank(row["time"]) is not None:
+            if any(other["pinned"] is False and (time_rank(other["time"]) or (-1,)) > time_rank(row["time"])
+                   for other in rows[index + 1:]):
+                row["pinned"] = True
+    return rows
+
+
+def time_rank(label):
+    """A sortable key for a chat-list time label (16:30, 昨天, 前天, 11/17, 2025/11/17); None for others."""
+    match = re.match(r"^(\d{1,2}):(\d{2})$", label or "")
+    if match:
+        return (5, int(match.group(1)) * 60 + int(match.group(2)))
+    if label in ("昨天", "前天"):
+        return (4 if label == "昨天" else 3, 0)
+    match = re.match(r"^(\d{1,2})/(\d{1,2})$", label or "")
+    if match:
+        return (1, int(match.group(1)) * 100 + int(match.group(2)))
+    match = re.match(r"^(\d{4})/(\d{1,2})/(\d{1,2})$", label or "")
+    if match:
+        return (0, int(match.group(1)) * 10000 + int(match.group(2)) * 100 + int(match.group(3)))
     return None
 
 
@@ -447,7 +610,8 @@ def read_folder(desktop, driver, window_id, rows):
     else:
         folded = qq_rows(tree) if in_folder(driver, tree) else None
         if folded is not None:
-            folded = [dict(r, placement="folded") for r in folded]
+            folded = qq_mark_pinned(desktop, window_id, [dict(r, placement="folded") for r in folded],
+                                    qq_open_chat(tree))
     if in_folder(driver, tree):
         leave_folder(desktop, driver, window_id, tree)
     if driver == "wechat":
@@ -471,7 +635,7 @@ def own_echo(state, conversation, texts, now):
     entries = state["recent"].get(conversation) or []
     wanted = {digest(collapse(text)) for text in texts if text}
     for index, entry in enumerate(entries):
-        if now - entry.get("at", 0) < RECENT_SEND_MS and entry.get("t") in wanted:
+        if now - entry.get("at", 0) < RECENT_SEND_MS and (entry.get("t") in wanted or set(entry.get("ts") or ()) & wanted):
             del entries[index]
             return True
     return False
@@ -485,7 +649,12 @@ def scan(request, config):
     state = load_state()
     window_id, tree = open_client(desktop, driver)
     owner = qq_owner(tree) if driver == "qq" else None
-    rows = main_rows(driver, tree) or []
+    if driver == "qq":
+        desktop.activate(window_id)
+        tree = qq_scroll_top(desktop, window_id, tree)
+        rows = qq_mark_pinned(desktop, window_id, main_rows(driver, tree) or [], qq_open_chat(tree))
+    else:
+        rows = main_rows(driver, tree) or []
     cursor = request.get("cursor") if isinstance(request.get("cursor"), dict) else {}
     seen = dict(cursor.get("chats") or {})
     folder_state = dict(cursor.get("folder") or {})
@@ -495,7 +664,8 @@ def scan(request, config):
     aggregate = next((r for r in rows if r["name"] == APPS[driver]["folder"]), None)
     aggregate_print = digest("{}\n{}".format(aggregate["preview"], aggregate["unread"])) if aggregate else None
     due = (aggregate_print and folder_state.get("p") != aggregate_print) or now - folder_state.get("at", 0) >= FOLDER_REFRESH_MS
-    if entry.get("readFolders") is True and due:
+    # A pinned folder row cannot move, so opening it is safe without the readFolders opt-in.
+    if (entry.get("readFolders") is True or (aggregate and aggregate.get("pinned"))) and due:
         folded = read_folder(desktop, driver, window_id, rows)
         if folded is not None:
             rows = rows + folded
@@ -513,6 +683,8 @@ def scan(request, config):
         fingerprint = digest(row["preview"])
         unread = row["unread"] if isinstance(row["unread"], int) else 0
         state["conversations"][conversation] = {"name": row["name"], "folder": row["placement"] == "folded", "at": now}
+        if row["pinned"] is None:
+            row["pinned"] = bool(previous and len(previous.get("s") or "") > 1 and previous["s"][1] == "1")
         traits = "{}{}{}".format(int(bool(row["muted"])), int(bool(row["pinned"])), row["placement"][0])
         changed = previous is None or previous.get("p") != fingerprint or unread > previous.get("u", 0)
         if not changed and previous.get("s") == traits:
@@ -647,7 +819,9 @@ def open_conversation(desktop, driver, window_id, tree, name, folded):
         ref = desktop.ref(window_id, r'entry\b')
         if not ref:
             raise AdapterError("conversation_not_found")
-        desktop.tool("type", ref=ref, text=name, replace=True)
+        desktop.tool("click", ref=ref)
+        clear_input(desktop)
+        type_chars(desktop, name)
         time.sleep(1.5)
         results = [n for n in walk(desktop.tree(window_id)) if n.get("role") == "list item" and n.get("bounds")]
         exact = [n for n in results if qq_result_match(n, name) == "exact"]
@@ -676,14 +850,14 @@ def type_text(desktop, driver, window_id, tree, name, body):
         ref = desktop.ref(window_id, r'text "{}"'.format(re.escape(node.get("name") or name)))
         if not ref:
             raise AdapterError("input_not_found")
-        desktop.tool("type", ref=ref, text=lines[0])
+        type_chars(desktop, lines[0], ref=ref)
     else:
         desktop.click(node["bounds"])
-        desktop.tool("type", text=lines[0])
+        type_chars(desktop, lines[0])
     for line in lines[1:]:
         desktop.tool("key", keys="shift+Return")
         if line:
-            desktop.tool("type", text=line)
+            type_chars(desktop, line)
 
 
 def clear_input(desktop):
@@ -691,33 +865,238 @@ def clear_input(desktop):
     desktop.tool("key", keys="BackSpace")
 
 
+def outgoing_files(entry, attachments, command_id):
+    """Copies each attachment into the profile's outgoing directory, which the container mounts, under its own file
+    name (recipients see it) in a fresh folder; returns (attachment, path inside the container) pairs."""
+    host = os.path.expanduser(str(entry.get("outgoingDirectory") or ""))
+    inside = str(entry.get("containerOutgoingDirectory") or "").rstrip("/")
+    if not host or not os.path.isabs(host) or not inside.startswith("/"):
+        raise AdapterError("attachments_unconfigured")
+    os.makedirs(host, mode=0o755, exist_ok=True)
+    now = time.time()
+    with os.scandir(host) as entries:
+        for item in entries:
+            try:
+                if item.is_dir(follow_symlinks=False) and now - item.stat(follow_symlinks=False).st_mtime > OUTGOING_KEEP_S:
+                    shutil.rmtree(item.path, ignore_errors=True)
+            except OSError:
+                pass
+    folder = "{}-{}".format(digest(str(command_id))[:10], secrets.token_hex(4))
+    os.mkdir(os.path.join(host, folder), 0o755)
+    staged = []
+    for attachment in attachments:
+        target = os.path.join(host, folder, attachment["fileName"])
+        shutil.copyfile(attachment["localPath"], target)
+        os.chmod(target, 0o644)
+        staged.append((attachment, "{}/{}/{}".format(inside, folder, attachment["fileName"])))
+    return staged
+
+
+def dialog_windows(desktop):
+    return {int(w["id"]): w for w in desktop.windows() if w.get("type") == "dialog" and w.get("mapped")}
+
+
+def pick_file(desktop, driver, window_id, button, path):
+    """Opens the chat's file picker with the toolbar `button` and chooses `path` in it. WeChat's picker is a Qt dialog
+    with an accessible file name field; QQ's is a GTK dialog without accessibility, driven from its location bar."""
+    ref = desktop.ref(window_id, r'button "{}"'.format(re.escape(button)))
+    if not ref:
+        raise AdapterError("file_button_not_found")
+    before = set(dialog_windows(desktop))
+    desktop.tool("click", ref=ref)
+    dialog = None
+    for _ in range(10):
+        time.sleep(0.5)
+        opened = [key for key in dialog_windows(desktop) if key not in before]
+        if opened:
+            dialog = opened[0]
+            break
+    if dialog is None:
+        raise AdapterError("file_dialog_missing")
+    if driver == "wechat":
+        field = desktop.ref(dialog, r'text "文件名称')
+        if field:
+            desktop.tool("click", ref=field)
+            clear_input(desktop)
+            type_chars(desktop, path)
+            desktop.tool("key", keys="Return")
+    else:
+        desktop.activate(dialog)
+        desktop.tool("key", keys="ctrl+l")
+        time.sleep(0.4)
+        type_chars(desktop, path)
+        time.sleep(0.3)
+        desktop.tool("key", keys="Return")
+    for _ in range(10):
+        time.sleep(0.5)
+        if dialog not in dialog_windows(desktop):
+            return
+    desktop.tool("window", action="close", window=dialog)
+    raise AdapterError("file_not_chosen")
+
+
+def message_tail(driver, tree):
+    """The last entries of the open chat's message list: list item names in WeChat, (role, text) leaves in QQ."""
+    if driver == "wechat":
+        messages = find(tree, lambda n: n.get("role") == "list" and n.get("name") == "消息")
+        return [n.get("name") or "" for n in (messages.get("children") or []) if n.get("role") == "list item"][-6:] \
+            if messages else []
+    messages = find(tree, lambda n: n.get("name") == "消息列表")
+    leaves = [(n.get("role"), text_of(n)) for n in walk(messages)
+              if n.get("role") == "image" or (n.get("role") == "static" and text_of(n))] if messages else []
+    return leaves[-16:]
+
+
+def file_landed(driver, tail, before, attachment, as_image):
+    if tail == before or not tail:
+        return False
+    name = attachment["fileName"]
+    if driver == "wechat":
+        last = tail[-1]
+        if last.startswith("文件\n" + name + "\n"):
+            return True
+        return as_image and last in ("图片", "动画表情")
+    if as_image:
+        return tail[-1][0] == "image"
+    statics = [text for role, text in tail if role == "static"]
+    return bool(statics) and statics[-1].endswith("已发送") and name in "".join(statics)
+
+
+def qq_file_confirmation(tree, name, file_name):
+    """QQ asks before sending a file: "发送给 <chat>", the file name, and a 发送(n) button."""
+    target = find(tree, lambda n: n.get("role") == "static" and text_of(n).startswith("发送给 "))
+    if target is None:
+        return False
+    chat = text_of(target)[len("发送给 "):].rstrip("…. ")
+    if not chat or not (chat == name or name.startswith(chat)):
+        return False
+    return any(n.get("role") == "paragraph" and "".join(text_of(c) for c in walk(n) if c is not n) == file_name
+               for n in walk(tree))
+
+
+def send_file(desktop, driver, window_id, name, attachment, path):
+    """Puts one file in the chat and sends it. Returns the tail to verify against; raises AdapterError before the
+    file is sent and returns normally once the client was told to send it."""
+    tree = desktop.tree(window_id)
+    before = message_tail(driver, tree)
+    as_image = attachment["mimeType"] in IMAGE_TYPES
+    if driver == "wechat":
+        pick_file(desktop, driver, window_id, "发送文件", path)
+        time.sleep(0.8)
+        node, held = chat_input(driver, desktop.tree(window_id), name, loose=True)
+        if node is None or collapse(held) != "￼":
+            clear_input(desktop)
+            raise AdapterError("input_mismatch")
+        desktop.tool("key", keys="Return")
+        return before, as_image
+    image_button = as_image and desktop.ref(window_id, r'button "图片"')
+    if image_button:
+        pick_file(desktop, driver, window_id, "图片", path)
+        time.sleep(0.8)
+        node, _ = chat_input(driver, desktop.tree(window_id), name, loose=True)
+        held = "".join(text_of(n) or (n.get("text") or "") for n in walk(node) if n.get("role") == "paragraph") \
+            if node else ""
+        if node is None or re.sub(r"[\s​]", "", held) != "￼":
+            clear_input(desktop)
+            raise AdapterError("input_mismatch")
+        ref = desktop.ref(window_id, r'button "发送"')
+        if not ref:
+            clear_input(desktop)
+            raise AdapterError("send_button_not_found")
+        desktop.tool("click", ref=ref)
+        return before, True
+    pick_file(desktop, driver, window_id, "文件", path)
+    time.sleep(1)
+    tree = desktop.tree(window_id)
+    ref = desktop.ref(window_id, r'button "发送\(\d+\)"')
+    if not ref or not qq_file_confirmation(tree, name, attachment["fileName"]):
+        close = desktop.ref(window_id, r'button "关闭"')
+        if close:
+            desktop.tool("click", ref=close)
+        raise AdapterError("file_confirmation_mismatch")
+    desktop.tool("click", ref=ref)
+    return before, False
+
+
+def wait_for(check, seconds):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        time.sleep(1)
+        if check():
+            return True
+    return False
+
+
+def echo_texts(attachment):
+    """Chat-list previews the client may show for a file this adapter sent."""
+    name = attachment["fileName"]
+    if attachment["mimeType"] in IMAGE_TYPES:
+        return ["[图片]", "[动画表情]", "[表情]", name, "[文件]" + name]
+    return [name, "[文件]" + name, "[文件] " + name]
+
+
+def valid_attachments(request):
+    attachments = request.get("attachments") or []
+    if not isinstance(attachments, list) or len(attachments) > MAX_ATTACHMENTS:
+        return None
+    for attachment in attachments:
+        if not isinstance(attachment, dict) or not isinstance(attachment.get("fileName"), str) \
+                or not SAFE_FILE_NAME.match(attachment["fileName"]) or attachment["fileName"] in (".", "..") \
+                or attachment["fileName"].startswith(".") or not isinstance(attachment.get("mimeType"), str) \
+                or not isinstance(attachment.get("localPath"), str) or not os.path.isfile(attachment["localPath"]):
+            return None
+    return attachments
+
+
 def send(request, config):
-    """One approved send. Failures before the text is sent report `dispatched: false`; once it may have gone out,
-    a result that cannot be confirmed reports neither a receipt nor `dispatched: false`, which the runtime treats as
-    uncertain and never retries on its own."""
+    """One approved send: each file, then the text. Failures before anything was sent report `dispatched: false`;
+    once something may have gone out, a result that cannot be confirmed reports neither a receipt nor
+    `dispatched: false`, which the runtime treats as uncertain and never retries on its own."""
     driver = request.get("driver")
     body = request.get("body") if isinstance(request.get("body"), str) else ""
     body = body.replace("\r\n", "\n").strip()
     if driver not in APPS:
         return {"ok": False, "dispatched": False, "error": "driver_unsupported"}
-    if request.get("attachments"):
-        return {"ok": False, "dispatched": False, "error": "attachments_unsupported"}
-    if not body or len(body) > MAX_BODY:
+    attachments = valid_attachments(request)
+    if attachments is None:
+        return {"ok": False, "dispatched": False, "error": "invalid_attachments"}
+    if (not body and not attachments) or len(body) > MAX_BODY:
         return {"ok": False, "dispatched": False, "error": "invalid_body"}
     conversation = request.get("conversationExternalId")
+    dispatched = False
+
+    def refused(error):
+        # After a file went out, a later refusal still leaves the command partly sent.
+        return {"ok": False, "error": error} if dispatched else {"ok": False, "dispatched": False, "error": error}
+
     try:
-        desktop, _ = container(config, request.get("profile"))
+        desktop, entry = container(config, request.get("profile"))
         state = load_state()
         target = state["conversations"].get(conversation) if isinstance(conversation, str) else None
         if not target:
-            return {"ok": False, "dispatched": False, "error": "conversation_unknown"}
+            return refused("conversation_unknown")
         name = target["name"]
+        staged = outgoing_files(entry, attachments, request.get("commandId")) if attachments else []
         window_id, tree = open_client(desktop, driver)
         desktop.activate(window_id)
         tree = open_conversation(desktop, driver, window_id, tree, name, bool(target.get("folder")))
         node, draft = chat_input(driver, tree, name, loose=True)
         if collapse(draft):
-            return {"ok": False, "dispatched": False, "error": "draft_present"}
+            return refused("draft_present")
+        for attachment, path in staged:
+            before, as_image = send_file(desktop, driver, window_id, name, attachment, path)
+            dispatched = True
+            if not wait_for(lambda: file_landed(driver, message_tail(driver, desktop.tree(window_id)), before,
+                                                attachment, as_image), FILE_SEND_WAIT_S):
+                return {"ok": False, "error": "send_unverified"}
+        now = int(time.time() * 1000)
+        if not body:
+            state["recent"].setdefault(conversation, []).append(
+                {"ts": [digest(collapse(text)) for text in echo_texts(attachments[-1])], "at": now})
+            save_state(state)
+            return {"ok": True, "receipt": "{}:{}:{}".format(conversation, digest(json.dumps(
+                [a["fileName"] for a in attachments], ensure_ascii=False)), now)}
+        tree = desktop.tree(window_id)
         before_text, before_count = last_message(driver, tree)
         type_text(desktop, driver, window_id, tree, name, body)
         time.sleep(0.6)
@@ -725,9 +1104,11 @@ def send(request, config):
         node, typed = chat_input(driver, tree, name, loose=True)
         if node is None or collapse(typed) != collapse(body):
             clear_input(desktop)
-            return {"ok": False, "dispatched": False, "error": "input_mismatch"}
+            return refused("input_mismatch")
     except AdapterError as error:
-        return {"ok": False, "dispatched": False, "error": str(error)}
+        return refused(str(error))
+    except OSError:
+        return refused("attachment_staging_failed")
 
     try:
         if driver == "qq":

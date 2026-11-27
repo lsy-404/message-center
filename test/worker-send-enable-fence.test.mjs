@@ -148,7 +148,7 @@ test('enabling send_text quarantines preexisting pending and leased commands wit
     FROM commands WHERE id = ?
   `).get(commandId);
   const pendingResult = state(pending.commandId);
-  assert.equal(pendingResult.state, 'manual_review');
+  assert.equal(pendingResult.state, 'failed');
   assert.equal(pendingResult.payload_json, pending.payload);
   assert.deepEqual(JSON.parse(pendingResult.result_json), {
     error: 'capability_enabled_old_command_review', dispatched: false,
@@ -171,12 +171,12 @@ test('enabling send_text quarantines preexisting pending and leased commands wit
 
   for (const message of [pending, expiredLease, activeLease]) {
     assert.equal(database.prepare('SELECT delivery_state FROM messages WHERE id = ?')
-      .get(message.messageId).delivery_state, 'uncertain');
+      .get(message.messageId).delivery_state, message === pending ? 'failed' : 'uncertain');
     assert.equal(database.prepare('SELECT body FROM messages WHERE id = ?')
       .get(message.messageId).body, `body-${message.commandId.slice('command-'.length)}`);
   }
   assert.equal(database.prepare('SELECT state FROM attachments WHERE id = ?')
-    .get('attachment-old-pending').state, 'uncertain');
+    .get('attachment-old-pending').state, 'failed');
   assert.equal(database.prepare('SELECT delivery_state FROM messages WHERE id = ?')
     .get(completed.messageId).delivery_state, 'delivered');
   assert.equal(database.prepare(`
@@ -214,7 +214,7 @@ test('repeated concurrent registration does not quarantine commands created afte
   const responses = await Promise.all([register(harness), register(harness)]);
   assert.deepEqual(responses.map((response) => response.status), [201, 201]);
   assert.equal(database.prepare('SELECT state FROM commands WHERE id = ?')
-    .get(old.commandId).state, 'manual_review');
+    .get(old.commandId).state, 'failed');
   assert.equal(database.prepare('SELECT state FROM commands WHERE id = ?')
     .get(fresh.commandId).state, 'pending');
   assert.equal(database.prepare(`
@@ -265,7 +265,7 @@ test('registration batch rolls back command review if message state update fails
     'rollback', 'pending');
   database.exec(`
       CREATE TRIGGER reject_manual_review BEFORE UPDATE OF delivery_state ON messages
-      WHEN NEW.delivery_state = 'uncertain'
+      WHEN NEW.delivery_state = 'failed'
       BEGIN SELECT RAISE(ABORT, 'message_review_rejected'); END
   `);
 

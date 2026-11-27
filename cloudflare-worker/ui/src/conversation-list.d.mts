@@ -30,7 +30,7 @@ export function enterConversationListFolder(path: unknown, folderId: unknown): s
 export function buildConversationListModel<T extends Record<string, any>>(
   conversations: T[], options?: {
     path?: unknown
-    scopeKind?: 'qq' | 'wechat'
+    scopeKinds?: Array<'qq' | 'wechat'>
     selectedId?: string
     rootTitle?: string
   },
@@ -41,7 +41,7 @@ export function buildConversationListModel<T extends Record<string, any>>(
   conversations: T[]
   scopeConversations: T[]
   selectionConversations: T[]
-  folder: null | { kind: 'folder', id: string, title: string, count: number, unreadCount: number, active: boolean }
+  folders: Array<{ kind: 'folder', id: string, title: string, count: number, unreadCount: number, active: boolean }>
 }
 export function resolveConversationSelection<T extends { id: string }>(
   conversations: T[], selectedId: string,

@@ -237,7 +237,14 @@ const isQQRootScope = computed(() => activeFilter.value === 'protocol:qq'
     && normalizeChannelLabel(activeFilter.value.slice('channel:'.length)) === 'QQ'))
 const isWeChatRootScope = computed(() => activeFilter.value.startsWith('channel:')
   && normalizeChannelLabel(activeFilter.value.slice('channel:'.length)) === '微信')
-const folderScopeKind = computed(() => isQQRootScope.value ? 'qq' : isWeChatRootScope.value ? 'wechat' : undefined)
+const folderScopeKinds = computed<Array<'qq' | 'wechat'>>(() => {
+  const connector = activeConnectorId.value
+    ? snapshot.value.connectors.find((item) => item.id === activeConnectorId.value)
+    : undefined
+  if (connector) return connector.kind === 'qq' || connector.kind === 'wechat' ? [connector.kind] : []
+  if (activeFilter.value === 'all') return ['qq', 'wechat']
+  return isQQRootScope.value ? ['qq'] : isWeChatRootScope.value ? ['wechat'] : []
+})
 const conversationFilterOptions = () => ({
   connectorKind: activeFilter.value === 'protocol:qq' ? 'qq' : undefined,
   connectorId: activeConnectorId.value,
@@ -252,15 +259,14 @@ const filteredConversations = computed(() => filterConversations(
 ))
 const conversationListModel = computed(() => buildConversationListModel(filteredConversations.value, {
   path: conversationListPath.value,
-  scopeKind: folderScopeKind.value,
+  scopeKinds: folderScopeKinds.value,
   selectedId: selectedId.value,
   rootTitle: activeFilterLabel.value,
 }))
 const displayedConversations = computed(() => conversationListModel.value.conversations)
 const displayedUnread = computed(() => unreadTotal(conversationListModel.value.scopeConversations))
 const displayedConversationCount = computed(() => conversationListModel.value.scopeConversations.length)
-const listFolder = computed(() => conversationListModel.value.folder)
-const listFolderUnit = computed(() => getConversationFolder(listFolder.value?.id)?.unit ?? '')
+const listFolders = computed(() => conversationListModel.value.folders)
 const conversationListTitle = computed(() => conversationListPath.value.length
   ? getConversationFolder(conversationListPath.value[0])?.title ?? '' : activeFilterLabel.value)
 const conversationListBreadcrumbs = computed(() => [
@@ -769,7 +775,7 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
       const scopedConversations = filterConversations(body.conversations, conversationFilterOptions())
       const listModel = buildConversationListModel(scopedConversations, {
         path: conversationListPath.value,
-        scopeKind: folderScopeKind.value,
+        scopeKinds: folderScopeKinds.value,
         selectedId: selectedId.value,
       })
       const selection = resolveConversationSelection(listModel.selectionConversations, selectedId.value)
@@ -838,7 +844,7 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
 
 async function selectConversation(conversation: Conversation, openMobileThread = true) {
   const folder = conversationFolderOf(conversation)
-  if (folder && folder.scopeKind === folderScopeKind.value && !conversationListPath.value.length) {
+  if (folder && folderScopeKinds.value.includes(folder.scopeKind) && !conversationListPath.value.length) {
     conversationListPath.value = enterConversationListFolder([], folder.id)
   }
   cancelInboxRead()
@@ -900,10 +906,9 @@ function selectFilter(id: string, connectorId = '') {
   applyConversationSelection(conversationListModel.value.selectionConversations)
 }
 
-function enterListFolder() {
-  const folder = conversationListModel.value.folder
-  if (!folder || !canEnterConversationListFolder(conversationListPath.value)) return
-  conversationListPath.value = enterConversationListFolder(conversationListPath.value, folder.id)
+function enterListFolder(folderId: string) {
+  if (!canEnterConversationListFolder(conversationListPath.value)) return
+  conversationListPath.value = enterConversationListFolder(conversationListPath.value, folderId)
   mobileThread.value = false
   applyConversationSelection(conversationListModel.value.selectionConversations)
 }
@@ -977,14 +982,17 @@ function selectNativeDesktop(key: string) {
 
 async function uploadFiles(event: Event) {
   const input = event.currentTarget as HTMLInputElement
+  await stageFiles(Array.from(input.files || []))
+  input.value = ''
+}
+
+async function stageFiles(selectedFiles: File[]) {
   const targetConversationId = selectedId.value
   const targetCapabilities = [...(selectedConversation.value?.capabilities ?? [])]
   const targetDeviceConversation = selectedConversationConnector.value?.mode === 'device_relay'
-  if (!targetConversationId) return
-  const selectedFiles = Array.from(input.files || [])
+  if (!targetConversationId || uploadingConversationIds.value.has(targetConversationId)) return
   if (targetDeviceConversation && staged.value.length + selectedFiles.length > 1) {
     notify('设备接入请每次单独发送一个附件')
-    input.value = ''
     return
   }
   uploadingConversationIds.value = new Set([...uploadingConversationIds.value, targetConversationId])
@@ -1023,9 +1031,60 @@ async function uploadFiles(event: Event) {
     const remaining = new Set(uploadingConversationIds.value)
     remaining.delete(targetConversationId)
     uploadingConversationIds.value = remaining
-    input.value = ''
   }
 }
+
+type Sticker = { id: string, fileName: string, mimeType: string, sizeBytes: number, sha256: string }
+const stickerOpen = ref(false)
+const stickers = ref<Sticker[] | null>(null)
+const stickersLoading = ref(false)
+const stickersFailed = ref(false)
+const stickerPicker = ref<HTMLElement | null>(null)
+const canSendImages = computed(() => canSendFiles.value && supportsAttachment(
+  selectedConversation.value?.capabilities ?? [], 'image/gif', 'sticker.gif',
+))
+
+async function loadStickers() {
+  stickersLoading.value = true
+  stickersFailed.value = false
+  try {
+    stickers.value = (await api<{ stickers: Sticker[] }>('/api/stickers')).stickers
+  } catch {
+    stickersFailed.value = true
+  } finally {
+    stickersLoading.value = false
+  }
+}
+
+function toggleStickers() {
+  stickerOpen.value = !stickerOpen.value
+  if (stickerOpen.value && (stickers.value === null || stickersFailed.value) && !stickersLoading.value) void loadStickers()
+}
+
+async function pickSticker(sticker: Sticker) {
+  stickerOpen.value = false
+  try {
+    const response = await fetch(`/api/files/${encodeURIComponent(sticker.id)}`, { credentials: 'same-origin' })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const blob = await response.blob()
+    await stageFiles([new File([blob], sticker.fileName, { type: sticker.mimeType })])
+  } catch (error) {
+    notify(`表情加载失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+function onStickerPointer(event: PointerEvent) {
+  if (stickerOpen.value && !stickerPicker.value?.contains(event.target as Node)) stickerOpen.value = false
+}
+
+function onStickerKeydown(event: KeyboardEvent) {
+  if (event.key !== 'Escape' || !stickerOpen.value) return
+  stickerOpen.value = false
+  stickerPicker.value?.querySelector<HTMLElement>('.sticker-toggle')?.focus()
+}
+
+watch(selectedId, () => { stickerOpen.value = false })
+watch(canSendImages, (value) => { if (!value) stickerOpen.value = false })
 
 async function removeStaged(index: number) {
   const [removed] = staged.value.splice(index, 1)
@@ -1149,6 +1208,8 @@ onMounted(() => {
   refreshLoop.start(true)
   clockTimer = window.setInterval(() => { nowTick.value = Date.now() }, 60_000)
   window.addEventListener('pageshow', onPageShow)
+  document.addEventListener('pointerdown', onStickerPointer)
+  document.addEventListener('keydown', onStickerKeydown)
   window.addEventListener('pagehide', onOffline)
   window.addEventListener('online', onOnline)
   window.addEventListener('offline', onOffline)
@@ -1156,6 +1217,8 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  document.removeEventListener('pointerdown', onStickerPointer)
+  document.removeEventListener('keydown', onStickerKeydown)
   refreshLoop?.stop()
   cancelInboxRead()
   if (toastTimer) window.clearTimeout(toastTimer)
@@ -1337,17 +1400,17 @@ onUnmounted(() => {
         </div>
 
         <ul class="conversation-items">
-          <li v-if="listFolder" :key="listFolder.id">
+          <li v-for="listFolder in listFolders" :key="listFolder.id">
             <button
               class="conversation-row conversation-folder-row"
               :class="{ active: listFolder.active, unread: listFolder.unreadCount > 0 }"
               type="button"
-              :aria-label="`${listFolder.title}，${listFolder.count} ${listFolderUnit}，${listFolder.unreadCount} 条未读`"
+              :aria-label="`${listFolder.title}，${listFolder.count} ${getConversationFolder(listFolder.id)?.unit ?? ''}，${listFolder.unreadCount} 条未读`"
               :aria-current="listFolder.active ? 'true' : undefined"
               :data-list-folder="listFolder.id"
               :data-folder-count="listFolder.count"
               :data-unread-count="listFolder.unreadCount"
-              @click="enterListFolder"
+              @click="enterListFolder(listFolder.id)"
             >
               <span class="avatar conversation-avatar folder-avatar" aria-hidden="true">
                 <AppIcon name="group" :size="18" />
@@ -1358,7 +1421,7 @@ onUnmounted(() => {
                   <AppIcon name="arrowRight" :size="14" aria-hidden="true" />
                 </span>
                 <span class="conversation-meta-row">
-                  <span class="conversation-preview">{{ listFolder.count }} {{ listFolderUnit }}</span>
+                  <span class="conversation-preview">{{ listFolder.count }} {{ getConversationFolder(listFolder.id)?.unit }}</span>
                   <span v-if="listFolder.unreadCount" class="unread-count" aria-hidden="true">
                     {{ listFolder.unreadCount > 99 ? '99+' : listFolder.unreadCount }}
                   </span>
@@ -1665,6 +1728,39 @@ onUnmounted(() => {
                   @change="uploadFiles"
                 >
               </label>
+              <div v-if="canSendImages" ref="stickerPicker" class="sticker-picker">
+                <button
+                  type="button"
+                  class="quiet-button sticker-toggle"
+                  title="表情"
+                  aria-label="表情"
+                  aria-haspopup="dialog"
+                  :aria-expanded="stickerOpen"
+                  :disabled="uploadingConversationIds.has(selectedId)"
+                  @click="toggleStickers"
+                >
+                  <AppIcon name="sticker" :size="18" />
+                </button>
+                <div v-if="stickerOpen" class="sticker-popover" role="dialog" aria-label="表情">
+                  <span v-if="stickersLoading" class="sticker-state"><span class="spinner small" />正在加载</span>
+                  <span v-else-if="stickersFailed" class="sticker-state">
+                    加载失败 <button type="button" class="sticker-retry" @click="loadStickers">重试</button>
+                  </span>
+                  <span v-else-if="!stickers?.length" class="sticker-state">还没有收到过表情</span>
+                  <div v-else class="sticker-grid">
+                    <button
+                      v-for="sticker in stickers"
+                      :key="sticker.id"
+                      type="button"
+                      class="sticker-item"
+                      :aria-label="`发送表情 ${sticker.fileName}`"
+                      @click="pickSticker(sticker)"
+                    >
+                      <img :src="`/api/files/${encodeURIComponent(sticker.id)}`" :alt="sticker.fileName" loading="lazy">
+                    </button>
+                  </div>
+                </div>
+              </div>
               <span v-if="uploadingConversationIds.has(selectedId)" class="capability-hint"><span class="spinner small" />正在上传</span>
               <span v-else-if="!canSendFiles && canSendText" class="capability-hint">此会话不支持发送附件</span>
               <span

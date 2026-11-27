@@ -28,7 +28,7 @@ test('QQ group assistant membership requires QQ, group type, and observed folded
 
 test('QQ root shows one group-assistant folder row and keeps non-assistant conversations at level one', () => {
   const model = buildConversationListModel(qqConversations, {
-    scopeKind: 'qq',
+    scopeKinds: ['qq'],
     selectedId: 'folded',
     rootTitle: 'QQ',
   })
@@ -36,47 +36,47 @@ test('QQ root shows one group-assistant folder row and keeps non-assistant conve
   assert.equal(model.level, 1)
   assert.equal(model.title, 'QQ')
   assert.deepEqual(model.conversations.map(({ id }) => id), ['normal-group', 'direct', 'unknown-placement'])
-  assert.deepEqual(model.folder, {
+  assert.deepEqual(model.folders, [{
     kind: 'folder', id: QQ_GROUP_ASSISTANT_FOLDER_ID, title: '群助手', count: 2, unreadCount: 2, active: true,
-  })
+  }])
   assert.ok(model.selectionConversations.some(({ id }) => id === 'folded'))
 })
 
 test('opening 群助手 is a flat second-level group list across the observed placements', () => {
   const path = enterConversationListFolder([], QQ_GROUP_ASSISTANT_FOLDER_ID)
-  const model = buildConversationListModel(qqConversations, { path, scopeKind: 'qq' })
+  const model = buildConversationListModel(qqConversations, { path, scopeKinds: ['qq'] })
 
   assert.deepEqual(path, [QQ_GROUP_ASSISTANT_FOLDER_ID])
   assert.equal(model.level, 2)
   assert.deepEqual(model.conversations.map(({ id }) => id), ['folded', 'message-box'])
   assert.deepEqual(new Set(model.conversations.map(({ placement }) => placement)), new Set(['folded', 'message_box']))
-  assert.equal(model.folder, null, 'placement is not a fabricated child-folder hierarchy')
+  assert.deepEqual(model.folders, [], 'placement is not a fabricated child-folder hierarchy')
 })
 
 test('search and unread filters determine folder presence and counts within the QQ root scope', () => {
   const searched = buildConversationListModel(filterConversations(qqConversations, { query: 'box group' }), {
-    scopeKind: 'qq',
+    scopeKinds: ['qq'],
   })
-  assert.deepEqual(searched.folder && [searched.folder.count, searched.folder.unreadCount], [1, 0])
+  assert.deepEqual([searched.folders[0].count, searched.folders[0].unreadCount], [1, 0])
 
   const unread = buildConversationListModel(filterConversations(qqConversations, { unreadOnly: true }), {
-    scopeKind: 'qq',
+    scopeKinds: ['qq'],
   })
-  assert.deepEqual(unread.folder && [unread.folder.count, unread.folder.unreadCount], [1, 2])
+  assert.deepEqual([unread.folders[0].count, unread.folders[0].unreadCount], [1, 2])
   assert.deepEqual(unread.conversations.map(({ id }) => id), ['normal-group', 'direct'])
 
   const noMatchingAssistant = buildConversationListModel(
-    filterConversations(qqConversations, { query: 'no matching group' }), { scopeKind: 'qq' },
+    filterConversations(qqConversations, { query: 'no matching group' }), { scopeKinds: ['qq'] },
   )
-  assert.equal(noMatchingAssistant.folder, null)
+  assert.deepEqual(noMatchingAssistant.folders, [])
 })
 
 test('selection remains attached to a nested group at the QQ root and is scope-bound inside 群助手', () => {
-  const root = buildConversationListModel(qqConversations, { scopeKind: 'qq', selectedId: 'folded' })
+  const root = buildConversationListModel(qqConversations, { scopeKinds: ['qq'], selectedId: 'folded' })
   assert.equal(resolveConversationSelection(root.selectionConversations, 'folded').action, 'keep')
 
   const groupPath = [QQ_GROUP_ASSISTANT_FOLDER_ID]
-  const assistant = buildConversationListModel(qqConversations, { path: groupPath, scopeKind: 'qq' })
+  const assistant = buildConversationListModel(qqConversations, { path: groupPath, scopeKinds: ['qq'] })
   assert.equal(resolveConversationSelection(assistant.selectionConversations, 'message-box').action, 'keep')
   assert.deepEqual(resolveConversationSelection(assistant.selectionConversations, 'wechat-selection'), {
     action: 'select', conversation: assistant.conversations[0],
@@ -96,8 +96,8 @@ test('conversation navigation is bounded to three list levels', () => {
 })
 
 test('the all-channel inbox remains flat and shows QQ group conversations as conversations', () => {
-  const model = buildConversationListModel(conversations, { scopeKind: undefined })
-  assert.equal(model.folder, null)
+  const model = buildConversationListModel(conversations, { scopeKinds: [] })
+  assert.deepEqual(model.folders, [])
   assert.deepEqual(model.conversations.map(({ id }) => id), conversations.map(({ id }) => id))
 })
 
