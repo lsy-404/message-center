@@ -645,6 +645,7 @@ async function upsertConversationProfile(request, env, ctx, conversationExternal
   const suppliedConversationType = String(request.headers.get("x-conversation-type") || "").trim().toLowerCase();
   const suppliedPlacement = String(request.headers.get("x-conversation-placement") || "").trim().toLowerCase();
   const suppliedPinned = String(request.headers.get("x-conversation-pinned") || "").trim();
+  const suppliedMuted = String(request.headers.get("x-conversation-muted") || "").trim();
   const suppliedUnreadText = String(request.headers.get("x-conversation-unread-count") || "").trim();
   const suppliedUnreadObservedText = String(request.headers.get("x-conversation-unread-observed-at") || "").trim();
   let suppliedLastPreview = "";
@@ -660,6 +661,7 @@ async function upsertConversationProfile(request, env, ctx, conversationExternal
   if ((suppliedConversationType && !conversationTypes.has(suppliedConversationType)) ||
       (suppliedPlacement && !placements.has(suppliedPlacement)) ||
       (suppliedPinned && suppliedPinned !== "0" && suppliedPinned !== "1") ||
+      (suppliedMuted && suppliedMuted !== "0" && suppliedMuted !== "1") ||
       (suppliedUnreadText && !/^\d{1,7}$/.test(suppliedUnreadText)) ||
       (suppliedUnreadObservedText && !suppliedUnreadObservedAt) ||
       suppliedLastPreview.length > 500 || (suppliedLastAtText && !suppliedLastAt)) {
@@ -726,6 +728,8 @@ async function upsertConversationProfile(request, env, ctx, conversationExternal
         WHERE p.connector_id = ? AND p.conversation_external_id = ?) AS channel_label,
       (SELECT p.is_pinned FROM conversation_profiles p
         WHERE p.connector_id = ? AND p.conversation_external_id = ?) AS is_pinned,
+      (SELECT p.is_muted FROM conversation_profiles p
+        WHERE p.connector_id = ? AND p.conversation_external_id = ?) AS is_muted,
       COALESCE(
         (SELECT CASE WHEN json_valid(m.metadata_json)
           THEN json_extract(m.metadata_json, '$.conversationType') END
@@ -766,6 +770,7 @@ async function upsertConversationProfile(request, env, ctx, conversationExternal
       connectorId, conversationExternalId,
       connectorId, conversationExternalId,
       connectorId, conversationExternalId,
+      connectorId, conversationExternalId,
     ).first();
   } catch (error) {
     if (uploadedAvatarKey) await env.FILES.delete(uploadedAvatarKey).catch(() => {});
@@ -778,6 +783,7 @@ async function upsertConversationProfile(request, env, ctx, conversationExternal
   const placement = (suppliedPlacement && suppliedPlacement !== "unknown" ? suppliedPlacement : "") ||
     (placements.has(previous?.placement) ? previous.placement : "unknown");
   const isPinned = suppliedPinned ? suppliedPinned === "1" : Boolean(previous?.is_pinned);
+  const isMuted = suppliedMuted ? suppliedMuted === "1" : Boolean(previous?.is_muted);
   const suppliedUnreadCount = suppliedUnreadText ? Math.min(Number(suppliedUnreadText), 1_000_000) : null;
   // Never manufacture a waterline: without a device observation time the count
   // is only a lower bound and reconciliation must take the conservative branch.
@@ -788,16 +794,17 @@ async function upsertConversationProfile(request, env, ctx, conversationExternal
     await env.DB.batch([
     env.DB.prepare(`
       INSERT INTO conversation_profiles (
-        connector_id, conversation_external_id, display_name, channel_label, conversation_type, placement, is_pinned,
+        connector_id, conversation_external_id, display_name, channel_label, conversation_type, placement, is_pinned, is_muted,
         native_last_message_preview, native_last_message_at, native_unread_count, native_unread_observed_at,
         avatar_object_key, avatar_mime_type, avatar_size_bytes, avatar_sha256, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(connector_id, conversation_external_id) DO UPDATE SET
         display_name = excluded.display_name,
         channel_label = excluded.channel_label,
         conversation_type = excluded.conversation_type,
         placement = excluded.placement,
         is_pinned = excluded.is_pinned,
+        is_muted = excluded.is_muted,
         native_last_message_preview = CASE
           WHEN excluded.native_last_message_at IS NOT NULL AND
             (conversation_profiles.native_last_message_at IS NULL OR
@@ -830,7 +837,7 @@ async function upsertConversationProfile(request, env, ctx, conversationExternal
         avatar_size_bytes = COALESCE(excluded.avatar_size_bytes, conversation_profiles.avatar_size_bytes),
         avatar_sha256 = COALESCE(excluded.avatar_sha256, conversation_profiles.avatar_sha256),
         updated_at = excluded.updated_at
-    `).bind(connectorId, conversationExternalId, displayName, channelLabel, conversationType, placement, isPinned ? 1 : 0,
+    `).bind(connectorId, conversationExternalId, displayName, channelLabel, conversationType, placement, isPinned ? 1 : 0, isMuted ? 1 : 0,
       hasNativeSummary ? suppliedLastPreview : null, hasNativeSummary ? suppliedLastAt : null,
       suppliedUnreadCount, unreadObservedAt,
       avatar?.objectKey || null, avatar?.mimeType || null, avatar?.sizeBytes || null, avatar?.sha256 || null, stamp),
@@ -893,13 +900,13 @@ async function upsertConversationProfile(request, env, ctx, conversationExternal
   try {
     await audit(env, `connector:${connectorId}`, "conversation_profile_updated", conversationExternalId,
       { avatar: Boolean(avatar), avatarSha256: avatar?.sha256 || null, channelLabel,
-        conversationType, placement, isPinned, nativeSummary: Boolean(suppliedLastPreview && suppliedLastAt) });
+        conversationType, placement, isPinned, isMuted, nativeSummary: Boolean(suppliedLastPreview && suppliedLastAt) });
   } catch (error) {
     console.error(JSON.stringify({ event: "audit_write_failed", action: "conversation_profile_updated",
       message: error instanceof Error ? error.message : String(error) }));
   }
   return json({ ok: true, connectorId, conversationExternalId, avatar: Boolean(avatar),
-    channelLabel, conversationType, placement, pinned: isPinned }, 201);
+    channelLabel, conversationType, placement, pinned: isPinned, muted: isMuted }, 201);
 }
 
 async function downloadConversationAvatar(env, connectorId, conversationExternalId) {
@@ -1866,6 +1873,7 @@ async function readInbox(env, selectedConversationId) {
       COALESCE(p.conversation_type, 'unknown') AS conversation_type,
       COALESCE(p.placement, 'unknown') AS placement,
       COALESCE(p.is_pinned, 0) AS is_pinned,
+      COALESCE(p.is_muted, 0) AS is_muted,
       p.avatar_object_key, p.avatar_sha256,
       k.kind AS connector_kind, k.channel_label AS connector_channel_label,
       k.account_label, k.display_name AS connector_name,
@@ -1889,7 +1897,7 @@ async function readInbox(env, selectedConversationId) {
     connectorAccount: row.account_label, connectorName: row.connector_name,
     connectorChannelLabel: row.conversation_channel_label || row.connector_channel_label || row.connector_kind,
     conversationType: row.conversation_type, placement: row.placement,
-    pinned: Boolean(row.is_pinned), title: row.profile_title,
+    pinned: Boolean(row.is_pinned), muted: Boolean(row.is_muted), title: row.profile_title,
     avatarLabel: row.avatar_label, trustTier: row.trust_tier, unreadCount: row.unread_count,
     avatarPath: row.avatar_object_key
       ? `/api/avatars/${encodeURIComponent(row.connector_id)}/${encodeURIComponent(row.external_id)}?v=${encodeURIComponent(row.avatar_sha256 || "")}` : null,

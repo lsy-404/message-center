@@ -10,14 +10,53 @@ export function normalizeChannelLabel(value) {
   return label
 }
 
+export const WECHAT_FOLDED_CHATS_FOLDER_ID = 'wechat-folded-chats'
+
+function isFoldedPlacement(conversation) {
+  return conversation.placement === 'folded' || conversation.placement === 'message_box'
+}
+
+const CONVERSATION_FOLDERS = [
+  {
+    id: QQ_GROUP_ASSISTANT_FOLDER_ID,
+    scopeKind: 'qq',
+    title: '群助手',
+    unit: '个群聊',
+    contains: (conversation) => conversation.connectorKind === 'qq'
+      && conversation.conversationType === 'group'
+      && isFoldedPlacement(conversation),
+  },
+  {
+    id: WECHAT_FOLDED_CHATS_FOLDER_ID,
+    scopeKind: 'wechat',
+    title: '折叠的聊天',
+    unit: '个会话',
+    contains: (conversation) => (conversation.connectorKind === 'wechat'
+      || normalizeChannelLabel(conversation.connectorChannelLabel) === '微信')
+      && isFoldedPlacement(conversation),
+  },
+]
+
+export function getConversationFolder(folderId) {
+  return CONVERSATION_FOLDERS.find((folder) => folder.id === folderId) || null
+}
+
+export function conversationFolderOf(conversation) {
+  return CONVERSATION_FOLDERS.find((folder) => folder.contains(conversation)) || null
+}
+
 export function isQQGroupAssistantConversation(conversation) {
-  return conversation.connectorKind === 'qq'
-    && conversation.conversationType === 'group'
-    && (conversation.placement === 'folded' || conversation.placement === 'message_box')
+  return getConversationFolder(QQ_GROUP_ASSISTANT_FOLDER_ID).contains(conversation)
 }
 
 export function filterQQGroupAssistantConversations(conversations) {
   return conversations.filter(isQQGroupAssistantConversation)
+}
+
+export function unreadTotal(conversations) {
+  return conversations.reduce(
+    (total, conversation) => total + (conversation.muted ? 0 : Math.max(0, Number(conversation.unreadCount) || 0)), 0,
+  )
 }
 
 export function normalizeConversationListPath(path) {
@@ -40,32 +79,33 @@ export function enterConversationListFolder(path, folderId) {
 export function buildConversationListModel(conversations, options = {}) {
   const items = Array.isArray(conversations) ? conversations : []
   const path = normalizeConversationListPath(options.path)
-  const assistantConversations = filterQQGroupAssistantConversations(items)
-  const inGroupAssistant = path[0] === QQ_GROUP_ASSISTANT_FOLDER_ID
+  const openFolder = getConversationFolder(path[0])
 
-  if (inGroupAssistant) {
+  if (openFolder) {
+    const folderConversations = items.filter(openFolder.contains)
     return {
-      path: [QQ_GROUP_ASSISTANT_FOLDER_ID],
+      path: [openFolder.id],
       level: 2,
-      title: '群助手',
-      conversations: assistantConversations,
-      scopeConversations: assistantConversations,
-      selectionConversations: assistantConversations,
+      title: openFolder.title,
+      conversations: folderConversations,
+      scopeConversations: folderConversations,
+      selectionConversations: folderConversations,
       folder: null,
     }
   }
 
-  const qqRoot = options.qqRoot === true
-  const rootConversations = qqRoot
-    ? items.filter((conversation) => !isQQGroupAssistantConversation(conversation))
+  const scopeFolder = CONVERSATION_FOLDERS.find((folder) => folder.scopeKind === options.scopeKind) || null
+  const folderConversations = scopeFolder ? items.filter(scopeFolder.contains) : []
+  const rootConversations = scopeFolder
+    ? items.filter((conversation) => !scopeFolder.contains(conversation))
     : items
-  const selectedAssistant = options.selectedId
-    ? assistantConversations.find((conversation) => conversation.id === options.selectedId)
+  const selectedInFolder = options.selectedId
+    ? folderConversations.find((conversation) => conversation.id === options.selectedId)
     : null
-  const selectionConversations = selectedAssistant
-    ? [...rootConversations, selectedAssistant]
+  const selectionConversations = selectedInFolder
+    ? [...rootConversations, selectedInFolder]
     : rootConversations
-  const unreadCount = assistantConversations.reduce(
+  const unreadCount = folderConversations.reduce(
     (total, conversation) => total + Math.max(0, Number(conversation.unreadCount) || 0), 0,
   )
 
@@ -76,13 +116,13 @@ export function buildConversationListModel(conversations, options = {}) {
     conversations: rootConversations,
     scopeConversations: items,
     selectionConversations,
-    folder: qqRoot && assistantConversations.length ? {
+    folder: scopeFolder && folderConversations.length ? {
       kind: 'folder',
-      id: QQ_GROUP_ASSISTANT_FOLDER_ID,
-      title: '群助手',
-      count: assistantConversations.length,
+      id: scopeFolder.id,
+      title: scopeFolder.title,
+      count: folderConversations.length,
       unreadCount,
-      active: Boolean(selectedAssistant),
+      active: Boolean(selectedInFolder),
     } : null,
   }
 }

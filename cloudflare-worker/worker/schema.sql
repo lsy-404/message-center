@@ -152,6 +152,7 @@ CREATE TABLE IF NOT EXISTS conversation_profiles (
   conversation_type TEXT NOT NULL DEFAULT 'unknown',
   placement TEXT NOT NULL DEFAULT 'unknown',
   is_pinned INTEGER NOT NULL DEFAULT 0 CHECK(is_pinned IN (0, 1)),
+  is_muted INTEGER NOT NULL DEFAULT 0 CHECK(is_muted IN (0, 1)),
   native_last_message_preview TEXT,
   native_last_message_at TEXT,
   native_unread_count INTEGER CHECK(native_unread_count IS NULL OR native_unread_count >= 0),

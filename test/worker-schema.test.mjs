@@ -828,7 +828,7 @@ const explicitProfileResponse = await putProfile('profile-only-live', {
 assert.equal(explicitProfileResponse.status, 201);
 assert.deepEqual(await explicitProfileResponse.json(), {
   ok: true, connectorId, conversationExternalId: 'profile-only-live', avatar: false,
-  channelLabel: 'Channel A', conversationType: 'direct', placement: 'normal', pinned: true,
+  channelLabel: 'Channel A', conversationType: 'direct', placement: 'normal', pinned: true, muted: false,
 });
 const profileOnlyConversation = database.prepare(`
   SELECT id, title, unread_count, last_message_preview, last_message_at FROM conversations WHERE connector_id = ? AND external_id = ?

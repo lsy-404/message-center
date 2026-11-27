@@ -16,13 +16,14 @@ import {
   conversationPageCount,
   enterConversationListFolder,
   filterConversations,
-  isQQGroupAssistantConversation,
   MAX_CONVERSATION_LIST_LEVELS,
   normalizeChannelLabel,
   nextConversationPage,
   pageConversations,
   previousConversationPage,
-  QQ_GROUP_ASSISTANT_FOLDER_ID,
+  conversationFolderOf,
+  getConversationFolder,
+  unreadTotal,
   resolveConversationSelection,
 } from './conversation-list.mjs'
 import {
@@ -61,6 +62,7 @@ type Conversation = {
   conversationType?: string | null
   placement?: string | null
   pinned?: boolean
+  muted?: boolean
   title: string
   avatarLabel?: string | null
   avatarPath?: string | null
@@ -73,7 +75,7 @@ type Conversation = {
 
 type ConversationListItem = Pick<Conversation,
   'id' | 'title' | 'avatarLabel' | 'avatarPath' | 'unreadCount' | 'lastMessagePreview' | 'lastMessageAt' | 'placement'
-  | 'pinned' | 'conversationType'
+  | 'pinned' | 'muted' | 'conversationType'
 > & { channel: string }
 
 type Attachment = {
@@ -204,7 +206,7 @@ const filters = computed(() => {
   }
   const summarize = (items: Conversation[]) => ({
     count: items.length,
-    unread: items.reduce((total, item) => total + Math.max(0, Number(item.unreadCount) || 0), 0),
+    unread: unreadTotal(items),
   })
   const qqConversations = snapshot.value.conversations.filter((item) => item.connectorKind === 'qq')
   return [
@@ -233,6 +235,9 @@ const activeFilterLabel = computed(() => {
 const isQQRootScope = computed(() => activeFilter.value === 'protocol:qq'
   || (activeFilter.value.startsWith('channel:')
     && normalizeChannelLabel(activeFilter.value.slice('channel:'.length)) === 'QQ'))
+const isWeChatRootScope = computed(() => activeFilter.value.startsWith('channel:')
+  && normalizeChannelLabel(activeFilter.value.slice('channel:'.length)) === '微信')
+const folderScopeKind = computed(() => isQQRootScope.value ? 'qq' : isWeChatRootScope.value ? 'wechat' : undefined)
 const conversationFilterOptions = () => ({
   connectorKind: activeFilter.value === 'protocol:qq' ? 'qq' : undefined,
   connectorId: activeConnectorId.value,
@@ -247,20 +252,20 @@ const filteredConversations = computed(() => filterConversations(
 ))
 const conversationListModel = computed(() => buildConversationListModel(filteredConversations.value, {
   path: conversationListPath.value,
-  qqRoot: isQQRootScope.value,
+  scopeKind: folderScopeKind.value,
   selectedId: selectedId.value,
   rootTitle: activeFilterLabel.value,
 }))
 const displayedConversations = computed(() => conversationListModel.value.conversations)
-const displayedUnread = computed(() => conversationListModel.value.scopeConversations
-  .reduce((total, item) => total + Math.max(0, Number(item.unreadCount) || 0), 0))
+const displayedUnread = computed(() => unreadTotal(conversationListModel.value.scopeConversations))
 const displayedConversationCount = computed(() => conversationListModel.value.scopeConversations.length)
-const groupAssistantFolder = computed(() => conversationListModel.value.folder)
+const listFolder = computed(() => conversationListModel.value.folder)
+const listFolderUnit = computed(() => getConversationFolder(listFolder.value?.id)?.unit ?? '')
 const conversationListTitle = computed(() => conversationListPath.value.length
-  ? '群助手' : activeFilterLabel.value)
+  ? getConversationFolder(conversationListPath.value[0])?.title ?? '' : activeFilterLabel.value)
 const conversationListBreadcrumbs = computed(() => [
   activeFilterLabel.value,
-  ...conversationListPath.value.map((folderId) => folderId === QQ_GROUP_ASSISTANT_FOLDER_ID ? '群助手' : ''),
+  ...conversationListPath.value.map((folderId) => getConversationFolder(folderId)?.title ?? ''),
 ].filter(Boolean))
 const visibleConversations = computed(() => pageConversations(
   displayedConversations.value,
@@ -284,6 +289,7 @@ const conversationRows = computed<ConversationListItem[]>(() => visibleConversat
   lastMessageAt: conversation.lastMessageAt,
   placement: conversation.placement,
   pinned: conversation.pinned,
+  muted: conversation.muted,
   conversationType: conversation.conversationType,
   channel: channelLabel(conversation),
 })))
@@ -479,6 +485,7 @@ function isFolded(conversation: Pick<Conversation, 'placement'>) {
 function conversationStateText(conversation: ConversationListItem) {
   return [
     conversation.pinned ? '置顶' : '',
+    conversation.muted ? '免打扰' : '',
     conversation.conversationType === 'group' ? '群聊' : '',
     conversation.placement === 'message_box' ? '消息盒子' : conversation.placement === 'folded' ? '折叠聊天' : '',
     conversation.unreadCount ? `${conversation.unreadCount} 条未读` : '',
@@ -704,7 +711,7 @@ function sameInbox(left: Snapshot, right: Snapshot) {
         || a.conversationType !== b.conversationType
         || a.unreadCount !== b.unreadCount || a.lastMessagePreview !== b.lastMessagePreview
         || a.lastMessageAt !== b.lastMessageAt || a.placement !== b.placement
-        || a.pinned !== b.pinned || a.connectorState !== b.connectorState
+        || a.pinned !== b.pinned || a.muted !== b.muted || a.connectorState !== b.connectorState
         || a.capabilities.length !== b.capabilities.length
         || a.capabilities.some((value, itemIndex) => value !== b.capabilities[itemIndex])) return false
   }
@@ -762,7 +769,7 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
       const scopedConversations = filterConversations(body.conversations, conversationFilterOptions())
       const listModel = buildConversationListModel(scopedConversations, {
         path: conversationListPath.value,
-        qqRoot: isQQRootScope.value,
+        scopeKind: folderScopeKind.value,
         selectedId: selectedId.value,
       })
       const selection = resolveConversationSelection(listModel.selectionConversations, selectedId.value)
@@ -830,8 +837,9 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
 }
 
 async function selectConversation(conversation: Conversation, openMobileThread = true) {
-  if (isQQRootScope.value && isQQGroupAssistantConversation(conversation) && !conversationListPath.value.length) {
-    conversationListPath.value = enterConversationListFolder([], QQ_GROUP_ASSISTANT_FOLDER_ID)
+  const folder = conversationFolderOf(conversation)
+  if (folder && folder.scopeKind === folderScopeKind.value && !conversationListPath.value.length) {
+    conversationListPath.value = enterConversationListFolder([], folder.id)
   }
   cancelInboxRead()
   storeComposer()
@@ -892,9 +900,9 @@ function selectFilter(id: string, connectorId = '') {
   applyConversationSelection(conversationListModel.value.selectionConversations)
 }
 
-function enterQQGroupAssistant() {
+function enterListFolder() {
   const folder = conversationListModel.value.folder
-  if (!isQQRootScope.value || !folder || !canEnterConversationListFolder(conversationListPath.value)) return
+  if (!folder || !canEnterConversationListFolder(conversationListPath.value)) return
   conversationListPath.value = enterConversationListFolder(conversationListPath.value, folder.id)
   mobileThread.value = false
   applyConversationSelection(conversationListModel.value.selectionConversations)
@@ -1329,30 +1337,30 @@ onUnmounted(() => {
         </div>
 
         <ul class="conversation-items">
-          <li v-if="groupAssistantFolder" :key="groupAssistantFolder.id">
+          <li v-if="listFolder" :key="listFolder.id">
             <button
               class="conversation-row conversation-folder-row"
-              :class="{ active: groupAssistantFolder.active, unread: groupAssistantFolder.unreadCount > 0 }"
+              :class="{ active: listFolder.active, unread: listFolder.unreadCount > 0 }"
               type="button"
-              :aria-label="`群助手，${groupAssistantFolder.count} 个群聊，${groupAssistantFolder.unreadCount} 条未读`"
-              :aria-current="groupAssistantFolder.active ? 'true' : undefined"
-              :data-list-folder="groupAssistantFolder.id"
-              :data-folder-count="groupAssistantFolder.count"
-              :data-unread-count="groupAssistantFolder.unreadCount"
-              @click="enterQQGroupAssistant"
+              :aria-label="`${listFolder.title}，${listFolder.count} ${listFolderUnit}，${listFolder.unreadCount} 条未读`"
+              :aria-current="listFolder.active ? 'true' : undefined"
+              :data-list-folder="listFolder.id"
+              :data-folder-count="listFolder.count"
+              :data-unread-count="listFolder.unreadCount"
+              @click="enterListFolder"
             >
               <span class="avatar conversation-avatar folder-avatar" aria-hidden="true">
                 <AppIcon name="group" :size="18" />
               </span>
               <span class="conversation-copy">
                 <span class="conversation-title-row">
-                  <strong><span class="conversation-title">群助手</span></strong>
+                  <strong><span class="conversation-title">{{ listFolder.title }}</span></strong>
                   <AppIcon name="arrowRight" :size="14" aria-hidden="true" />
                 </span>
                 <span class="conversation-meta-row">
-                  <span class="conversation-preview">{{ groupAssistantFolder.count }} 个群聊</span>
-                  <span v-if="groupAssistantFolder.unreadCount" class="unread-count" aria-hidden="true">
-                    {{ groupAssistantFolder.unreadCount > 99 ? '99+' : groupAssistantFolder.unreadCount }}
+                  <span class="conversation-preview">{{ listFolder.count }} {{ listFolderUnit }}</span>
+                  <span v-if="listFolder.unreadCount" class="unread-count" aria-hidden="true">
+                    {{ listFolder.unreadCount > 99 ? '99+' : listFolder.unreadCount }}
                   </span>
                 </span>
               </span>
@@ -1366,6 +1374,7 @@ onUnmounted(() => {
                 pinned: conversation.pinned,
                 folded: isFolded(conversation),
                 unread: conversation.unreadCount > 0,
+                muted: conversation.muted,
               }"
               type="button"
               :aria-current="selectedId === conversation.id ? 'true' : undefined"
@@ -1404,6 +1413,7 @@ onUnmounted(() => {
                     <span class="conversation-title">{{ conversation.title }}</span>
                   </strong>
                   <AppIcon v-if="conversation.pinned" class="pin-icon" name="pin" :size="12" />
+                  <span v-if="conversation.muted" class="muted-icon" role="img" aria-label="免打扰"><AppIcon name="bellOff" :size="13" /></span>
                   <time
                     :datetime="isoTime(conversation.lastMessageAt)"
                     :title="formatFullStamp(conversation.lastMessageAt)"
@@ -1456,7 +1466,7 @@ onUnmounted(() => {
             >
           </span>
           <div class="thread-title">
-            <h2>{{ selectedConversation.title }}</h2>
+            <h2>{{ selectedConversation.title }}<span v-if="selectedConversation.muted" class="muted-icon" role="img" aria-label="免打扰"><AppIcon name="bellOff" :size="14" /></span></h2>
             <p class="thread-subtitle">
               <span class="channel-tag channel-tone" :class="`tone-${channelTone(channelLabel(selectedConversation))}`">{{ channelLabel(selectedConversation) }}</span>
               <span v-if="selectedConversation.conversationType === 'group'">群聊</span>

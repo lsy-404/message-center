@@ -138,6 +138,12 @@ def _prepare_profile(profile, remaining_avatar_bytes=MAX_AVATAR_BATCH_BYTES):
             raise ProfileSyncError("invalid_profile_metadata")
         headers["x-conversation-pinned"] = "1" if pinned else "0"
 
+    muted = profile.get("muted")
+    if muted is not None:
+        if not isinstance(muted, bool):
+            raise ProfileSyncError("invalid_profile_metadata")
+        headers["x-conversation-muted"] = "1" if muted else "0"
+
     unread_count = profile.get("unreadCount")
     if unread_count is not None:
         if isinstance(unread_count, bool) or not isinstance(unread_count, int) or not 0 <= unread_count <= 9_999_999:

@@ -10,6 +10,17 @@ export type ConversationListFilter = {
 export const CONVERSATION_PAGE_SIZE: number
 export const MAX_CONVERSATION_LIST_LEVELS: number
 export const QQ_GROUP_ASSISTANT_FOLDER_ID: string
+export const WECHAT_FOLDED_CHATS_FOLDER_ID: string
+export type ConversationFolderDefinition = {
+  id: string
+  scopeKind: 'qq' | 'wechat'
+  title: string
+  unit: string
+  contains: (conversation: any) => boolean
+}
+export function getConversationFolder(folderId: unknown): ConversationFolderDefinition | null
+export function conversationFolderOf(conversation: Record<string, any>): ConversationFolderDefinition | null
+export function unreadTotal(conversations: Array<{ unreadCount?: unknown, muted?: boolean }>): number
 export function normalizeChannelLabel(value: unknown): string
 export function isQQGroupAssistantConversation<T extends Record<string, any>>(conversation: T): boolean
 export function filterQQGroupAssistantConversations<T extends Record<string, any>>(conversations: T[]): T[]
@@ -19,7 +30,7 @@ export function enterConversationListFolder(path: unknown, folderId: unknown): s
 export function buildConversationListModel<T extends Record<string, any>>(
   conversations: T[], options?: {
     path?: unknown
-    qqRoot?: boolean
+    scopeKind?: 'qq' | 'wechat'
     selectedId?: string
     rootTitle?: string
   },

@@ -89,7 +89,7 @@
 
 ## 原生会话状态
 
-`PUT /api/connectors/conversation-profiles/<conversationExternalId>` 以请求头上报会话状态：显示名、渠道标签、`conversationType`、`placement`、`isPinned`、原生未读数及其 `unreadObservedAt`、原生最后消息摘要/时间。可选请求体是最多 2 MiB、带 SHA-256 的头像。状态更新按各自观察时间单调合并，晚到的旧扫描不会覆盖较新的摘要或未读水位。
+`PUT /api/connectors/conversation-profiles/<conversationExternalId>` 以请求头上报会话状态：显示名、渠道标签、`conversationType`、`placement`、`isPinned`（请求头 `x-conversation-pinned`）、`x-conversation-muted`（`1`/`0`，原生免打扰；缺省保持上次值，其他取值拒绝）、原生未读数及其 `unreadObservedAt`、原生最后消息摘要/时间。可选请求体是最多 2 MiB、带 SHA-256 的头像。状态更新按各自观察时间单调合并，晚到的旧扫描不会覆盖较新的摘要或未读水位。
 
 置顶与折叠是两个独立维度：置顶决定收件箱排序，折叠/消息盒描述原生客户端中的放置位置；两者都不改变消息是否进入统一消息流。群聊是否进入 Agent 即时队列仍只由 `trigger` 决定。
 

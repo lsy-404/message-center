@@ -506,6 +506,8 @@ button { color: inherit; }
 .conversation-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .title-icon { color: var(--text-tertiary); }
 .pin-icon { color: var(--accent-base); }
+.muted-icon { display: inline-flex; flex: 0 0 auto; align-items: center; margin-inline-start: 6px; color: var(--text-tertiary); vertical-align: middle; }
+.conversation-title-row .muted-icon { margin-inline-start: 0; }
 .conversation-title-row time { flex: 0 0 auto; color: var(--text-tertiary); font-size: 12px; font-variant-numeric: tabular-nums; }
 .conversation-row.unread .conversation-title-row time { color: var(--accent-base); font-weight: 600; }
 .conversation-preview { min-width: 0; flex: 1; overflow: hidden; color: var(--text-secondary); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
@@ -524,7 +526,7 @@ button { color: inherit; }
   line-height: 20px;
   text-align: center;
 }
-.conversation-row.folded .unread-count { color: var(--text-secondary); background: var(--subtle-secondary); }
+.conversation-row.muted .unread-count, .conversation-row.folded .unread-count { color: var(--text-secondary); background: var(--subtle-secondary); }
 
 .conversation-pager { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 2px; color: var(--text-tertiary); font-size: 12px; }
 
