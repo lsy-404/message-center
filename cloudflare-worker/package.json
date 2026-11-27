@@ -6,6 +6,7 @@
     "test:oidc": "node --experimental-sqlite --test ../test/oidc-auth.test.mjs"
   },
   "dependencies": {
+    "@pushforge/builder": "^2.0.5",
     "jose": "6.2.12",
     "openid-client": "6.8.8",
     "postal-mime": "4.2.1"

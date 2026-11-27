@@ -190,7 +190,8 @@ type MessageScrollState = {
 
 const emptySnapshot = (): Snapshot => ({ connectors: [], conversations: [], contacts: [], messages: [], selectedConversationId: null, filteredCount: 0 })
 const snapshot = ref<Snapshot>(emptySnapshot())
-const selectedId = ref('')
+const initialConversationId = new URLSearchParams(window.location.search).get('conversation') || ''
+const selectedId = ref(initialConversationId)
 const selectedContactId = ref('')
 const activeFilter = ref('all')
 const activeConnectorId = ref('')
@@ -207,7 +208,7 @@ const filteredMessages = ref<FilteredMessage[]>([])
 const filteredLoading = ref(false)
 const filterDrafts = ref<Record<string, FilterDraft>>({})
 const overlayPane = computed(() => showInstances.value || showFiltered.value)
-const mobileThread = ref(false)
+const mobileThread = ref(Boolean(initialConversationId))
 const loading = ref(true)
 const detailLoading = ref(false)
 const draft = ref('')
@@ -764,6 +765,97 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   }
   if (!response.ok) throw new Error(body?.error || `HTTP ${response.status}`)
   return body as T
+}
+
+const pushSupported = 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window
+const iosNeedsInstall = (/iPhone|iPad|iPod/.test(navigator.userAgent)
+  || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1))
+  && !((navigator as Navigator & { standalone?: boolean }).standalone === true
+    || window.matchMedia('(display-mode: standalone)').matches)
+const pushEnabled = ref(false)
+const pushBusy = ref(false)
+const pushDevices = ref<{ endpoint: string, label: string, createdAt: string, lastSuccessAt: string | null }[]>([])
+
+function vapidKeyBytes(key: string) {
+  const base64 = key.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(key.length / 4) * 4, '=')
+  return Uint8Array.from(atob(base64), (char) => char.charCodeAt(0))
+}
+
+async function currentPushSubscription() {
+  const registration = await navigator.serviceWorker.getRegistration('/')
+  return registration ? registration.pushManager.getSubscription() : null
+}
+
+async function refreshPush() {
+  if (!pushSupported) return
+  try {
+    const body = await api<{ devices: typeof pushDevices.value }>('/api/push/subscriptions')
+    pushDevices.value = body.devices
+    const subscription = await currentPushSubscription()
+    pushEnabled.value = Boolean(subscription && body.devices.some((device) => device.endpoint === subscription.endpoint))
+  } catch { /* the section stays in its last known state */ }
+}
+
+async function enablePush() {
+  pushBusy.value = true
+  try {
+    if (await Notification.requestPermission() !== 'granted') {
+      notify('未获得通知权限，请在系统设置中允许')
+      return
+    }
+    const { publicKey } = await api<{ publicKey: string | null }>('/api/push/public-key')
+    if (!publicKey) {
+      notify('服务器尚未配置推送密钥')
+      return
+    }
+    const registration = await navigator.serviceWorker.ready
+    const subscription = await registration.pushManager.getSubscription()
+      ?? await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: vapidKeyBytes(publicKey) })
+    await api('/api/push/subscriptions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(subscription.toJSON()),
+    })
+    await refreshPush()
+    notify('已开启手机通知')
+  } catch (error) {
+    notify(`开启失败：${error instanceof Error ? error.message : String(error)}`)
+  } finally {
+    pushBusy.value = false
+  }
+}
+
+async function disablePush() {
+  pushBusy.value = true
+  try {
+    const subscription = await currentPushSubscription()
+    if (subscription) {
+      await api('/api/push/subscriptions', {
+        method: 'DELETE',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ endpoint: subscription.endpoint }),
+      })
+      await subscription.unsubscribe()
+    }
+    await refreshPush()
+    notify('已关闭本设备的手机通知')
+  } catch (error) {
+    notify(`关闭失败：${error instanceof Error ? error.message : String(error)}`)
+  } finally {
+    pushBusy.value = false
+  }
+}
+
+async function sendTestPush() {
+  pushBusy.value = true
+  try {
+    const result = await api<{ sent: number }>('/api/push/test', { method: 'POST' })
+    notify(result.sent ? '测试通知已发送' : '没有可用的已订阅设备')
+  } catch (error) {
+    notify(`发送失败：${error instanceof Error ? error.message : String(error)}`)
+  } finally {
+    pushBusy.value = false
+  }
 }
 
 function sameInbox(left: Snapshot, right: Snapshot) {
@@ -1647,6 +1739,9 @@ function onOnline() {
 }
 
 onMounted(() => {
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js', { scope: '/' }).then(refreshPush, () => {})
+  }
   let firstLoad = true
   refreshLoop = createInboxRefreshLoop(async () => {
     if (inboxReads.isBusy()) return
@@ -2405,6 +2500,22 @@ onUnmounted(() => {
           <p>{{ snapshot.connectors.length }} 个账号 · {{ onlineConnectorCount }} 个在线<span v-if="degradedConnectorCount"> · {{ degradedConnectorCount }} 个部分同步</span></p>
         </div>
       </header>
+      <section class="push-panel" aria-label="手机通知">
+        <h2>手机通知</h2>
+        <p v-if="iosNeedsInstall">iPhone 需要先在 Safari 中点“分享”，选择“添加到主屏幕”，再从主屏幕图标打开本应用后开启通知。</p>
+        <p v-else-if="!pushSupported">当前浏览器不支持推送通知。</p>
+        <template v-else>
+          <p>
+            {{ pushEnabled ? '本设备已开启，私聊和被提及的群聊消息会推送到这里。' : '本设备未开启。' }}
+            <span v-if="pushDevices.length">已登记 {{ pushDevices.length }} 台设备：{{ pushDevices.map((device) => device.label).join('、') }}。</span>
+          </p>
+          <div class="push-actions">
+            <FluentButton v-if="!pushEnabled" class="accent-button" tone="primary" type="button" :disabled="pushBusy" @click="enablePush">开启通知</FluentButton>
+            <FluentButton v-else type="button" :disabled="pushBusy" @click="disablePush">关闭通知</FluentButton>
+            <FluentButton type="button" :disabled="pushBusy || !pushDevices.length" @click="sendTestPush">发送测试通知</FluentButton>
+          </div>
+        </template>
+      </section>
       <div class="instance-grid">
         <article
           v-for="connector in snapshot.connectors"

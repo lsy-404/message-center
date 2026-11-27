@@ -1,6 +1,7 @@
 import PostalMime from "postal-mime";
 import { evaluateMessageFilter, normalizeFilterSettings, parseFilterSettings } from "./message-filter.js";
 import { normalizeContactName, suggestContactMatches } from "./contacts.js";
+import { deliverPush, deviceLabel, notifyInbound, pushConfigured } from "./push.js";
 import { OidcAuthError, beginOidcLogin, completeOidcLogin, oidcIdentity, logoutOidc, cleanupOidcSessions, clearOidcSessionCookie } from "./oidc.js";
 
 const JSON_HEADERS = {
@@ -1260,7 +1261,7 @@ async function conversationHasOutbound(env, connectorId, conversationExternalId)
   return Boolean(row);
 }
 
-async function ingestEvents(request, env) {
+async function ingestEvents(request, env, ctx) {
   const authenticatedConnectorId = request.headers.get("x-connector-id") || "";
   if (!await hasConnectorRole(request, env, authenticatedConnectorId)) return fail("unauthorized", 401);
   const body = await readJson(request, 2 * 1024 * 1024);
@@ -1275,6 +1276,7 @@ async function ingestEvents(request, env) {
   let upgraded = 0;
   let promoted = 0;
   let suppressed = 0;
+  const notifyIds = [];
   const stamp = now();
   for (const item of body.messages) {
     if (!validShort(item?.externalId) || !item?.conversationExternalId || !item?.conversationTitle || !item?.senderName ||
@@ -1310,6 +1312,7 @@ async function ingestEvents(request, env) {
         conversationType: event.conversationType, hasAttachments: attachments.length > 0,
       }, () => conversationHasOutbound(env, connectorId, conversationExternalId));
     let messageFiltered = Boolean(filterVerdict);
+    let freshlyStored = false;
     let metadata = JSON.stringify({ ...suppliedMetadata,
       conversationType: event.conversationType, trigger: event.trigger, mentioned: event.mentioned,
       placement: event.placement, context: event.context, attachments: attachmentMetadata,
@@ -1446,6 +1449,7 @@ async function ingestEvents(request, env) {
           metadata, event.occurredAt, stamp, existing.id).run();
         if (count(promotion.meta?.changes)) {
           promoted += 1;
+          freshlyStored = true;
           messageFiltered = Boolean(filterVerdict);
           canonicalBody = upgradedBody || canonicalBody;
           canonicalOccurredAt = event.occurredAt;
@@ -1474,6 +1478,7 @@ async function ingestEvents(request, env) {
       }
     } else {
       inserted += 1;
+      freshlyStored = true;
     }
     const preview = String(canonicalBody || (canonicalAttachments[0]
       ? `[附件] ${canonicalAttachments[0].fileName || ""}` : "")).slice(0, 500);
@@ -1492,7 +1497,9 @@ async function ingestEvents(request, env) {
       filtered: messageFiltered,
       enqueueForAgents: event.presentation !== "system",
     });
+    if (freshlyStored && !event.isSelf && !messageFiltered) notifyIds.push(canonicalMessageId);
   }
+  if (notifyIds.length) runInBackground(ctx, notifyInbound(env, notifyIds));
   await reconcileConnectorSummaries(env, connectorId, stamp);
   await audit(env, `connector:${connectorId}`, "messages_ingested", connectorId,
     { received: body.messages.length, inserted, upgraded, promoted, suppressed });
@@ -3421,6 +3428,77 @@ async function mcp(request, env) {
   return json({ jsonrpc: "2.0", id: body.id ?? null, error: { code: -32601, message: "Method not found" } });
 }
 
+function runInBackground(ctx, promise) {
+  const guarded = promise.catch((error) => {
+    console.error(JSON.stringify({ event: "push_notify_failed", message: error instanceof Error ? error.message : String(error) }));
+  });
+  if (typeof ctx?.waitUntil === "function") ctx.waitUntil(guarded);
+}
+
+const PUBLIC_PWA_FILES = new Map([
+  ["/sw.js", "text/javascript; charset=utf-8"],
+  ["/manifest.webmanifest", "application/manifest+json; charset=utf-8"],
+  ["/icon-192.png", "image/png"],
+  ["/icon-512.png", "image/png"],
+  ["/apple-touch-icon.png", "image/png"],
+]);
+
+// Installability fetches (iOS icon, manifest) can arrive without the session cookie.
+async function pwaFileResponse(request, env, path) {
+  const asset = await appAssetResponse(request, env, path);
+  if (!asset.ok) return asset;
+  const headers = new Headers(asset.headers);
+  headers.set("content-type", PUBLIC_PWA_FILES.get(path));
+  headers.set("cache-control", "no-cache");
+  headers.delete("expires");
+  if (path === "/sw.js") headers.set("service-worker-allowed", "/");
+  return new Response(asset.body, { status: asset.status, headers });
+}
+
+async function savePushSubscription(request, env, identity) {
+  const body = await readJson(request, 16 * 1024);
+  const endpoint = text(body?.endpoint);
+  const p256dh = text(body?.keys?.p256dh);
+  const auth = text(body?.keys?.auth);
+  let valid = endpoint.length > 0 && endpoint.length <= 2048 && p256dh.length <= 200 && auth.length <= 100 && p256dh && auth;
+  try { valid = valid && new URL(endpoint).protocol === "https:"; } catch { valid = false; }
+  if (!valid) throw new Error("invalid_push_subscription");
+  const label = deviceLabel(request.headers.get("user-agent"));
+  await env.DB.prepare(`
+    INSERT INTO push_subscriptions (endpoint, owner_id, p256dh, auth, user_agent, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(endpoint) DO UPDATE SET owner_id = excluded.owner_id, p256dh = excluded.p256dh,
+      auth = excluded.auth, user_agent = excluded.user_agent
+  `).bind(endpoint, identity.id, p256dh, auth, label, now()).run();
+  await audit(env, identity.id, "push_subscription_saved", null, { device: label });
+  return json({ ok: true });
+}
+
+async function deletePushSubscription(request, env, identity) {
+  const body = await readJson(request, 16 * 1024);
+  await env.DB.prepare("DELETE FROM push_subscriptions WHERE endpoint = ? AND owner_id = ?")
+    .bind(text(body?.endpoint), identity.id).run();
+  await audit(env, identity.id, "push_subscription_removed", null, {});
+  return json({ ok: true });
+}
+
+async function listPushSubscriptions(env, identity) {
+  const rows = await env.DB.prepare(`
+    SELECT endpoint, user_agent, created_at, last_success_at FROM push_subscriptions
+    WHERE owner_id = ? ORDER BY created_at DESC
+  `).bind(identity.id).all();
+  return json({ ok: true, devices: (rows.results || []).map((row) => ({
+    endpoint: row.endpoint, label: row.user_agent, createdAt: row.created_at, lastSuccessAt: row.last_success_at,
+  })) });
+}
+
+async function sendTestPush(env, identity) {
+  if (!pushConfigured(env)) return fail("push_not_configured", 503);
+  const result = await deliverPush(env, { title: "Message Center", body: "测试通知：手机通知已开启", tag: "test" }, identity.id);
+  await audit(env, identity.id, "push_test_sent", null, result);
+  return json({ ok: true, ...result });
+}
+
 function redirect(location) {
   return new Response(null, { status: 303, headers: { location, "cache-control": "no-store" } });
 }
@@ -3479,7 +3557,7 @@ async function appAssetResponse(request, env, assetPath) {
     headers.set("content-security-policy",
       "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; " +
       "media-src 'self' blob:; connect-src 'self'; font-src 'self' data:; object-src 'none'; " +
-      "frame-src 'self'; " +
+      "frame-src 'self'; manifest-src 'self'; " +
       "base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
   }
   return new Response(asset.body, { status: asset.status, statusText: asset.statusText, headers });
@@ -3526,7 +3604,7 @@ async function ensureEmailConnector(env, stamp) {
   `).bind(EMAIL_CONNECTOR_ID, stamp, stamp, stamp).run();
 }
 
-async function receiveEmail(message, env) {
+async function receiveEmail(message, env, ctx) {
   const stamp = now();
   const recipient = String(message.to || "unknown").trim().toLowerCase().slice(0, 320) || "unknown";
   const envelopeFrom = String(message.from || "").slice(0, 320);
@@ -3623,11 +3701,12 @@ async function receiveEmail(message, env) {
     preview: (subject || plain || body).slice(0, 500), occurredAt, attachments: [], stamp,
     isSelf: false, filtered: Boolean(filterVerdict), enqueueForAgents: false,
   });
+  if (!filterVerdict) runInBackground(ctx, notifyInbound(env, [messageId]));
 }
 
 export default {
-  async email(message, env) {
-    await receiveEmail(message, env);
+  async email(message, env, ctx) {
+    await receiveEmail(message, env, ctx);
   },
   async scheduled(controller, env, ctx) {
     ctx.waitUntil(Promise.all([
@@ -3657,7 +3736,7 @@ export default {
       }
       if (url.pathname === "/api/connectors/register" && request.method === "POST") return await registerConnector(request, env);
       if (url.pathname === "/api/connectors/heartbeat" && request.method === "POST") return await heartbeatConnector(request, env);
-      if (url.pathname === "/api/connectors/events" && request.method === "POST") return await ingestEvents(request, env);
+      if (url.pathname === "/api/connectors/events" && request.method === "POST") return await ingestEvents(request, env, ctx);
       if (url.pathname === "/api/connectors/group-text-backups" && request.method === "POST") {
         return await ingestGroupTextBackups(request, env);
       }
@@ -3686,6 +3765,8 @@ export default {
       if (completion && request.method === "POST") return await completeCommand(request, env, completion[1]);
       const fileDownload = url.pathname.match(/^\/api\/files\/([a-zA-Z0-9._:-]+)$/);
       if (fileDownload && request.method === "GET") return await downloadFile(request, env, ctx, fileDownload[1]);
+
+      if (request.method === "GET" && PUBLIC_PWA_FILES.has(url.pathname)) return await pwaFileResponse(request, env, url.pathname);
 
       const identity = await oidcIdentity(request, env);
       if (!identity && (url.pathname === "/" || url.pathname === "/app" || url.pathname === "/index.html") && request.method === "GET") return redirect("/login");
@@ -3736,6 +3817,15 @@ export default {
       if (contactLinks && request.method === "POST") return await linkContactConversation(request, env, identity, contactLinks[1]);
       const contactLink = url.pathname.match(/^\/api\/contacts\/([a-zA-Z0-9._:-]+)\/conversations\/([a-zA-Z0-9._:-]+)$/);
       if (contactLink && request.method === "DELETE") return await unlinkContactConversation(env, identity, contactLink[1], contactLink[2]);
+      if (url.pathname === "/api/push/public-key" && request.method === "GET") {
+        return json({ ok: true, publicKey: pushConfigured(env) ? env.VAPID_PUBLIC_KEY : null });
+      }
+      if (url.pathname === "/api/push/subscriptions") {
+        if (request.method === "GET") return await listPushSubscriptions(env, identity);
+        if (request.method === "POST") return await savePushSubscription(request, env, identity);
+        if (request.method === "DELETE") return await deletePushSubscription(request, env, identity);
+      }
+      if (url.pathname === "/api/push/test" && request.method === "POST") return await sendTestPush(env, identity);
       if (url.pathname === "/api/stickers" && request.method === "GET") {
         return json({ ok: true, stickers: await readStickers(env) });
       }

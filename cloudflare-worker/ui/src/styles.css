@@ -988,6 +988,13 @@ button { color: inherit; }
   background: var(--thread-bg);
 }
 .instances-header { position: sticky; z-index: 2; top: 0; gap: 10px; padding: 10px 20px; }
+.push-panel {
+  display: flex; flex-direction: column; gap: 8px; margin: 20px 20px 0; padding: 14px 16px;
+  border: 1px solid var(--card-stroke); border-radius: 10px; background: var(--card-bg); box-shadow: var(--shadow-card);
+}
+.push-panel h2 { margin: 0; font-size: 15px; }
+.push-panel p { margin: 0; color: var(--text-secondary); font-size: 13px; line-height: 1.5; }
+.push-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .instance-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; padding: 20px; }
 .instance-card {
   display: flex;

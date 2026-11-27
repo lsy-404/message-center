@@ -61,6 +61,13 @@
 - `/api/inbox` 返回 `contacts[]`（`conversationIds`、`defaultConversationId` 为最近有入站消息的会话）；带 `contactId` 时 `messages` 为该联系人全部会话按时间合并的线程，每条消息带 `connectorId`、`channelLabel`、`accountLabel`。网页中联系人是一行：未读为未免打扰会话之和，摘要取最新一条，回复经所选会话发送。
 - Agent 的 `listen_messages` 候选与 `claim_message` 消息带 `contact: {id, name}`（未关联为 `null`）；`agent_access` 的限制不变。
 
+## 手机通知（PWA + Web Push）
+
+- 网页可安装为 PWA（`manifest.webmanifest`，Service Worker `/sw.js`，仅处理 `push` 与 `notificationclick`，不缓存任何数据）。这几个静态文件与图标无需登录即可读取，其余路径照常要求管理员登录；iPhone 需 iOS 16.4+，并先“添加到主屏幕”后从图标打开。
+- 在“接入管理”页顶部的“手机通知”中开启、关闭或发送测试通知。订阅保存在 `push_subscriptions`；推送服务返回 404/410 时自动删除。接口：`GET /api/push/public-key`、`GET|POST|DELETE /api/push/subscriptions`、`POST /api/push/test`。
+- 触发：新入库、未被过滤（`queue_class = 'immediate'`）、会话未免打扰的入站消息，且为私聊或触发方式为 `mention` 的群聊；邮件按私聊处理。同一会话 60 秒内至多推送一次（`push_conversation_state`），经 `ctx.waitUntil` 发送，失败只记日志。
+- 发送使用 `@pushforge/builder`（VAPID + aes128gcm，Web Crypto）。生成密钥：`pnpm exec pushforge vapid`；公钥写入 secret `VAPID_PUBLIC_KEY`，私钥 JWK（一行 JSON）写入 secret `VAPID_PRIVATE_KEY`；可选 var `VAPID_SUBJECT`（`mailto:` 或站点 URL，写在私有 `wrangler.local.jsonc`）缺省为站点源。
+
 详细协议见 [CONNECTOR_PROTOCOL.md](./CONNECTOR_PROTOCOL.md)。
 
 ## 发送与文件生命周期
