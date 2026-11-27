@@ -59,6 +59,50 @@ export function unreadTotal(conversations) {
   )
 }
 
+export const CONTACT_ROW_PREFIX = 'contact:'
+
+// A contact becomes one list row, placed where its highest-ranked linked conversation sits.
+export function aggregateContacts(conversations, contacts) {
+  const list = Array.isArray(conversations) ? conversations : []
+  const contactOf = new Map()
+  for (const contact of Array.isArray(contacts) ? contacts : []) {
+    for (const id of contact.conversationIds) contactOf.set(id, contact)
+  }
+  const placed = new Set()
+  const items = []
+  for (const conversation of list) {
+    const contact = contactOf.get(conversation.id)
+    if (!contact) {
+      items.push(conversation)
+      continue
+    }
+    if (placed.has(contact.id)) continue
+    placed.add(contact.id)
+    const members = list.filter((item) => contactOf.get(item.id) === contact)
+    const latest = members.reduce((best, item) => ((item.lastMessageAt || '') > (best.lastMessageAt || '') ? item : best))
+    const target = members.find((item) => item.id === contact.defaultConversationId) || members[0]
+    items.push({
+      id: `${CONTACT_ROW_PREFIX}${contact.id}`,
+      contactId: contact.id,
+      members,
+      title: contact.name,
+      avatarLabel: target.avatarLabel,
+      avatarPath: (members.find((item) => item.avatarPath) || target).avatarPath ?? null,
+      unreadCount: unreadTotal(members),
+      lastMessagePreview: latest.lastMessagePreview,
+      lastMessageAt: latest.lastMessageAt,
+      pinned: members.some((item) => item.pinned),
+      muted: members.every((item) => item.muted),
+      conversationType: 'direct',
+      placement: 'normal',
+      connectorKind: 'contact',
+      connectorId: '',
+      connectorChannelLabel: '',
+    })
+  }
+  return items
+}
+
 export function normalizeConversationListPath(path) {
   if (!Array.isArray(path)) return []
   return path.slice(0, MAX_CONVERSATION_LIST_LEVELS - 1)
@@ -147,25 +191,29 @@ export function filterConversations(conversations, options = {}) {
   const getChannelLabel = options.getChannelLabel
   const unreadOnly = Boolean(options.unreadOnly)
 
-  return conversations.filter((conversation) => {
+  const inScope = (conversation) => {
     if (connectorKind && conversation.connectorKind !== connectorKind) return false
     if (connectorId && conversation.connectorId !== connectorId) return false
+    if (!channelLabel) return true
+    const label = normalizeChannelLabel(getChannelLabel
+      ? getChannelLabel(conversation)
+      : String(conversation.connectorChannelLabel || conversation.connectorKind || ''))
+    return label === channelLabel
+  }
+  const searchable = (conversation) => [
+    conversation.title,
+    conversation.avatarLabel,
+    conversation.lastMessagePreview,
+    conversation.connectorChannelLabel,
+    conversation.connectorKind,
+  ].map((value) => String(value || '')).join(' ').toLowerCase()
+
+  return conversations.filter((conversation) => {
+    const members = conversation.members || []
+    if (!(members.length ? members : [conversation]).some(inScope)) return false
     if (unreadOnly && !(Number(conversation.unreadCount) > 0)) return false
-    if (channelLabel) {
-      const label = normalizeChannelLabel(getChannelLabel
-        ? getChannelLabel(conversation)
-        : String(conversation.connectorChannelLabel || conversation.connectorKind || ''))
-      if (label !== channelLabel) return false
-    }
     if (!query) return true
-    const searchable = [
-      conversation.title,
-      conversation.avatarLabel,
-      conversation.lastMessagePreview,
-      conversation.connectorChannelLabel,
-      conversation.connectorKind,
-    ].map((value) => String(value || '')).join(' ').toLowerCase()
-    return searchable.includes(query)
+    return [conversation, ...members].some((item) => searchable(item).includes(query))
   })
 }
 

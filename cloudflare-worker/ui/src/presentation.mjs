@@ -119,7 +119,7 @@ export function formatDayLabel(value, nowValue = new Date()) {
 }
 
 function senderKey(message) {
-  return [message.direction, message.authorRole || '', message.senderName || ''].join('\u0000')
+  return [message.conversationId || '', message.direction, message.authorRole || '', message.senderName || ''].join('\u0000')
 }
 
 // Inserts a day separator before the first message of each local day and marks

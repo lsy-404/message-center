@@ -10,8 +10,10 @@ import {
   isAcceptedSendResponse,
 } from './send-request-key.mjs'
 import {
+  aggregateContacts,
   buildConversationListModel,
   canEnterConversationListFolder,
+  CONTACT_ROW_PREFIX,
   CONVERSATION_PAGE_SIZE,
   conversationPageCount,
   enterConversationListFolder,
@@ -83,6 +85,21 @@ type Connector = {
   filter: FilterSettings
 }
 
+type Contact = {
+  id: string
+  name: string
+  note: string
+  conversationIds: string[]
+  defaultConversationId: string
+}
+
+type ContactSuggestion = {
+  key: string
+  name: string
+  contactId: string | null
+  conversationIds: string[]
+}
+
 type Conversation = {
   id: string
   connectorId: string
@@ -100,12 +117,14 @@ type Conversation = {
   lastMessageAt?: string | null
   connectorState: ConnectorState
   capabilities: string[]
+  contactId?: string
+  members?: Conversation[]
 }
 
 type ConversationListItem = Pick<Conversation,
   'id' | 'title' | 'avatarLabel' | 'avatarPath' | 'unreadCount' | 'lastMessagePreview' | 'lastMessageAt' | 'placement'
-  | 'pinned' | 'muted' | 'conversationType'
-> & { channel: string }
+  | 'pinned' | 'muted' | 'conversationType' | 'contactId'
+> & { channel: string, channels: string[] }
 
 type Attachment = {
   id: string
@@ -124,6 +143,10 @@ type ReplyPreview = {
 
 type Message = {
   id: string
+  conversationId: string
+  connectorId?: string
+  channelLabel?: string
+  accountLabel?: string
   direction: 'inbound' | 'outbound' | string
   senderName: string
   senderAvatarPath?: string | null
@@ -144,6 +167,7 @@ type StatusInfo = { label: string, tone: 'muted' | 'success' | 'warning' | 'dang
 type Snapshot = {
   connectors: Connector[]
   conversations: Conversation[]
+  contacts: Contact[]
   messages: Message[]
   selectedConversationId: string | null
   filteredCount: number
@@ -164,9 +188,10 @@ type MessageScrollState = {
   anchorOffset: number
 }
 
-const emptySnapshot = (): Snapshot => ({ connectors: [], conversations: [], messages: [], selectedConversationId: null, filteredCount: 0 })
+const emptySnapshot = (): Snapshot => ({ connectors: [], conversations: [], contacts: [], messages: [], selectedConversationId: null, filteredCount: 0 })
 const snapshot = ref<Snapshot>(emptySnapshot())
 const selectedId = ref('')
+const selectedContactId = ref('')
 const activeFilter = ref('all')
 const activeConnectorId = ref('')
 const conversationListPath = ref<string[]>([])
@@ -209,6 +234,17 @@ const selectedConversation = computed(() =>
 const selectedConversationConnector = computed(() =>
   snapshot.value.connectors.find((item) => item.id === selectedConversation.value?.connectorId) ?? null,
 )
+const selectedContact = computed(() =>
+  snapshot.value.contacts.find((item) => item.id === selectedContactId.value) ?? null,
+)
+const contactMembers = computed(() => (selectedContact.value?.conversationIds ?? [])
+  .map((id) => snapshot.value.conversations.find((item) => item.id === id))
+  .filter((item): item is Conversation => Boolean(item)))
+const selectionKey = computed(() => selectedContactId.value
+  ? `${CONTACT_ROW_PREFIX}${selectedContactId.value}` : selectedId.value)
+const listItems = computed<Conversation[]>(() =>
+  aggregateContacts(snapshot.value.conversations, snapshot.value.contacts) as Conversation[],
+)
 const nativeDesktops = computed(() => {
   const groups = new Map<string, { key: string, connectors: Connector[] }>()
   for (const connector of snapshot.value.connectors) {
@@ -245,7 +281,7 @@ const filters = computed(() => {
   })
   const qqConversations = snapshot.value.conversations.filter((item) => item.connectorKind === 'qq')
   return [
-    { id: 'all', label: '全部', channel: '', ...summarize(snapshot.value.conversations) },
+    { id: 'all', label: '全部', channel: '', ...summarize(listItems.value) },
     ...(qqConversations.length ? [{
       id: 'protocol:qq', label: 'QQ', channel: 'QQ', ...summarize(qqConversations),
     }] : []),
@@ -290,12 +326,12 @@ const conversationFilterOptions = () => ({
   getChannelLabel: channelLabel,
 })
 const filteredConversations = computed(() => filterConversations(
-  snapshot.value.conversations, conversationFilterOptions(),
+  listItems.value, conversationFilterOptions(),
 ))
 const conversationListModel = computed(() => buildConversationListModel(filteredConversations.value, {
   path: conversationListPath.value,
   scopeKinds: folderScopeKinds.value,
-  selectedId: selectedId.value,
+  selectedId: selectionKey.value,
   rootTitle: activeFilterLabel.value,
 }))
 const displayedConversations = computed(() => conversationListModel.value.conversations)
@@ -332,7 +368,10 @@ const conversationRows = computed<ConversationListItem[]>(() => visibleConversat
   pinned: conversation.pinned,
   muted: conversation.muted,
   conversationType: conversation.conversationType,
+  contactId: conversation.contactId,
   channel: channelLabel(conversation),
+  channels: conversation.members
+    ? [...new Set(conversation.members.map((member) => channelLabel(member)))] : [],
 })))
 
 watch([activeFilter, activeConnectorId, conversationSearch, unreadOnly, conversationListPath], async () => {
@@ -732,7 +771,8 @@ function sameInbox(left: Snapshot, right: Snapshot) {
       || left.filteredCount !== right.filteredCount) return false
   if (left.connectors.length !== right.connectors.length
       || left.conversations.length !== right.conversations.length
-      || left.messages.length !== right.messages.length) return false
+      || left.messages.length !== right.messages.length
+      || JSON.stringify(left.contacts) !== JSON.stringify(right.contacts)) return false
   for (let index = 0; index < left.connectors.length; index += 1) {
     const a = left.connectors[index]
     const b = right.connectors[index]
@@ -759,7 +799,8 @@ function sameInbox(left: Snapshot, right: Snapshot) {
   for (let index = 0; index < left.messages.length; index += 1) {
     const a = left.messages[index]
     const b = right.messages[index]
-    if (a.id !== b.id || a.direction !== b.direction || a.senderName !== b.senderName
+    if (a.id !== b.id || a.conversationId !== b.conversationId || a.direction !== b.direction
+        || a.senderName !== b.senderName
         || a.senderAvatarPath !== b.senderAvatarPath
         || a.body !== b.body || a.contentType !== b.contentType || a.occurredAt !== b.occurredAt
         || a.deliveryState !== b.deliveryState || a.queueClass !== b.queueClass
@@ -802,18 +843,38 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
   if (!silent) detailLoading.value = Boolean(conversationId)
   const query = new URLSearchParams({ refresh: String(Date.now()) })
   if (conversationId) query.set('conversationId', conversationId)
+  if (selectedContactId.value) query.set('contactId', selectedContactId.value)
   try {
     const body = await api<Snapshot & { ok: boolean }>(`/api/inbox?${query}`, { signal: request.controller.signal })
     if (!inboxReads.isCurrent(request, selectedId.value)) return
     let reloadConversationId = ''
+    if (selectedContactId.value) {
+      const contact = body.contacts.find((item) => item.id === selectedContactId.value)
+      if (!contact) {
+        selectedContactId.value = ''
+      } else if (!contact.conversationIds.includes(body.selectedConversationId || '')) {
+        body.selectedConversationId = contact.defaultConversationId
+        reloadConversationId = contact.defaultConversationId
+        body.messages = []
+      }
+    } else if (!conversationListPath.value.length && body.selectedConversationId) {
+      const owner = body.contacts.find((item) => item.conversationIds.includes(body.selectedConversationId || ''))
+      if (owner) {
+        selectedContactId.value = owner.id
+        reloadConversationId = body.selectedConversationId
+        body.messages = []
+      }
+    }
     if (conversationListPath.value.length) {
-      const scopedConversations = filterConversations(body.conversations, conversationFilterOptions())
+      const scopedConversations = filterConversations(
+        aggregateContacts(body.conversations, body.contacts), conversationFilterOptions(),
+      )
       const listModel = buildConversationListModel(scopedConversations, {
         path: conversationListPath.value,
         scopeKinds: folderScopeKinds.value,
-        selectedId: selectedId.value,
+        selectedId: selectionKey.value,
       })
-      const selection = resolveConversationSelection(listModel.selectionConversations, selectedId.value)
+      const selection = resolveConversationSelection(listModel.selectionConversations, selectionKey.value)
       const selectedConversationId = selection.action === 'keep'
         ? selectedId.value
         : selection.action === 'select' ? selection.conversation?.id || '' : ''
@@ -877,13 +938,15 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
   }
 }
 
-async function selectConversation(conversation: Conversation, openMobileThread = true) {
-  const folder = conversationFolderOf(conversation)
+async function selectConversation(conversation: Conversation, openMobileThread = true, contactId = '') {
+  const folder = contactId ? null : conversationFolderOf(conversation)
   if (folder && folderScopeKinds.value.includes(folder.scopeKind) && !conversationListPath.value.length) {
     conversationListPath.value = enterConversationListFolder([], folder.id)
   }
   cancelInboxRead()
   storeComposer()
+  selectedContactId.value = contactId
+  contactPanel.value = ''
   if (conversation.id !== selectedId.value) pendingScrollToBottomId = null
   selectedId.value = conversation.id
   restoreComposer(conversation.id)
@@ -924,11 +987,24 @@ function showPreviousConversationPage() {
   conversationPage.value = previousConversationPage(conversationPage.value)
 }
 
+function selectListItem(item: Conversation, openMobileThread = true) {
+  const contact = item.contactId ? snapshot.value.contacts.find((entry) => entry.id === item.contactId) : null
+  if (!contact) return selectConversation(item, openMobileThread)
+  const members = item.members ?? []
+  const target = (selectedContactId.value === contact.id && members.find((member) => member.id === selectedId.value))
+    || members.find((member) => member.id === contact.defaultConversationId) || members[0]
+  return selectConversation(target, openMobileThread, contact.id)
+}
+
 function selectConversationById(conversationId: string) {
-  const conversation = snapshot.value.conversations.find((item) => item.id === conversationId)
-  if (!conversation) return
+  const item = listItems.value.find((entry) => entry.id === conversationId)
+  if (!item) return
   showInfoView()
-  void selectConversation(conversation)
+  void selectListItem(item)
+}
+
+function isRowActive(row: ConversationListItem) {
+  return row.contactId ? selectedContactId.value === row.contactId : !selectedContactId.value && selectedId.value === row.id
 }
 
 function selectFilter(id: string, connectorId = '') {
@@ -955,13 +1031,14 @@ function navigateConversationListTo(level: number) {
 }
 
 function applyConversationSelection(conversations: Conversation[]) {
-  const selection = resolveConversationSelection(conversations, selectedId.value)
+  const selection = resolveConversationSelection(conversations, selectionKey.value)
   if (selection.action === 'select' && selection.conversation) {
-    void selectConversation(selection.conversation, false)
+    void selectListItem(selection.conversation, false)
   } else if (selection.action === 'clear') {
     storeComposer()
     pendingScrollToBottomId = null
     cancelInboxRead()
+    selectedContactId.value = ''
     selectedId.value = ''
     restoreComposer('')
     snapshot.value.messages = []
@@ -1079,6 +1156,193 @@ function showFilteredView() {
   mobileThread.value = false
   void loadFiltered()
 }
+
+const CONTACT_ERRORS: Record<string, string> = {
+  group_conversation_not_linkable: '群聊不能关联到联系人',
+  conversation_already_linked: '该会话已关联到其他联系人',
+  contact_conversation_limit: '联系人关联的会话已达上限',
+  invalid_contact_name: '名称无效',
+  contact_not_found: '联系人不存在',
+}
+
+const contactPanel = ref<'' | 'link' | 'manage'>('')
+const linkTarget = ref('new')
+const linkName = ref('')
+const contactNameDraft = ref('')
+const contactBusy = ref(false)
+const deleteArmed = ref(false)
+const suggestions = ref<ContactSuggestion[]>([])
+
+const canLinkContact = computed(() => Boolean(selectedConversation.value)
+  && !selectedContact.value && selectedConversation.value?.conversationType !== 'group')
+const threadIdentity = computed(() => {
+  const contact = selectedContact.value
+  const conversation = selectedConversation.value
+  if (!conversation) return null
+  if (!contact) {
+    return { title: conversation.title, label: conversation.avatarLabel || conversation.title,
+      avatarPath: conversation.avatarPath, muted: Boolean(conversation.muted) }
+  }
+  const members = contactMembers.value
+  return { title: contact.name, label: contact.name,
+    avatarPath: members.find((member) => member.avatarPath)?.avatarPath ?? null,
+    muted: members.length > 0 && members.every((member) => member.muted) }
+})
+const contactChannels = computed(() => [...new Set(contactMembers.value.map((member) => channelLabel(member)))])
+const sendTargetOptions = computed(() => contactMembers.value.map((member) => ({
+  id: member.id,
+  label: `${channelLabel(member)} · ${connectorAccount(member.connectorId)}`,
+})))
+const composerName = computed(() => selectedContact.value
+  ? `${selectedContact.value.name}（${channelLabel(selectedConversation.value)}）`
+  : selectedConversation.value?.title ?? '')
+const visibleSuggestions = computed(() => suggestions.value.flatMap((suggestion) => {
+  const items = suggestion.conversationIds
+    .map((id) => snapshot.value.conversations.find((item) => item.id === id))
+    .filter((item): item is Conversation => Boolean(item))
+  return items.length ? [{ ...suggestion, items }] : []
+}))
+
+function connectorAccount(connectorId: string) {
+  return snapshot.value.connectors.find((item) => item.id === connectorId)?.accountLabel ?? ''
+}
+
+function messageChannel(message: Message) {
+  const label = normalizeChannelLabel(message.channelLabel || '')
+  return message.accountLabel ? `${label} · ${message.accountLabel}` : label
+}
+
+function contactErrorText(error: unknown) {
+  const code = error instanceof Error ? error.message : String(error)
+  return CONTACT_ERRORS[code] || code
+}
+
+function postJson(method: string, body?: unknown): RequestInit {
+  return { method, headers: { 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) }
+}
+
+function openContactPanel() {
+  if (contactPanel.value) {
+    contactPanel.value = ''
+    return
+  }
+  deleteArmed.value = false
+  if (selectedContact.value) {
+    contactNameDraft.value = selectedContact.value.name
+    contactPanel.value = 'manage'
+  } else {
+    linkTarget.value = 'new'
+    linkName.value = selectedConversation.value?.title ?? ''
+    contactPanel.value = 'link'
+  }
+}
+
+async function runContactAction(action: () => Promise<void>, done: string) {
+  if (contactBusy.value) return
+  contactBusy.value = true
+  try {
+    await action()
+    notify(done)
+    await load(selectedId.value, true, false)
+  } catch (error) {
+    if (!(error instanceof DOMException && error.name === 'AbortError')) notify(`操作失败：${contactErrorText(error)}`)
+  } finally {
+    contactBusy.value = false
+  }
+}
+
+async function submitLink() {
+  const conversationId = selectedId.value
+  if (!conversationId) return
+  await runContactAction(async () => {
+    if (linkTarget.value === 'new') {
+      const result = await api<{ contactId: string }>('/api/contacts',
+        postJson('POST', { name: linkName.value.trim() || undefined, conversationIds: [conversationId] }))
+      selectedContactId.value = result.contactId
+    } else {
+      await api(`/api/contacts/${encodeURIComponent(linkTarget.value)}/conversations`, postJson('POST', { conversationId }))
+      selectedContactId.value = linkTarget.value
+    }
+    contactPanel.value = ''
+  }, '已关联')
+}
+
+async function saveContactName() {
+  const contact = selectedContact.value
+  if (!contact) return
+  await runContactAction(async () => {
+    await api(`/api/contacts/${encodeURIComponent(contact.id)}`, postJson('PUT', { name: contactNameDraft.value }))
+  }, '已保存')
+}
+
+async function unlinkConversation(conversationId: string) {
+  const contact = selectedContact.value
+  if (!contact) return
+  await runContactAction(async () => {
+    await api(`/api/contacts/${encodeURIComponent(contact.id)}/conversations/${encodeURIComponent(conversationId)}`,
+      postJson('DELETE'))
+  }, '已取消关联')
+}
+
+async function deleteContact() {
+  const contact = selectedContact.value
+  if (!contact) return
+  if (!deleteArmed.value) {
+    deleteArmed.value = true
+    return
+  }
+  await runContactAction(async () => {
+    await api(`/api/contacts/${encodeURIComponent(contact.id)}`, postJson('DELETE'))
+    contactPanel.value = ''
+  }, '已删除联系人，消息不受影响')
+}
+
+function chooseSendTarget(conversationId: string) {
+  if (!selectedContactId.value || conversationId === selectedId.value) return
+  const carried = draft.value
+  draft.value = ''
+  storeComposer()
+  selectedId.value = conversationId
+  restoreComposer(conversationId)
+  if (carried && !draft.value) draft.value = carried
+  void load(conversationId, true).catch(() => {})
+}
+
+async function loadSuggestions() {
+  try {
+    suggestions.value = (await api<{ suggestions: ContactSuggestion[] }>('/api/contacts/suggestions')).suggestions
+  } catch {
+    suggestions.value = []
+  }
+}
+
+async function confirmSuggestion(suggestion: ContactSuggestion) {
+  await runContactAction(async () => {
+    if (suggestion.contactId) {
+      for (const conversationId of suggestion.conversationIds) {
+        await api(`/api/contacts/${encodeURIComponent(suggestion.contactId)}/conversations`,
+          postJson('POST', { conversationId }))
+      }
+    } else {
+      await api('/api/contacts', postJson('POST', { name: suggestion.name, conversationIds: suggestion.conversationIds }))
+    }
+  }, '已关联')
+}
+
+async function dismissSuggestion(suggestion: ContactSuggestion) {
+  suggestions.value = suggestions.value.filter((item) => item.key !== suggestion.key)
+  try {
+    await api('/api/contacts/suggestions/dismiss', postJson('POST', { key: suggestion.key }))
+  } catch (error) {
+    notify(`操作失败：${contactErrorText(error)}`)
+    void loadSuggestions()
+  }
+}
+
+watch(
+  () => `${snapshot.value.conversations.length}:${snapshot.value.contacts.map((item) => `${item.id}${item.conversationIds.length}`).join(',')}`,
+  () => { void loadSuggestions() },
+)
 
 const fetchingMessageIds = ref(new Set<string>())
 
@@ -1604,6 +1868,20 @@ onUnmounted(() => {
           </div>
         </div>
 
+        <details v-if="visibleSuggestions.length && !conversationListPath.length" class="contact-suggestions">
+          <summary>可能是同一人 <span class="suggestion-count">{{ visibleSuggestions.length }}</span></summary>
+          <ul>
+            <li v-for="suggestion in visibleSuggestions" :key="suggestion.key" :data-suggestion-key="suggestion.key">
+              <span class="suggestion-copy">
+                <strong>{{ suggestion.name }}</strong>
+                <small>{{ suggestion.items.map((item) => `${channelLabel(item)} · ${connectorAccount(item.connectorId)}`).join('、') }}<template v-if="suggestion.contactId">，加入已有联系人</template></small>
+              </span>
+              <button type="button" class="suggestion-action" :disabled="contactBusy" @click="confirmSuggestion(suggestion)">关联</button>
+              <button type="button" class="suggestion-action quiet" @click="dismissSuggestion(suggestion)">忽略</button>
+            </li>
+          </ul>
+        </details>
+
         <ul class="conversation-items">
           <li v-for="listFolder in listFolders" :key="listFolder.id">
             <button
@@ -1638,15 +1916,16 @@ onUnmounted(() => {
             <button
               class="conversation-row"
               :class="{
-                active: selectedId === conversation.id,
+                active: isRowActive(conversation),
                 pinned: conversation.pinned,
                 folded: isFolded(conversation),
                 unread: conversation.unreadCount > 0,
                 muted: conversation.muted,
               }"
               type="button"
-              :aria-current="selectedId === conversation.id ? 'true' : undefined"
+              :aria-current="isRowActive(conversation) ? 'true' : undefined"
               :data-conversation-id="conversation.id"
+              :data-contact-id="conversation.contactId || undefined"
               :data-channel="conversation.channel"
               :data-conversation-type="conversation.conversationType || undefined"
               :data-unread-count="conversation.unreadCount"
@@ -1667,7 +1946,7 @@ onUnmounted(() => {
                   @error="imageFailed"
                 >
                 <span
-                  v-if="activeFilter === 'all' && !activeConnectorId"
+                  v-if="activeFilter === 'all' && !activeConnectorId && !conversation.contactId"
                   class="channel-badge channel-tone"
                   :class="`tone-${channelTone(conversation.channel)}`"
                   aria-hidden="true"
@@ -1680,6 +1959,15 @@ onUnmounted(() => {
                     <AppIcon v-if="isFolded(conversation)" class="title-icon" name="archive" :size="14" />
                     <span class="conversation-title">{{ conversation.title }}</span>
                   </strong>
+                  <span v-if="conversation.channels.length" class="contact-channels" aria-hidden="true">
+                    <span
+                      v-for="label in conversation.channels"
+                      :key="label"
+                      class="contact-channel channel-tone"
+                      :class="`tone-${channelTone(label)}`"
+                      :title="label"
+                    >{{ channelGlyph(label) }}</span>
+                  </span>
                   <AppIcon v-if="conversation.pinned" class="pin-icon" name="pin" :size="12" />
                   <span v-if="conversation.muted" class="muted-icon" role="img" aria-label="免打扰"><AppIcon name="bellOff" :size="13" /></span>
                   <time
@@ -1691,7 +1979,7 @@ onUnmounted(() => {
                   <span class="conversation-preview">{{ conversationPreview(conversation) }}</span>
                   <span v-if="conversation.unreadCount" class="unread-count" aria-hidden="true">{{ conversation.unreadCount > 99 ? '99+' : conversation.unreadCount }}</span>
                 </span>
-                <span class="sr-only">，{{ conversation.channel }}<template v-if="conversationStateText(conversation)">，{{ conversationStateText(conversation) }}</template></span>
+                <span class="sr-only">，<template v-if="conversation.channels.length">联系人，{{ conversation.channels.join('、') }}</template><template v-else>{{ conversation.channel }}</template><template v-if="conversationStateText(conversation)">，{{ conversationStateText(conversation) }}</template></span>
               </span>
             </button>
           </li>
@@ -1715,27 +2003,36 @@ onUnmounted(() => {
     </section>
 
     <section v-if="!overlayPane && !nativeViewActive" class="content-pane" aria-label="会话详情">
-      <template v-if="selectedConversation">
+      <template v-if="selectedConversation && threadIdentity">
         <header class="thread-header">
           <button class="quiet-button mobile-back" type="button" aria-label="返回收件箱" title="返回收件箱" @click="mobileThread = false">
             <AppIcon name="back" :size="18" />
           </button>
-          <span class="avatar thread-avatar" :class="`avatar-tone-${avatarTone(selectedConversation.title)}`">
-            <span aria-hidden="true">{{ initials(selectedConversation.avatarLabel || selectedConversation.title) }}</span>
+          <span class="avatar thread-avatar" :class="`avatar-tone-${avatarTone(threadIdentity.title)}`">
+            <span aria-hidden="true">{{ initials(threadIdentity.label) }}</span>
             <img
-              v-if="selectedConversation.avatarPath"
-              :key="avatarKey(selectedConversation.avatarPath)"
-              :src="avatarSource(selectedConversation.avatarPath)"
-              :data-avatar-path="selectedConversation.avatarPath"
-              :data-avatar-revision="avatarRevision(selectedConversation.avatarPath)"
+              v-if="threadIdentity.avatarPath"
+              :key="avatarKey(threadIdentity.avatarPath)"
+              :src="avatarSource(threadIdentity.avatarPath)"
+              :data-avatar-path="threadIdentity.avatarPath"
+              :data-avatar-revision="avatarRevision(threadIdentity.avatarPath)"
               alt=""
               @load="imageLoaded"
               @error="imageFailed"
             >
           </span>
           <div class="thread-title">
-            <h2>{{ selectedConversation.title }}<span v-if="selectedConversation.muted" class="muted-icon" role="img" aria-label="免打扰"><AppIcon name="bellOff" :size="14" /></span></h2>
-            <p class="thread-subtitle">
+            <h2>{{ threadIdentity.title }}<span v-if="threadIdentity.muted" class="muted-icon" role="img" aria-label="免打扰"><AppIcon name="bellOff" :size="14" /></span></h2>
+            <p v-if="selectedContact" class="thread-subtitle">
+              <span>联系人</span>
+              <span
+                v-for="label in contactChannels"
+                :key="label"
+                class="channel-tag channel-tone"
+                :class="`tone-${channelTone(label)}`"
+              >{{ label }}</span>
+            </p>
+            <p v-else class="thread-subtitle">
               <span class="channel-tag channel-tone" :class="`tone-${channelTone(channelLabel(selectedConversation))}`">{{ channelLabel(selectedConversation) }}</span>
               <span v-if="selectedConversation.conversationType === 'group'">群聊</span>
               <span v-else-if="selectedConversation.conversationType === 'direct'">私聊</span>
@@ -1744,6 +2041,13 @@ onUnmounted(() => {
               </span>
             </p>
           </div>
+          <button
+            v-if="canLinkContact || selectedContact"
+            type="button"
+            class="header-text-button"
+            :aria-expanded="contactPanel !== ''"
+            @click="openContactPanel"
+          >{{ selectedContact ? '管理联系人' : '关联联系人' }}</button>
           <div v-if="selectedConversationConnector?.native" class="segmented" role="group" aria-label="显示模式">
             <button type="button" class="active" aria-pressed="true">信息模式</button>
             <button type="button" aria-pressed="false" @click="showNativeView(selectedConversationConnector)">原生模式</button>
@@ -1752,6 +2056,55 @@ onUnmounted(() => {
             <span class="unread-dot" /><span class="chip-label">AI 未读</span> {{ aiUnreadCount }}
           </span>
         </header>
+
+        <section v-if="contactPanel" class="contact-panel" aria-label="联系人">
+          <template v-if="contactPanel === 'link'">
+            <label class="panel-field">
+              <span>关联到</span>
+              <select v-model="linkTarget">
+                <option value="new">新建联系人</option>
+                <option v-for="contact in snapshot.contacts" :key="contact.id" :value="contact.id">{{ contact.name }}</option>
+              </select>
+            </label>
+            <label v-if="linkTarget === 'new'" class="panel-field">
+              <span>名称</span>
+              <input v-model="linkName" type="text" maxlength="100" @keydown.enter.prevent="submitLink">
+            </label>
+            <div class="panel-actions">
+              <button type="button" class="panel-button" @click="contactPanel = ''">取消</button>
+              <button type="button" class="panel-button primary" :disabled="contactBusy" @click="submitLink">关联</button>
+            </div>
+          </template>
+          <template v-else-if="selectedContact">
+            <label class="panel-field">
+              <span>名称</span>
+              <input v-model="contactNameDraft" type="text" maxlength="100" @keydown.enter.prevent="saveContactName">
+              <button
+                type="button"
+                class="panel-button"
+                :disabled="contactBusy || !contactNameDraft.trim() || contactNameDraft.trim() === selectedContact.name"
+                @click="saveContactName"
+              >保存</button>
+            </label>
+            <ul class="panel-links">
+              <li v-for="member in contactMembers" :key="member.id">
+                <span class="channel-tag channel-tone" :class="`tone-${channelTone(channelLabel(member))}`">{{ channelLabel(member) }}</span>
+                <span class="panel-link-name">{{ connectorAccount(member.connectorId) }} · {{ member.title }}</span>
+                <button
+                  type="button"
+                  class="panel-button"
+                  :disabled="contactBusy || contactMembers.length < 2"
+                  :title="contactMembers.length < 2 ? '至少保留一个会话，或删除联系人' : undefined"
+                  @click="unlinkConversation(member.id)"
+                >取消关联</button>
+              </li>
+            </ul>
+            <div class="panel-actions">
+              <button type="button" class="panel-button danger" :disabled="contactBusy" @click="deleteContact">{{ deleteArmed ? '确认删除（不删除消息）' : '删除联系人' }}</button>
+              <button type="button" class="panel-button" @click="contactPanel = ''">关闭</button>
+            </div>
+          </template>
+        </section>
 
         <div class="message-scroll" :class="{ busy: detailLoading }" role="log" aria-label="消息记录" :aria-busy="detailLoading">
           <template v-for="entry in threadRows" :key="entry.key">
@@ -1804,6 +2157,12 @@ onUnmounted(() => {
                 <p class="message-meta" :class="{ 'sr-only': entry.continuation }">
                   <span class="message-sender">{{ senderLabel(entry.message) }}</span>
                   <span v-if="entry.byAgent" class="role-chip"><AppIcon name="bot" :size="12" />代你发送</span>
+                  <span
+                    v-if="selectedContact && entry.message.channelLabel"
+                    class="message-channel channel-tone"
+                    :class="`tone-${channelTone(normalizeChannelLabel(entry.message.channelLabel))}`"
+                    :data-conversation-id="entry.message.conversationId"
+                  >{{ messageChannel(entry.message) }}</span>
                   <time
                     :datetime="isoTime(entry.message.occurredAt)"
                     :title="formatFullStamp(entry.message.occurredAt)"
@@ -1922,12 +2281,18 @@ onUnmounted(() => {
               v-model="draft"
               :disabled="!canSendText"
               :maxlength="maxTextLength"
-              :placeholder="canSendText ? `回复 ${selectedConversation.title}` : '此接入仅接收消息'"
-              :aria-label="`回复 ${selectedConversation.title}`"
+              :placeholder="canSendText ? `回复 ${composerName}` : '此接入仅接收消息'"
+              :aria-label="`回复 ${composerName}`"
               rows="2"
               @keydown="onComposerKeydown"
             />
             <div class="compose-toolbar">
+              <label v-if="selectedContact && sendTargetOptions.length > 1" class="send-target">
+                <span class="sr-only">发送渠道</span>
+                <select :value="selectedId" @change="chooseSendTarget(($event.target as HTMLSelectElement).value)">
+                  <option v-for="option in sendTargetOptions" :key="option.id" :value="option.id">{{ option.label }}</option>
+                </select>
+              </label>
               <label
                 class="quiet-button attachment-button"
                 :class="{ disabled: !canSendFiles || uploadingConversationIds.has(selectedId) }"

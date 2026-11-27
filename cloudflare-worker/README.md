@@ -53,6 +53,14 @@
 - inbox 消息附带只读的 `authorRole`（`contact`、`owner` 或 `agent`）与 `agentRead`（Agent 是否已领取该消息；未进入即时队列为 `null`），不返回 Agent consumer ID 或队列内部状态。网页据此区分 AI 代发与本人发送，并在入站消息下标注“AI 已读 / AI 未读”。
 - 网页把 QQ/微信正文中的行首标签渲染为富内容：`[引用] 作者：内容`、`[reply:type-7]` 与微信复制格式 `「作者：内容」` + 虚线分隔显示为引用块；`[小程序]`、`[QQ小程序]`、`[链接]`、`[分享]`、`[卡片]`、`[聊天记录]`、`[视频号]`、`[音乐]`、`[位置]`、`[名片]`、`[公众号]` 后接 `标题 · 摘要 · 来源` 显示为卡片；`[转账]`、`[红包]` 显示为金额卡片，`[拍一拍]` 显示为居中提示；`[picture:…]`、`[file:…]`、`[voice:…]`、`[video:…]`、`[sticker:…]`、`[图片]` 等显示为媒体标签，`[kind:type-N]` 显示为可读名称。标签只在行首生效，其余文字原样显示；会话列表摘要使用同一规则压缩为一行。
 
+## 联系人聚合
+
+- `contacts` 与 `contact_conversations`（一个会话至多属于一个联系人）把同一个人在不同渠道、账号下的私聊合并展示；群聊不能关联。删除联系人只解除分组，不删除会话和消息。`contact_suggestion_dismissals` 记住已忽略的建议。
+- 管理接口（管理员）：`POST /api/contacts`（`name`、`conversationIds`）、`PUT /api/contacts/<id>`（`name`、`note`）、`DELETE /api/contacts/<id>`、`POST /api/contacts/<id>/conversations`、`DELETE /api/contacts/<id>/conversations/<会话 ID>`、`GET /api/contacts/suggestions`、`POST /api/contacts/suggestions/dismiss`。均写入审计。
+- 建议只比较私聊标题：NFKC 规范化后去掉空白、标点、符号与 emoji 并忽略大小写，相同且跨至少两个接入实例才提示，由管理员确认，不会自动合并。
+- `/api/inbox` 返回 `contacts[]`（`conversationIds`、`defaultConversationId` 为最近有入站消息的会话）；带 `contactId` 时 `messages` 为该联系人全部会话按时间合并的线程，每条消息带 `connectorId`、`channelLabel`、`accountLabel`。网页中联系人是一行：未读为未免打扰会话之和，摘要取最新一条，回复经所选会话发送。
+- Agent 的 `listen_messages` 候选与 `claim_message` 消息带 `contact: {id, name}`（未关联为 `null`）；`agent_access` 的限制不变。
+
 详细协议见 [CONNECTOR_PROTOCOL.md](./CONNECTOR_PROTOCOL.md)。
 
 ## 发送与文件生命周期

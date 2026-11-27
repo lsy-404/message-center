@@ -17,6 +17,7 @@ export function formatRelativeAge(value: unknown, now?: Date | number | string):
 export function formatDayLabel(value: unknown, now?: Date | number | string): string
 export function buildThreadEntries<T extends {
   id: string
+  conversationId?: string
   direction: string
   senderName?: string | null
   authorRole?: string | null

@@ -1,5 +1,6 @@
 import PostalMime from "postal-mime";
 import { evaluateMessageFilter, normalizeFilterSettings, parseFilterSettings } from "./message-filter.js";
+import { normalizeContactName, suggestContactMatches } from "./contacts.js";
 import { OidcAuthError, beginOidcLogin, completeOidcLogin, oidcIdentity, logoutOidc, cleanupOidcSessions, clearOidcSessionCookie } from "./oidc.js";
 
 const JSON_HEADERS = {
@@ -1925,7 +1926,7 @@ async function readStickers(env) {
   }));
 }
 
-async function readInbox(env, selectedConversationId) {
+async function readInbox(env, selectedConversationId, selectedContactId) {
   const connectorsResult = await env.DB.prepare(`
     SELECT * FROM connector_instances ORDER BY kind, display_name
   `).all();
@@ -1971,21 +1972,27 @@ async function readInbox(env, selectedConversationId) {
     connectorState: liveState({ state: row.connector_state, last_seen_at: row.connector_last_seen }),
     capabilities: safeJson(row.capabilities_json, []),
   }));
+  const contacts = await readContacts(env);
+  const contact = contacts.find((item) => item.id === selectedContactId);
   const selected = conversations.some((item) => item.id === selectedConversationId)
     ? selectedConversationId : conversations[0]?.id || null;
+  const scope = contact
+    ? { sql: "conversation_id IN (SELECT conversation_id FROM contact_conversations WHERE contact_id = ?)", value: contact.id }
+    : { sql: "conversation_id = ?", value: selected };
   let messages = [];
   if (selected) {
     const messageResult = await env.DB.prepare(`
         SELECT m.*, a.sha256 AS sender_avatar_sha256, q.state AS agent_state,
-          k.kind AS connector_kind FROM (
-        SELECT * FROM messages WHERE conversation_id = ? AND queue_class != 'filtered'
+          k.kind AS connector_kind, k.channel_label AS connector_channel_label,
+          k.account_label AS connector_account FROM (
+        SELECT * FROM messages WHERE ${scope.sql} AND queue_class != 'filtered'
         ORDER BY occurred_at DESC, created_at DESC LIMIT 300
       ) m LEFT JOIN sender_avatars a
         ON a.connector_id = m.connector_id AND a.sender_id = m.sender_id
       LEFT JOIN agent_queue q ON q.message_id = m.id
       LEFT JOIN connector_instances k ON k.id = m.connector_id
       ORDER BY m.occurred_at ASC, m.created_at ASC
-    `).bind(selected).all();
+    `).bind(scope.value).all();
     const ids = (messageResult.results || []).map((row) => row.id);
     const attachmentMap = new Map();
     if (ids.length) {
@@ -1993,11 +2000,11 @@ async function readInbox(env, selectedConversationId) {
         SELECT id, message_id, external_id, file_name, mime_type, size_bytes, sha256, state, object_key
         FROM attachments
         WHERE message_id IN (
-          SELECT id FROM messages WHERE conversation_id = ? AND queue_class != 'filtered'
+          SELECT id FROM messages WHERE ${scope.sql} AND queue_class != 'filtered'
           ORDER BY occurred_at DESC, created_at DESC LIMIT 300
         )
         ORDER BY created_at
-      `).bind(selected).all();
+      `).bind(scope.value).all();
       for (const row of files.results || []) {
         const list = attachmentMap.get(row.message_id) || [];
         list.push({ id: row.id, externalId: row.external_id, fileName: row.file_name, mimeType: row.mime_type, sizeBytes: row.size_bytes,
@@ -2022,6 +2029,8 @@ async function readInbox(env, selectedConversationId) {
         attachments.length === 0;
       return {
         id: row.id, conversationId: row.conversation_id, direction: row.direction,
+        connectorId: row.connector_id, accountLabel: row.connector_account,
+        channelLabel: row.connector_channel_label || row.connector_kind,
         senderName: row.sender_name, body: row.body, contentType: row.content_type,
         senderAvatarPath: row.sender_avatar_sha256
           ? `/api/sender-avatars/${row.connector_id}/${row.sender_id}?v=${encodeURIComponent(row.sender_avatar_sha256)}` : null,
@@ -2036,7 +2045,7 @@ async function readInbox(env, selectedConversationId) {
     });
   }
   const filteredTotal = await env.DB.prepare("SELECT COUNT(*) AS total FROM messages WHERE queue_class = 'filtered'").first();
-  return { connectors, conversations, messages, selectedConversationId: selected,
+  return { connectors, conversations, contacts, messages, selectedConversationId: selected,
     filteredCount: count(filteredTotal?.total) };
 }
 
@@ -2111,6 +2120,160 @@ async function updateConnectorSettings(request, env, identity, connectorId) {
   `).bind(agentAccess, JSON.stringify(filter), now(), connectorId).run();
   await audit(env, identity.id, "connector_settings_updated", connectorId, { agentAccess, filter });
   return json({ ok: true, connectorId, agentAccess, filter });
+}
+
+const MAX_CONTACT_CONVERSATIONS = 20;
+
+function contactName(value) {
+  const name = String(value ?? "").trim();
+  if (!name || [...name].length > 100) throw new Error("invalid_contact_name");
+  return name;
+}
+
+async function contactRow(env, contactId) {
+  if (!validId(contactId)) throw new Error("invalid_contact_id");
+  const row = await env.DB.prepare("SELECT * FROM contacts WHERE id = ?").bind(contactId).first();
+  if (!row) throw new Error("contact_not_found");
+  return row;
+}
+
+const CONVERSATION_LINK_FIELDS = `
+  c.id, c.connector_id, COALESCE(p.display_name, c.title) AS title,
+  COALESCE(p.conversation_type, 'unknown') AS conversation_type,
+  EXISTS (SELECT 1 FROM group_text_backups b
+    WHERE b.connector_id = c.connector_id AND b.conversation_external_id = c.external_id) AS group_backup,
+  cc.contact_id
+  FROM conversations c
+  LEFT JOIN conversation_profiles p ON p.connector_id = c.connector_id AND p.conversation_external_id = c.external_id
+  LEFT JOIN contact_conversations cc ON cc.conversation_id = c.id`;
+
+function isGroupLink(row) { return row.conversation_type === "group" || Boolean(row.group_backup); }
+
+async function linkableConversations(env, ids, contactId) {
+  if (!Array.isArray(ids) || !ids.length || ids.length > MAX_CONTACT_CONVERSATIONS || !ids.every(validId)) {
+    throw new Error("invalid_conversation_ids");
+  }
+  const unique = [...new Set(ids)];
+  const rows = (await env.DB.prepare(`
+    SELECT ${CONVERSATION_LINK_FIELDS} WHERE c.id IN (${unique.map(() => "?").join(",")})
+  `).bind(...unique).all()).results || [];
+  if (rows.length !== unique.length) throw new Error("conversation_not_found");
+  for (const row of rows) {
+    if (isGroupLink(row)) throw new Error("group_conversation_not_linkable");
+    if (row.contact_id && row.contact_id !== contactId) throw new Error("conversation_already_linked");
+  }
+  return rows;
+}
+
+async function createContact(request, env, identity) {
+  const body = await readJson(request, 16 * 1024);
+  const rows = await linkableConversations(env, body.conversationIds, null);
+  const name = contactName(body.name ?? rows[0].title);
+  const note = String(body.note ?? "").slice(0, 500);
+  const id = crypto.randomUUID();
+  const stamp = now();
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO contacts (id, display_name, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+      .bind(id, name, note, stamp, stamp),
+    ...rows.map((row) => env.DB.prepare(
+      "INSERT INTO contact_conversations (conversation_id, contact_id, created_at) VALUES (?, ?, ?)",
+    ).bind(row.id, id, stamp)),
+  ]);
+  await audit(env, identity.id, "contact_created", id, { name, conversationIds: rows.map((row) => row.id) });
+  return json({ ok: true, contactId: id, name }, 201);
+}
+
+async function updateContact(request, env, identity, contactId) {
+  const contact = await contactRow(env, contactId);
+  const body = await readJson(request, 16 * 1024);
+  const name = body.name === undefined ? contact.display_name : contactName(body.name);
+  const note = body.note === undefined ? contact.note : String(body.note).slice(0, 500);
+  await env.DB.prepare("UPDATE contacts SET display_name = ?, note = ?, updated_at = ? WHERE id = ?")
+    .bind(name, note, now(), contactId).run();
+  await audit(env, identity.id, "contact_updated", contactId, { name, note });
+  return json({ ok: true, contactId, name, note });
+}
+
+async function deleteContact(env, identity, contactId) {
+  await contactRow(env, contactId);
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM contact_conversations WHERE contact_id = ?").bind(contactId),
+    env.DB.prepare("DELETE FROM contacts WHERE id = ?").bind(contactId),
+  ]);
+  await audit(env, identity.id, "contact_deleted", contactId, {});
+  return json({ ok: true, contactId });
+}
+
+async function linkContactConversation(request, env, identity, contactId) {
+  await contactRow(env, contactId);
+  const body = await readJson(request, 4 * 1024);
+  const [row] = await linkableConversations(env, [body.conversationId], contactId);
+  if (!row.contact_id) {
+    const total = await env.DB.prepare("SELECT COUNT(*) AS total FROM contact_conversations WHERE contact_id = ?")
+      .bind(contactId).first();
+    if (count(total?.total) >= MAX_CONTACT_CONVERSATIONS) throw new Error("contact_conversation_limit");
+    try {
+      await env.DB.prepare("INSERT INTO contact_conversations (conversation_id, contact_id, created_at) VALUES (?, ?, ?)")
+        .bind(row.id, contactId, now()).run();
+    } catch {
+      throw new Error("conversation_already_linked");
+    }
+    await audit(env, identity.id, "contact_conversation_linked", contactId, { conversationId: row.id });
+  }
+  return json({ ok: true, contactId, conversationId: row.id });
+}
+
+async function unlinkContactConversation(env, identity, contactId, conversationId) {
+  await contactRow(env, contactId);
+  if (!validId(conversationId)) throw new Error("invalid_conversation_id");
+  const result = await env.DB.prepare("DELETE FROM contact_conversations WHERE contact_id = ? AND conversation_id = ?")
+    .bind(contactId, conversationId).run();
+  if (!count(result.meta?.changes)) throw new Error("contact_link_not_found");
+  await audit(env, identity.id, "contact_conversation_unlinked", contactId, { conversationId });
+  return json({ ok: true, contactId, conversationId });
+}
+
+async function readContactSuggestions(env) {
+  const rows = (await env.DB.prepare(`SELECT ${CONVERSATION_LINK_FIELDS} LIMIT 2000`).all()).results || [];
+  const dismissed = new Set(((await env.DB.prepare("SELECT match_key FROM contact_suggestion_dismissals").all()).results || [])
+    .map((row) => row.match_key));
+  return suggestContactMatches(rows.filter((row) => !isGroupLink(row)).map((row) => ({
+    id: row.id, title: row.title, connectorId: row.connector_id, contactId: row.contact_id,
+  })), dismissed);
+}
+
+async function dismissContactSuggestion(request, env, identity) {
+  const body = await readJson(request, 4 * 1024);
+  const key = String(body.key ?? "");
+  if (!key || key.length > 200 || normalizeContactName(key) !== key) throw new Error("invalid_suggestion_key");
+  await env.DB.prepare("INSERT OR IGNORE INTO contact_suggestion_dismissals (match_key, created_at) VALUES (?, ?)")
+    .bind(key, now()).run();
+  await audit(env, identity.id, "contact_suggestion_dismissed", null, { key });
+  return json({ ok: true, key });
+}
+
+async function readContacts(env) {
+  const rows = (await env.DB.prepare(`
+    SELECT ct.id, ct.display_name, ct.note, cc.conversation_id,
+      (SELECT MAX(m.occurred_at) FROM messages m WHERE m.conversation_id = cc.conversation_id
+        AND m.direction = 'inbound' AND m.queue_class != 'filtered') AS last_inbound_at
+    FROM contacts ct JOIN contact_conversations cc ON cc.contact_id = ct.id
+    ORDER BY ct.created_at, cc.created_at
+  `).all()).results || [];
+  const contacts = new Map();
+  for (const row of rows) {
+    const contact = contacts.get(row.id) || { id: row.id, name: row.display_name, note: row.note,
+      conversationIds: [], defaultConversationId: null, inboundAt: "" };
+    contact.conversationIds.push(row.conversation_id);
+    if (row.last_inbound_at && row.last_inbound_at > contact.inboundAt) {
+      contact.inboundAt = row.last_inbound_at;
+      contact.defaultConversationId = row.conversation_id;
+    }
+    contacts.set(row.id, contact);
+  }
+  return [...contacts.values()].map(({ inboundAt: _inboundAt, defaultConversationId, ...contact }) => ({
+    ...contact, defaultConversationId: defaultConversationId || contact.conversationIds[0],
+  }));
 }
 
 async function stageHumanFile(request, env, identity) {
@@ -2934,9 +3097,12 @@ async function listenAgentMessages(env, filters, requestedLimit) {
   const conversationTypeSlots = filters.conversationTypes.map(() => "?").join(", ");
   const rows = await env.DB.prepare(`
     SELECT q.message_id, q.state, q.lease_expires_at, m.occurred_at, m.metadata_json,
-      c.id AS conversation_id, c.title AS conversation_title
+      c.id AS conversation_id, c.title AS conversation_title,
+      ct.id AS contact_id, ct.display_name AS contact_name
     FROM agent_queue q JOIN messages m ON m.id = q.message_id
     JOIN conversations c ON c.id = m.conversation_id
+    LEFT JOIN contact_conversations cc ON cc.conversation_id = c.id
+    LEFT JOIN contacts ct ON ct.id = cc.contact_id
     JOIN connector_instances k ON k.id = m.connector_id
     WHERE m.queue_class = 'immediate' AND k.agent_access != 'none'
       AND (q.state = 'pending' OR (q.state = 'leased' AND q.lease_expires_at < ?))
@@ -2951,6 +3117,7 @@ async function listenAgentMessages(env, filters, requestedLimit) {
       messageId: row.message_id,
       receivedAt: row.occurred_at,
       conversation: { id: row.conversation_id, title: row.conversation_title },
+      contact: row.contact_id ? { id: row.contact_id, name: row.contact_name } : null,
       event: {
         conversationType: LISTENER_CONVERSATION_TYPES.has(metadata.conversationType)
           ? metadata.conversationType : "direct",
@@ -2986,8 +3153,10 @@ async function readClaimedAgentMessage(env, messageId, leaseToken, leaseExpiresA
     SELECT m.*, c.title AS conversation_title, c.external_id AS conversation_external_id,
       c.trust_tier, c.agent_policy_json, k.kind AS connector_kind,
       k.channel_label AS connector_channel_label, k.account_label AS connector_account,
-      k.display_name AS connector_name
+      k.display_name AS connector_name, ct.id AS contact_id, ct.display_name AS contact_name
     FROM messages m JOIN conversations c ON c.id = m.conversation_id
+    LEFT JOIN contact_conversations cc ON cc.conversation_id = c.id
+    LEFT JOIN contacts ct ON ct.id = cc.contact_id
     JOIN connector_instances k ON k.id = m.connector_id WHERE m.id = ?
   `).bind(messageId).first();
   const files = await env.DB.prepare(`
@@ -3001,6 +3170,7 @@ async function readClaimedAgentMessage(env, messageId, leaseToken, leaseExpiresA
       connector: { id: row.connector_id, kind: row.connector_kind,
         channelLabel: row.connector_channel_label || row.connector_kind,
         accountLabel: row.connector_account, name: row.connector_name } },
+    contact: row.contact_id ? { id: row.contact_id, name: row.contact_name } : null,
     sender: { id: row.sender_id, name: row.sender_name }, receivedAt: row.occurred_at,
     text: row.body, contentType: row.content_type,
     event: {
@@ -3318,7 +3488,7 @@ async function appAssetResponse(request, env, assetPath) {
 function statusForError(message) {
   if (message === "request_too_large") return 413;
   if (message === "idempotency_key_conflict" || message === "idempotency_request_in_progress" ||
-      message === "inbound_file_cleanup_in_progress") return 409;
+      message === "inbound_file_cleanup_in_progress" || message === "conversation_already_linked") return 409;
   if (message.endsWith("_not_found") || message === "conversation_not_found") return 404;
   if (message.includes("not_supported") || message.includes("not_allowed") || message === "forbidden") return 403;
   return 400;
@@ -3543,7 +3713,7 @@ export default {
         return await downloadSenderAvatar(request, env, senderAvatarDownload[1], senderAvatarDownload[2]);
       }
       if (url.pathname === "/api/inbox" && request.method === "GET") {
-        return json({ ok: true, ...(await readInbox(env, url.searchParams.get("conversationId"))) });
+        return json({ ok: true, ...(await readInbox(env, url.searchParams.get("conversationId"), url.searchParams.get("contactId"))) });
       }
       if (url.pathname === "/api/filtered" && request.method === "GET") {
         return json({ ok: true, messages: await readFilteredMessages(env) });
@@ -3552,6 +3722,20 @@ export default {
       if (restoreRoute && request.method === "POST") return await restoreFilteredMessage(request, env, identity, restoreRoute[1]);
       const settingsRoute = url.pathname.match(/^\/api\/connectors\/([a-zA-Z0-9._:-]+)\/settings$/);
       if (settingsRoute && request.method === "PUT") return await updateConnectorSettings(request, env, identity, settingsRoute[1]);
+      if (url.pathname === "/api/contacts" && request.method === "POST") return await createContact(request, env, identity);
+      if (url.pathname === "/api/contacts/suggestions" && request.method === "GET") {
+        return json({ ok: true, suggestions: await readContactSuggestions(env) });
+      }
+      if (url.pathname === "/api/contacts/suggestions/dismiss" && request.method === "POST") {
+        return await dismissContactSuggestion(request, env, identity);
+      }
+      const contactRoute = url.pathname.match(/^\/api\/contacts\/([a-zA-Z0-9._:-]+)$/);
+      if (contactRoute && request.method === "PUT") return await updateContact(request, env, identity, contactRoute[1]);
+      if (contactRoute && request.method === "DELETE") return await deleteContact(env, identity, contactRoute[1]);
+      const contactLinks = url.pathname.match(/^\/api\/contacts\/([a-zA-Z0-9._:-]+)\/conversations$/);
+      if (contactLinks && request.method === "POST") return await linkContactConversation(request, env, identity, contactLinks[1]);
+      const contactLink = url.pathname.match(/^\/api\/contacts\/([a-zA-Z0-9._:-]+)\/conversations\/([a-zA-Z0-9._:-]+)$/);
+      if (contactLink && request.method === "DELETE") return await unlinkContactConversation(env, identity, contactLink[1], contactLink[2]);
       if (url.pathname === "/api/stickers" && request.method === "GET") {
         return json({ ok: true, stickers: await readStickers(env) });
       }

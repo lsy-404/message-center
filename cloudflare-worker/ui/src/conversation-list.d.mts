@@ -24,6 +24,17 @@ export function unreadTotal(conversations: Array<{ unreadCount?: unknown, muted?
 export function normalizeChannelLabel(value: unknown): string
 export function isQQGroupAssistantConversation<T extends Record<string, any>>(conversation: T): boolean
 export function filterQQGroupAssistantConversations<T extends Record<string, any>>(conversations: T[]): T[]
+export const CONTACT_ROW_PREFIX: string
+export type ContactSummary = {
+  id: string
+  name: string
+  note: string
+  conversationIds: string[]
+  defaultConversationId: string
+}
+export function aggregateContacts<T extends Record<string, any>>(
+  conversations: T[], contacts: ContactSummary[],
+): Array<T & { members?: T[], contactId?: string }>
 export function normalizeConversationListPath(path: unknown): string[]
 export function canEnterConversationListFolder(path: unknown): boolean
 export function enterConversationListFolder(path: unknown, folderId: unknown): string[]

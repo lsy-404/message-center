@@ -533,6 +533,7 @@ button { color: inherit; }
 /* Thread */
 
 .content-pane {
+  position: relative;
   display: grid;
   min-width: 0;
   min-height: 0;
@@ -569,6 +570,63 @@ button { color: inherit; }
 .presence.online { color: var(--success-text); }
 .presence.degraded { color: var(--warning-text); }
 .mobile-back { display: none; }
+
+/* Contacts */
+
+.contact-channels { display: inline-flex; flex: 0 0 auto; gap: 2px; }
+.contact-channel { display: grid; min-width: 15px; height: 15px; padding: 0 2px; place-items: center; border-radius: 4px; font-size: 9px; font-weight: 700; line-height: 1; }
+.message-channel { padding: 0 6px; border-radius: 8px; font-size: 11px; font-weight: 600; line-height: 16px; }
+.header-text-button { flex: 0 0 auto; padding: 5px 10px; border: 1px solid var(--ctrl-border); border-radius: 6px; color: var(--text-primary); background: var(--ctrl-fill-secondary); font: inherit; font-size: 13px; cursor: pointer; }
+.header-text-button:hover { background: var(--row-hover); }
+.contact-panel {
+  position: absolute;
+  z-index: 5;
+  top: 62px;
+  right: 16px;
+  display: flex;
+  width: min(380px, calc(100% - 32px));
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--stroke-divider);
+  border-radius: 8px;
+  background: var(--layer-default);
+  box-shadow: var(--shadow-soft);
+  font-size: 13px;
+}
+.panel-field { display: flex; align-items: center; gap: 8px; }
+.panel-field > span { flex: 0 0 auto; color: var(--text-tertiary); font-size: 12px; }
+.panel-field select, .panel-field input, .send-target select {
+  min-width: 0;
+  flex: 1;
+  padding: 5px 8px;
+  border: 1px solid var(--ctrl-border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  background: var(--ctrl-fill-secondary);
+  font: inherit;
+  font-size: 13px;
+}
+.panel-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.panel-button, .suggestion-action { padding: 4px 10px; border: 1px solid var(--ctrl-border); border-radius: 6px; color: var(--text-primary); background: var(--ctrl-fill-secondary); font: inherit; font-size: 12.5px; white-space: nowrap; cursor: pointer; }
+.panel-button:hover:not(:disabled), .suggestion-action:hover:not(:disabled) { background: var(--row-hover); }
+.panel-button:disabled, .suggestion-action:disabled { color: var(--text-disabled); cursor: not-allowed; }
+.panel-button.primary, .suggestion-action:not(.quiet) { border-color: transparent; color: #fff; background: var(--accent-base); }
+.panel-button.primary:hover:not(:disabled), .suggestion-action:not(.quiet):hover:not(:disabled) { background: var(--accent-hover); }
+.panel-button.danger { color: var(--danger-text); }
+.panel-links { display: flex; margin: 0; padding: 0; flex-direction: column; gap: 6px; list-style: none; }
+.panel-links li { display: flex; align-items: center; gap: 8px; }
+.panel-link-name { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.send-target { flex: 0 1 auto; min-width: 0; }
+.send-target select { max-width: 190px; padding: 3px 6px; font-size: 12px; }
+.contact-suggestions { margin: 0 0 6px; padding: 6px 8px; border: 1px solid var(--stroke-divider); border-radius: 8px; font-size: 12.5px; }
+.contact-suggestions summary { color: var(--text-secondary); font-weight: 600; cursor: pointer; }
+.suggestion-count { margin-left: 4px; color: var(--accent-base); }
+.contact-suggestions ul { display: flex; margin: 8px 0 2px; padding: 0; flex-direction: column; gap: 8px; list-style: none; }
+.contact-suggestions li { display: flex; align-items: center; gap: 6px; }
+.suggestion-copy { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
+.suggestion-copy strong, .suggestion-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.suggestion-copy small { color: var(--text-tertiary); }
 
 .status-chip {
   display: inline-flex;
