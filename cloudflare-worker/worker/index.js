@@ -2311,10 +2311,6 @@ async function queueOutbound(env, input, retryDepth = 0) {
   if (conversation.connector_mode === "device_relay" && attachmentIds.length > 1) {
     throw new Error("invalid_device_attachment_count");
   }
-  if (attachmentIds.length && conversation.connector_mode === "device_relay" &&
-      conversation.conversation_type !== "group") {
-    throw new Error("connector_file_send_not_supported");
-  }
   const stamp = now();
   // The claim belongs to this execution attempt, not to the public idempotency key. Two
   // concurrent retries must never be able to release or consume each other's attachments.

@@ -346,8 +346,6 @@ const deviceConversation = computed(() => selectedConversationConnector.value?.m
 const maxTextLength = computed(() => deviceConversation.value ? 500 : 20_000)
 const canSendFiles = computed(() => {
   if (!connectorReachable.value) return false
-  if (selectedConversationConnector.value?.mode === 'device_relay'
-      && selectedConversation.value?.conversationType !== 'group') return false
   const capabilities = selectedConversation.value?.capabilities ?? []
   return capabilities.includes('send_files') || capabilities.includes('send_images') || capabilities.includes('send_video')
 })

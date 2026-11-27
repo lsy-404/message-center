@@ -848,15 +848,6 @@ const outboundStage = await worker.fetch(new Request('https://message.example.co
 }), workerEnv, {});
 assert.equal(outboundStage.status, 201);
 const outboundAttachment = (await outboundStage.json()).attachment;
-const directFileBlocked = await worker.fetch(new Request('https://message.example.com/api/messages/send', {
-  method: 'POST',
-  headers: { ...auth.headers, 'content-type': 'application/json' },
-  body: JSON.stringify({ conversationId: profileOnlyConversation.id, body: '',
-    attachmentIds: [outboundAttachment.id], clientRequestId: 'web-direct-file-block-0001' }),
-}), workerEnv, {});
-assert.equal(directFileBlocked.status, 403);
-assert.equal((await directFileBlocked.json()).error, 'connector_file_send_not_supported');
-assert.equal(database.prepare('SELECT state FROM attachments WHERE id = ?').get(outboundAttachment.id).state, 'staged');
 database.prepare(`
   UPDATE conversation_profiles SET conversation_type = 'group'
   WHERE connector_id = ? AND conversation_external_id = 'profile-only-live'

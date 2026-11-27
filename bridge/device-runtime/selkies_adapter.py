@@ -388,9 +388,13 @@ def qq_owner(tree):
 
 
 def qq_open_chat(tree):
-    """The open chat's name: its input box is named after it."""
+    """The open chat's name: the input box carries it while it holds text, the chat header's leftmost button always."""
     node = find(tree, lambda n: n.get("role") == "section" and (n.get("states") or {}).get("editable") and n.get("name"))
-    return node.get("name") if node else None
+    if node:
+        return node.get("name")
+    header = [n for n in walk(tree) if n.get("role") == "button" and text_of(n) and n.get("bounds")
+              and n["bounds"]["x"] > 300 and 40 < n["bounds"]["y"] < 120]
+    return min(header, key=lambda n: n["bounds"]["x"]).get("name") if header else None
 
 
 def qq_scroll_top(desktop, window_id, tree):
@@ -432,13 +436,17 @@ def qq_mark_pinned(desktop, window_id, rows, open_name):
     for row, colour in colours:
         if row["name"] != open_name:
             row["pinned"] = colour != common
-    # The list puts pinned chats first and the rest newest first, so an open chat older than an unpinned chat
-    # below it must be pinned.
+    # The list puts pinned chats first and the rest newest first: an open chat below an unpinned chat is not pinned,
+    # and one older than an unpinned chat below it is.
     for index, row in enumerate(rows):
-        if row["pinned"] is None and row["name"] == open_name and time_rank(row["time"]) is not None:
-            if any(other["pinned"] is False and (time_rank(other["time"]) or (-1,)) > time_rank(row["time"])
-                   for other in rows[index + 1:]):
-                row["pinned"] = True
+        if row["pinned"] is not None or row["name"] != open_name:
+            continue
+        if any(other["pinned"] is False for other in rows[:index]):
+            row["pinned"] = False
+        elif time_rank(row["time"]) is not None and any(
+                other["pinned"] is False and (time_rank(other["time"]) or (-1,)) > time_rank(row["time"])
+                for other in rows[index + 1:]):
+            row["pinned"] = True
     return rows
 
 
