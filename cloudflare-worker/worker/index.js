@@ -3983,6 +3983,11 @@ export default {
             headers.set("cache-control", "no-store");
             return new Response(null, { status: 303, headers });
           }
+          if (caught.code === "auth_refresh_pending") {
+            // Another request holds the session refresh; the browser reloads once it has finished.
+            headers.set("refresh", String(caught.retryAfter || 1));
+            return authenticationPage("正在刷新登录状态，马上自动重试。", caught.status, headers);
+          }
           return authenticationPage("登录服务暂时不可用，请稍后重试。", caught.status, headers);
         }
         return json({ ok: false, error: caught.code }, caught.status, Object.fromEntries(headers));
