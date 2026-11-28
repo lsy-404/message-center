@@ -1,0 +1,14 @@
+{
+  "name": "mc-input",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Pointer executor installed in the desktop image.",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "ghost-cursor": "1.4.2"
+  },
+  "packageManager": "pnpm@10.34.6"
+}

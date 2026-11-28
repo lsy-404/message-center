@@ -40,7 +40,6 @@ A connector's `id` is its `kind`, a hyphen and the account it reads: the QQ numb
 ```json
 {
   "docker": "/opt/homebrew/bin/docker",
-  "node": "/usr/local/bin/node",
   "profiles": {
     "wechat-a": {
       "desktopUrl": "http://127.0.0.1:13000",
@@ -63,7 +62,7 @@ A connector's `id` is its `kind`, a hyphen and the account it reads: the QQ numb
 
 The adapter reads windows, accessibility trees and screenshots through Pelorus at `desktopUrl`, and sends clicks, keys and text with `xdotool` inside `container` through `docker exec`, using the absolute `docker` path (launchd gives the runtime a minimal `PATH`): Pelorus pauses about a second after every action it performs, while `docker exec xdotool` takes about 0.1 second, and `xdotool type` enters CJK text and 「」 as they are.
 
-The pointer moves the way a hand moves it. Before every click, scroll and hover the adapter reads the pointer position and has `pointer_path.mjs` (run with the absolute `node` path; install the bridge's dependencies with `pnpm install`) draw a path with [ghost-cursor](https://github.com/Xetera/ghost-cursor): a Bézier curve whose number of steps follows Fitts's law, ending at a random point inside the target away from its edges, and overshooting then correcting on moves longer than 500 px. `xdotool` replays it one step every 4–8 ms, then presses and releases the button 60–120 ms apart; scrolling sends wheel notches 10–30 ms apart. A move across the screen takes about half a second. A window is brought forward by clicking an empty patch of its title strip, only when it is not already focused.
+The pointer moves the way a hand moves it. Clicks, scrolls and hovers go through `mc-input`, an executor the image adds (see below): it reads the pointer position, draws a path with [ghost-cursor](https://github.com/Xetera/ghost-cursor) — a Bézier curve whose number of steps follows Fitts's law, ending at a random point inside the target away from its edges, overshooting then correcting on moves longer than 500 px — and replays it with one `xdotool` call, one step every 4–8 ms, pressing and releasing the button 60–120 ms apart and sending wheel notches 10–30 ms apart. One action is one `docker exec`; a move across the screen takes about half a second. A window is brought forward by clicking an empty patch of its title strip, only when it is not already focused.
 
 `outgoingDirectory` is a folder inside the container's mounted config volume and `containerOutgoingDirectory` is the same folder as the container sees it; files to send are copied there under their own names (recipients see them) and removed after a day. Without both, sends with files are refused before anything is sent. `tokenFile` holds the container's Selkies master token (`SELKIES_MASTER_TOKEN`), which the adapter sends as `Authorization: Bearer`; it stays outside the repository. The runtime starts the adapter directly, so keep it executable (`chmod 755 selkies_adapter.py`). Run one container per client account (`AUTO_START_WECHAT` / `AUTO_START_QQ` pick the client), so each desktop has one client to restore, maximize and read, and a second account is one more container. A container costs about 0.3 GB for the desktop and streaming stack (with audio, printing and the TURN server turned off as below) plus 0.4–1 GB for its client, which grows the longer it runs. The adapter keeps each profile's chat names and recent sends, and nothing else, in `selkies_adapter.<profile>.state.json` beside itself (mode `0600`), so two accounts in the same group do not take each other's messages for their own.
 
@@ -71,17 +70,11 @@ The pointer moves the way a hand moves it. Before every click, scroll and hover 
 
 The adapter reads the desktop through the container's accessibility API. WeChat exposes it by default. QQ exposes its chat list only when started with `--force-renderer-accessibility`. `/usr/bin/qq` in the stock image is a symlink to `/opt/QQ/qq`, so bind-mounting a wrapper over it would overwrite the real binary.
 
-The container runs in Selkies secure mode: a master token protects every API and stream for the adapter, and a controller session token, which the Worker adds to every request it forwards, serves the web UI's native view. The stock start script forces basic auth on, so the derived image also lets `SELKIES_ENABLE_BASIC_AUTH` turn it off (the build fails if that line of the upstream script changes):
+The container runs in Selkies secure mode: a master token protects every API and stream for the adapter, and a controller session token, which the Worker adds to every request it forwards, serves the web UI's native view.
 
-```dockerfile
-FROM ghcr.io/nickrunning/wechat-selkies:latest
-RUN rm /usr/bin/qq && printf '#!/bin/sh\nexec /opt/QQ/qq --force-renderer-accessibility "$@"\n' > /usr/bin/qq && chmod 755 /usr/bin/qq
-RUN grep -qx 'export SELKIES_ENABLE_BASIC_AUTH=true' /wechat-container-start \
- && sed -i 's/^export SELKIES_ENABLE_BASIC_AUTH=true$/export SELKIES_ENABLE_BASIC_AUTH=${SELKIES_ENABLE_BASIC_AUTH:-true}/' /wechat-container-start
-RUN rm -rf /etc/service/pipewire /etc/service/pipewire-pulse /etc/service/wireplumber
-```
+The image is built from [`container/Dockerfile`](container/Dockerfile): upstream `ghcr.io/nickrunning/wechat-selkies:latest`, followed on every build with `--pull`, plus our own layer. The layer replaces `/usr/bin/qq` with the accessibility wrapper; lets `SELKIES_ENABLE_BASIC_AUTH` turn off the basic auth the stock start script forces on (the build fails if that line of the upstream script changes); drops the audio services, which nothing here uses; and installs `xdotool` and the `mc-input` executor (`container/mc-input.mjs`, Node with ghost-cursor pinned by `container/pnpm-lock.yaml`): `mc-input move X Y W H`, `mc-input click X Y W H [left|right]` and `mc-input scroll X Y up|down N` on `DISPLAY :20`, exiting 2 on bad arguments and 1 when `xdotool` fails.
 
-The last line drops the audio services, which nothing here uses.
+[`container/run-container.sh`](container/run-container.sh) `<instance> <port> <wechat|qq>` rebuilds the image and recreates `selkies-<instance>` with the settings below. `DESKTOP_ROOT` (default `~/.local/share/wechat-selkies`) holds the shared `password` and `frame-ancestors` files and one folder per instance with its config volume, tokens and machine identity.
 
 Generate two random tokens (for example `openssl rand -hex 32`), keep them in mode-`0600` files, and write the session token into a tokens file inside the container's config volume, also mode `0600`: `{"<session-token>": {"role": "controller", "mk_control": true}}`. The same session token goes into the Worker's `NATIVE_DESKTOPS` secret. Then run the container with:
 
@@ -90,7 +83,7 @@ Generate two random tokens (for example `openssl rand -hex 32`), keep them in mo
 - `SELKIES_AUDIO_ENABLED=false`, `SELKIES_PRINTING_ENABLED=false` and `SELKIES_ENABLE_DUAL_MODE=false`: the native view streams over WebSockets, so the TURN server, the print queue and audio capture are not started
 - the published port bound to `127.0.0.1` only; the Worker reaches it through a Cloudflare Tunnel (`cloudflared` on the same machine, QUIC transport) and a Workers VPC HTTP service pointing at `127.0.0.1:<port>`
 - `AUTO_START_WECHAT` / `AUTO_START_QQ` set to `true` for the one client this container runs, and a non-empty `PASSWORD` (the start script still requires one)
-- a fixed `--hostname`; the clients tie a saved sign-in to it, so a recreated container with a new hostname asks to sign in again
+- one machine identity per instance that survives restarts and recreation: `--hostname`, `--mac-address` (a Realtek OUI), and a `machine-id` and DMI `product_uuid` bind-mounted read-only over `/etc/machine-id`, `/var/lib/dbus/machine-id` and `/sys/devices/virtual/dmi/id/product_uuid`. The stock image ships one machine-id for every container and Docker gives each new container a random MAC, so without these a recreated container looks like a new device to QQ and WeChat. `run-container.sh` generates them once per instance
 
 Sign each client in once in Message Center's native view. Tick QQ's 自动登录 so it signs in again after a restart; WeChat asks for a confirmation on the phone after each container restart.
 

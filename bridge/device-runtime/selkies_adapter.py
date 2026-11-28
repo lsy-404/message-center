@@ -15,7 +15,6 @@ import datetime
 import hashlib
 import json
 import os
-import random
 import re
 import secrets
 import shutil
@@ -64,7 +63,6 @@ ROW_MARKERS = re.compile(r"^(\[(有人@我|有新文件|有人@你|草稿)\])+")
 SENDER = re.compile(r"^([^:：\[\]\n]{1,64})(?:: |：)(.*)$", re.S)
 CONTAINER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 INPUT_TIMEOUT = 20
-POINTER_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pointer_path.mjs")
 # Each signed-in account leaves a marker here; the newest one is the account signed in now.
 ACCOUNT_MARKERS = {
     "qq": ("/config/.config/QQ/global/nt_data/Login", re.compile(r"^\.([1-9][0-9]{4,11})$")),
@@ -165,11 +163,11 @@ def container(config, profile):
         raise AdapterError("token_missing")
     if not token:
         raise AdapterError("token_missing")
-    name, docker, node = entry.get("container"), config.get("docker"), config.get("node")
-    if not isinstance(name, str) or not CONTAINER_NAME.match(name) \
-            or not all(isinstance(path, str) and os.path.isabs(path) for path in (docker, node)):
+    name, docker = entry.get("container"), config.get("docker")
+    if not isinstance(name, str) or not CONTAINER_NAME.match(name) or not isinstance(docker, str) \
+            or not os.path.isabs(docker):
         raise AdapterError("profile_invalid")
-    return Desktop(url, "Bearer " + token, docker, name, node), entry
+    return Desktop(url, "Bearer " + token, docker, name), entry
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -180,12 +178,11 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 class Desktop:
     """The container's Pelorus API for windows, accessibility trees and pictures, and xdotool for input."""
 
-    def __init__(self, url, authorization, docker, name, node):
+    def __init__(self, url, authorization, docker, name):
         self.url = url
         self.authorization = authorization
         self.docker = docker
         self.name = name
-        self.node = node
 
     def call(self, path, method="GET", payload=None):
         data = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -212,32 +209,20 @@ class Desktop:
             raise AdapterError("desktop_action_failed")
         return result.get("text") or ""
 
-    def xdotool(self, *arguments):
+    def exec(self, *command):
         try:
-            return subprocess.run([self.docker, "exec", self.name, "env", "DISPLAY=:20", "xdotool"] + list(arguments),
+            return subprocess.run([self.docker, "exec", self.name, "env", "DISPLAY=:20"] + list(command),
                                   stdin=subprocess.DEVNULL, capture_output=True,
-                                  timeout=INPUT_TIMEOUT, check=True).stdout.decode("ascii", "replace")
+                                  timeout=INPUT_TIMEOUT, check=True).stdout.decode("utf-8", "replace")
         except (OSError, subprocess.SubprocessError):
             raise AdapterError("desktop_input_failed")
 
-    def glide(self, bounds, *then):
-        """Moves the pointer into `bounds` along a ghost-cursor path, one xdotool step every few milliseconds, then
-        runs the xdotool commands in `then` from there."""
-        location = dict(re.findall(r"^([XY])=(-?\d+)$", self.xdotool("getmouselocation", "--shell"), re.M))
-        if "X" not in location or "Y" not in location:
-            raise AdapterError("desktop_input_failed")
-        try:
-            output = subprocess.run(
-                [self.node, POINTER_PATH, location["X"], location["Y"]]
-                + [str(int(bounds[key])) for key in ("x", "y", "w", "h")],
-                stdin=subprocess.DEVNULL, capture_output=True, timeout=INPUT_TIMEOUT, check=True).stdout
-            points = json.loads(output)
-        except (OSError, subprocess.SubprocessError, ValueError):
-            raise AdapterError("pointer_path_failed")
-        steps = []
-        for x, y in points:
-            steps += ["mousemove", str(x), str(y), "sleep", "{:.3f}".format(random.uniform(0.004, 0.008))]
-        self.xdotool(*(steps + list(then)))
+    def xdotool(self, *arguments):
+        return self.exec("xdotool", *arguments)
+
+    def pointer(self, *arguments):
+        """The image's mc-input executor: moves the pointer along a human-like path before it clicks or scrolls."""
+        return self.exec("mc-input", *[str(int(a)) if isinstance(a, (int, float)) else a for a in arguments])
 
     def control(self, window_id, pattern):
         return control_in(self.tree(window_id), pattern)
@@ -246,18 +231,13 @@ class Desktop:
         self.click(control["bounds"])
 
     def click(self, bounds, button="left"):
-        code = "3" if button == "right" else "1"
-        self.glide(bounds, "sleep", "{:.3f}".format(random.uniform(0.05, 0.15)),
-                   "mousedown", code, "sleep", "{:.3f}".format(random.uniform(0.06, 0.12)), "mouseup", code)
+        self.pointer("click", bounds["x"], bounds["y"], max(1, bounds["w"]), max(1, bounds["h"]), button)
 
     def point(self, x, y):
-        self.glide({"x": x - 3, "y": y - 3, "w": 6, "h": 6})
+        self.pointer("move", x - 3, y - 3, 6, 6)
 
     def scroll(self, at, direction, amount):
-        notches = []
-        for _ in range(amount):
-            notches += ["click", "4" if direction == "up" else "5", "sleep", "{:.3f}".format(random.uniform(0.01, 0.03))]
-        self.glide({"x": at[0] - 10, "y": at[1] - 10, "w": 20, "h": 20}, *notches)
+        self.pointer("scroll", at[0], at[1], direction, amount)
 
     def key(self, keys):
         self.xdotool("key", "--clearmodifiers", keys)
