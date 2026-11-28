@@ -765,10 +765,16 @@ function notify(message: string) {
   toastTimer = window.setTimeout(() => { toast.value = '' }, 3000)
 }
 
-async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
+async function api<T>(path: string, options: RequestInit = {}, attempt = 0): Promise<T> {
   const response = await fetch(path, { cache: 'no-store', credentials: 'same-origin', ...options })
   const type = response.headers.get('content-type') || ''
   const body = type.includes('json') ? await response.json() : null
+  // Requests that arrive while another one is refreshing the session wait for it and try again.
+  if (response.status === 503 && body?.error === 'auth_refresh_pending' && attempt < 5) {
+    const seconds = Number(response.headers.get('retry-after')) || 1
+    await new Promise((resolve) => window.setTimeout(resolve, seconds * 1000))
+    return api<T>(path, options, attempt + 1)
+  }
   if (response.status === 401) {
     window.location.replace('/login')
     throw new Error('access_required')

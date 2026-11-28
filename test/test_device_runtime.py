@@ -1507,112 +1507,6 @@ class DeviceRuntimeTests(unittest.TestCase):
             self.assertEqual(following[0][3]["state"], "offline")
         self.assertFalse(any(row[1] == "GET" and "/commands?" in row[2] for row in calls))
 
-    def test_slow_profile_and_avatar_acks_keep_heartbeat_progress_bounded(self):
-        now = [100.0]
-        http_calls = []
-        png = b"\x89PNG\r\n\x1a\nsmall-avatar"
-        encoded_avatar = base64.b64encode(png).decode("ascii")
-        profiles = [{"conversationExternalId": f"profile-{index}", "displayName": "Profile"}
-                    for index in range(20)]
-        avatars = [{"senderId": f"sender-{index}", "avatarBase64": encoded_avatar}
-                   for index in range(20)]
-
-        class SlowResponse:
-            def __init__(self, url):
-                self.url = url
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def geturl(self):
-                return self.url
-
-            def read(self, _limit):
-                return b'{"ok":true}'
-
-        class SlowOpener:
-            def __init__(self):
-                self.requests = []
-
-            def open(self, request, timeout):
-                self.requests.append((request, timeout))
-                now[0] += 5
-                return SlowResponse(request.full_url)
-
-        opener = SlowOpener()
-        relay = runtime.Relay(self.config, self.db,
-                              lambda _request: {"ok": True, "sourceReadStatus": "complete",
-                                                "health": "online", "cursor": {"next": "done"},
-                                                "messages": [], "conversationProfiles": profiles,
-                                                "senderAvatars": avatars},
-                              lambda method, path, payload=None:
-                                  http_calls.append((now[0], method, path, payload)) or {"ok": True})
-        relay.select_connector(relay.connectors[0])
-
-        with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]), \
-                patch.object(conversation_profiles.urllib.request, "build_opener", return_value=opener):
-            self.assertTrue(relay.scan_profile("primary"))
-
-        profile_requests = [request for request, _timeout in opener.requests
-                            if "/conversation-profiles/" in request.full_url]
-        avatar_requests = [request for request, _timeout in opener.requests
-                           if "/sender-avatars/" in request.full_url]
-        self.assertEqual(len(profile_requests), 20)
-        self.assertEqual(len(avatar_requests), 20)
-        heartbeat_rows = [row for row in http_calls if row[2].endswith("/heartbeat")]
-        self.assertGreater(now[0] - 100, 90)
-        self.assertGreaterEqual(len(heartbeat_rows), 6)
-        self.assertTrue(all(row[3]["state"] == "online" for row in heartbeat_rows))
-        self.assertTrue(all(right[0] - left[0] >= runtime.HEARTBEAT_MIN_INTERVAL
-                            for left, right in zip(heartbeat_rows, heartbeat_rows[1:])))
-        self.assertTrue(any(row[0] >= 200 for row in heartbeat_rows))
-        self.assertEqual(relay.failures["connector-a"], 0)
-
-    def test_profile_ack_heartbeat_failure_does_not_fail_scan_or_connector_backoff(self):
-        now = [100.0]
-
-        def http(_method, path, _payload=None):
-            if path.endswith("/heartbeat"):
-                raise OSError("heartbeat offline")
-            return {"ok": True}
-
-        relay = runtime.Relay(
-            self.config, self.db,
-            lambda _request: {"ok": True, "sourceReadStatus": "complete", "health": "online",
-                              "cursor": {"next": "done"}, "messages": [],
-                              "conversationProfiles": [{"conversationExternalId": "profile-a",
-                                                         "displayName": "Profile"}]}, http)
-        relay.select_connector(relay.connectors[0])
-
-        class Response:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def geturl(self):
-                return "https://worker.example/api/connectors/conversation-profiles/profile-a"
-
-            def read(self, _limit):
-                return b'{"ok":true}'
-
-        class Opener:
-            def open(self, _request, timeout):
-                self.timeout = timeout
-                return Response()
-
-        with patch.object(runtime.time, "monotonic", side_effect=lambda: now[0]), \
-                patch.object(conversation_profiles.urllib.request, "build_opener", return_value=Opener()):
-            self.assertTrue(relay.scan_profile("primary"))
-
-        self.assertEqual(relay.heartbeat_failures["connector-a"], 1)
-        self.assertEqual(relay.failures["connector-a"], 0)
-        self.assertEqual(json_cursor(self.db), runtime.compact({"next": "done"}))
-
     def test_same_state_heartbeat_is_throttled_but_state_change_is_immediate(self):
         now = [100.0]
         calls = []
@@ -1779,40 +1673,26 @@ class DeviceRuntimeTests(unittest.TestCase):
         with self.assertRaises(runtime.urllib.error.HTTPError):
             runtime.NoRedirect().redirect_request(request, None, 302, "Found", {}, "https://other.example/")
 
-    def test_http_request_sends_device_headers_and_connector_identity(self):
+    def test_request_goes_over_the_signal_socket_with_connector_identity(self):
         received = {}
 
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                received["path"] = self.path
-                received["headers"] = self.headers
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"ok":true}')
+        class FakeSignal:
+            def request(self, method, path, headers, body, timeout):
+                received.update(method=method, path=path, headers=headers, body=body)
+                return 200, '{"ok":true}'
 
-            def log_message(self, _format, *_args):
-                pass
-
-        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            relay = runtime.Relay(self.config, self.db, lambda _request: {}, None)
-            relay.base = "http://127.0.0.1:%d" % server.server_port
-            relay.select_connector(self.config["connectors"][0])
-            result = relay.request("GET", "/api/connectors/healthz")
-        finally:
-            server.shutdown()
-            thread.join(timeout=2)
-            server.server_close()
+        relay = runtime.Relay(self.config, self.db, lambda _request: {}, None)
+        relay.signals["connector-a"] = FakeSignal()
+        relay.select_connector(self.config["connectors"][0])
+        result = relay.request("POST", "/api/connectors/heartbeat", {"state": "online"})
 
         self.assertEqual(result, {"ok": True})
-        self.assertEqual(received["path"], "/api/connectors/healthz")
-        self.assertEqual(received["headers"].get("User-Agent"), "MessageCenterDevice/1.0")
-        self.assertEqual(received["headers"].get("Accept"), "application/json")
-        self.assertEqual(received["headers"].get("Authorization"), "Bearer " + "x" * 40)
-        self.assertEqual(received["headers"].get("X-connector-id"), "connector-a")
+        self.assertEqual(received["method"], "POST")
+        self.assertEqual(received["path"], "/api/connectors/heartbeat")
+        self.assertEqual(received["body"], b'{"state":"online"}')
+        self.assertEqual(received["headers"]["Authorization"], "Bearer " + "x" * 40)
+        self.assertEqual(received["headers"]["x-connector-id"], "connector-a")
+        self.assertEqual(received["headers"]["Content-Type"], "application/json")
 
 
 def json_cursor(db):

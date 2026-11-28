@@ -1,12 +1,17 @@
-// Sockets only carry wake-ups: devices hear "command" and lease it over HTTP; the owner's pages hear "changed" and
-// reload the inbox. A missed signal waits for the next poll either way.
+import worker from "./index.js";
+
+// Devices hear "command" and the owner's pages hear "changed"; a missed signal waits for the next poll either way.
+// Devices may also send small JSON API calls as {"t":"req"} frames, answered with {"t":"res"} frames.
 // Devices ping every 60 seconds, under the edge's 100-second idle limit.
 const SIGNAL_LIVE_MS = 150_000;
 const OWNER_TAG = "owner";
+const MAX_FRAME_BYTES = 1024 * 1024;
+const TEXT_ENCODER = new TextEncoder();
 
 export class CommandSignal {
-  constructor(state) {
+  constructor(state, env) {
     this.state = state;
+    this.env = env;
     // Keep-alive pings are answered without waking the object.
     state.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
@@ -30,7 +35,7 @@ export class CommandSignal {
     }
     const [client, server] = Object.values(new WebSocketPair());
     this.state.acceptWebSocket(server, [tag]);
-    server.serializeAttachment({ acceptedAt: Date.now() });
+    server.serializeAttachment({ acceptedAt: Date.now(), origin: new URL(request.url).origin });
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -39,15 +44,77 @@ export class CommandSignal {
     const connectors = new Set();
     for (const socket of this.state.getWebSockets()) {
       const pinged = this.state.getWebSocketAutoResponseTimestamp(socket)?.getTime() || 0;
-      const accepted = socket.deserializeAttachment()?.acceptedAt || 0;
-      if (Date.now() - Math.max(pinged, accepted) <= SIGNAL_LIVE_MS) {
+      const attachment = socket.deserializeAttachment();
+      const active = Math.max(pinged, attachment?.acceptedAt || 0, attachment?.lastMessageAt || 0);
+      if (Date.now() - active <= SIGNAL_LIVE_MS) {
         for (const tag of this.state.getTags(socket)) if (tag !== OWNER_TAG) connectors.add(tag);
       }
     }
     return connectors;
   }
 
-  webSocketMessage() {}
+  async webSocketMessage(socket, message) {
+    if (typeof message !== "string") return;
+    const oversize = TEXT_ENCODER.encode(message).length > MAX_FRAME_BYTES;
+    let frame;
+    if (oversize) {
+      frame = { id: Number(/"id"\s*:\s*(\d+)/.exec(message.slice(0, 256))?.[1]) };
+    } else {
+      try {
+        frame = JSON.parse(message);
+      } catch {
+        return;
+      }
+    }
+    if (frame?.t !== "req" && !oversize) return;
+    const id = frame?.id;
+    if (!Number.isSafeInteger(id)) return;
+    const attachment = socket.deserializeAttachment() || {};
+    socket.serializeAttachment({ ...attachment, lastMessageAt: Date.now() });
+    const reply = (status, body) => {
+      try {
+        socket.send(JSON.stringify({ t: "res", id, status, body }));
+      } catch {
+        // The socket closed; the client's call times out and its caller retries.
+      }
+    };
+    if (oversize) return reply(413, JSON.stringify({ ok: false, error: "frame_too_large" }));
+    const path = typeof frame.path === "string" ? frame.path : "";
+    const method = typeof frame.method === "string" ? frame.method.toUpperCase() : "";
+    if (!["GET", "POST", "PUT"].includes(method) || !frame.headers || typeof frame.headers !== "object"
+      || Array.isArray(frame.headers)) {
+      return reply(400, JSON.stringify({ ok: false, error: "bad_request" }));
+    }
+    const route = path.split("?")[0];
+    if (!route.startsWith("/api/connectors/") || route === "/api/connectors/signal"
+      || route.startsWith("/api/connectors/files/")) {
+      return reply(404, JSON.stringify({ ok: false, error: "not_dispatchable" }));
+    }
+    try {
+      const init = { method, headers: frame.headers };
+      if (method !== "GET" && typeof frame.body === "string") {
+        init.body = frame.bodyEncoding === "base64"
+          ? Uint8Array.from(atob(frame.body), (char) => char.charCodeAt(0))
+          : frame.body;
+      }
+      const response = await worker.fetch(
+        new Request(`${attachment.origin || "https://message-center.internal"}${path}`, init),
+        this.dispatchEnv(),
+        { waitUntil: (promise) => this.state.waitUntil(promise), passThroughOnException() {} },
+      );
+      reply(response.status, await response.text());
+    } catch (error) {
+      console.error(JSON.stringify({ event: "signal_dispatch_failed", path: route,
+        message: error instanceof Error ? error.message : String(error) }));
+      reply(500, JSON.stringify({ ok: false, error: "dispatch_failed" }));
+    }
+  }
+
+  // A dispatched route signals through this object directly: an object cannot fetch its own stub.
+  dispatchEnv() {
+    const self = { fetch: (input, init) => this.fetch(new Request(input, init)) };
+    return { ...this.env, COMMAND_SIGNAL: { idFromName: () => "self", get: () => self } };
+  }
 
   webSocketClose(socket, code) {
     try {

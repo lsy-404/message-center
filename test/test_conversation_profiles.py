@@ -3,11 +3,9 @@ import hashlib
 import importlib.util
 import json
 import os
+import sqlite3
 import unittest
-import urllib.error
 import urllib.parse
-import urllib.request
-from unittest.mock import patch
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -18,72 +16,30 @@ SPEC.loader.exec_module(profiles_module)
 
 
 class FakeRelay:
-    base = "https://worker.example/"
+    connector = "connector-test"
 
-    def __init__(self, heartbeat_error=None):
-        self.connector = "connector-test"
-        self.heartbeats = []
-        self.heartbeat_error = heartbeat_error
+    def __init__(self, outcomes=None):
+        self.db = sqlite3.connect(":memory:")
+        self.db.execute("CREATE TABLE sync_digests(connector_id TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL,"
+                        " digest TEXT NOT NULL, PRIMARY KEY(connector_id,kind,key))")
+        self.outcomes = list(outcomes) if outcomes is not None else None
+        self.calls = []
 
-    def headers(self):
-        return {
-            "Authorization": "Bearer " + "x" * 40,
-            "x-connector-id": "connector-test",
-            "User-Agent": "MessageCenterDevice/1.0",
-            "Accept": "application/json",
-        }
-
-    def send_heartbeat(self, connector_id, state):
-        self.heartbeats.append((connector_id, state))
-        if self.heartbeat_error is not None:
-            raise self.heartbeat_error
-        return True
-
-
-class FakeResponse:
-    def __init__(self, url, body=b'{"ok":true}'):
-        self.url = url
-        self.body = body
-        self.read_limit = None
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_args):
-        return False
-
-    def geturl(self):
-        return self.url
-
-    def read(self, limit):
-        self.read_limit = limit
-        return self.body[:limit]
-
-
-class FakeOpener:
-    def __init__(self, outcomes):
-        self.outcomes = list(outcomes)
-        self.requests = []
-        self.timeouts = []
-
-    def open(self, request, timeout):
-        self.requests.append(request)
-        self.timeouts.append(timeout)
+    def api_call(self, method, path, headers, body):
+        self.calls.append((method, path, headers, body))
+        if self.outcomes is None:
+            return 200, '{"ok":true}'
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
-        outcome.url = request.full_url
         return outcome
 
 
 class ConversationProfileTests(unittest.TestCase):
-    def request_with(self, profiles, outcomes=None):
-        opener = FakeOpener(outcomes or [FakeResponse("") for _ in profiles])
-        with patch.object(profiles_module.urllib.request, "build_opener", return_value=opener) as build:
-            result = profiles_module.sync_profiles(FakeRelay(), profiles)
-        build.assert_called_once()
-        self.assertIsInstance(build.call_args.args[0], profiles_module.NoRedirect)
-        return result, opener
+    def request_with(self, profiles):
+        relay = FakeRelay()
+        result = profiles_module.sync_profiles(relay, profiles)
+        return result, relay
 
     def test_put_uses_worker_headers_utf8_percent_encoding_and_empty_body(self):
         profile = {
@@ -98,31 +54,27 @@ class ConversationProfileTests(unittest.TestCase):
             "lastMessagePreview": "最新消息 🌱",
             "lastMessageAt": "2026-10-07T12:01:00+00:00",
         }
-        result, opener = self.request_with([profile])
+        result, relay = self.request_with([profile])
         self.assertEqual(result, 1)
-        request = opener.requests[0]
-        self.assertEqual(request.full_url, "https://worker.example/api/connectors/conversation-profiles/group:fixture-1")
-        self.assertEqual(request.get_method(), "PUT")
-        self.assertEqual(request.data, b"")
-        self.assertEqual(request.get_header("Content-length"), "0")
-        self.assertEqual(request.get_header("Authorization"), "Bearer " + "x" * 40)
-        self.assertEqual(request.get_header("X-connector-id"), "connector-test")
-        self.assertEqual(request.get_header("User-agent"), "MessageCenterDevice/1.0")
-        self.assertEqual(urllib.parse.unquote(request.get_header("X-conversation-display-name")), "群聊 Café")
-        self.assertEqual(urllib.parse.unquote(request.get_header("X-conversation-channel-label")), "即时 消息")
-        self.assertEqual(urllib.parse.unquote(request.get_header("X-conversation-last-preview")), "最新消息 🌱")
-        self.assertEqual(request.get_header("X-conversation-type"), "group")
-        self.assertEqual(request.get_header("X-conversation-placement"), "folded")
-        self.assertEqual(request.get_header("X-conversation-pinned"), "1")
-        self.assertEqual(request.get_header("X-conversation-unread-count"), "17")
-        self.assertEqual(request.get_header("X-conversation-unread-observed-at"), "2026-10-07T12:00:00.000Z")
-        self.assertEqual(request.get_header("X-conversation-last-at"), "2026-10-07T12:01:00.000Z")
-        self.assertEqual(opener.timeouts, [20])
+        method, path, headers, body = relay.calls[0]
+        self.assertEqual(method, "PUT")
+        self.assertEqual(path, "/api/connectors/conversation-profiles/group:fixture-1")
+        self.assertEqual(body, b"")
+        self.assertNotIn("Content-Type", headers)
+        self.assertEqual(urllib.parse.unquote(headers["x-conversation-display-name"]), "群聊 Café")
+        self.assertEqual(urllib.parse.unquote(headers["x-conversation-channel-label"]), "即时 消息")
+        self.assertEqual(urllib.parse.unquote(headers["x-conversation-last-preview"]), "最新消息 🌱")
+        self.assertEqual(headers["x-conversation-type"], "group")
+        self.assertEqual(headers["x-conversation-placement"], "folded")
+        self.assertEqual(headers["x-conversation-pinned"], "1")
+        self.assertEqual(headers["x-conversation-unread-count"], "17")
+        self.assertEqual(headers["x-conversation-unread-observed-at"], "2026-10-07T12:00:00.000Z")
+        self.assertEqual(headers["x-conversation-last-at"], "2026-10-07T12:01:00.000Z")
 
     def test_empty_batch_does_not_open_network(self):
-        with patch.object(profiles_module.urllib.request, "build_opener") as build:
-            self.assertEqual(profiles_module.sync_profiles(FakeRelay(), []), 0)
-        build.assert_not_called()
+        relay = FakeRelay()
+        self.assertEqual(profiles_module.sync_profiles(relay, []), 0)
+        self.assertEqual(relay.calls, [])
 
     def test_profile_count_is_bounded_and_all_metadata_validated_before_requests(self):
         valid = {"conversationExternalId": "group-1", "displayName": "Group"}
@@ -139,92 +91,38 @@ class ConversationProfileTests(unittest.TestCase):
             [{**valid, "unreadCount": 1, "unreadObservedAt": "2026-10-07T12:00:00"}],
         ]
         for profiles in invalid_profiles:
-            with self.subTest(profiles=profiles[:1]), patch.object(
-                profiles_module.urllib.request, "build_opener"
-            ) as build:
+            with self.subTest(profiles=profiles[:1]):
+                relay = FakeRelay()
                 with self.assertRaises(profiles_module.ProfileSyncError):
-                    profiles_module.sync_profiles(FakeRelay(), profiles)
-                build.assert_not_called()
+                    profiles_module.sync_profiles(relay, profiles)
+                self.assertEqual(relay.calls, [])
 
-    def test_redirect_and_oversized_response_are_rejected(self):
-        handler = profiles_module.NoRedirect()
-        with self.assertRaises(urllib.error.HTTPError):
-            handler.redirect_request(urllib.request.Request("https://worker.example/"), None,
-                                     307, "redirect", {}, "https://other.example/")
-
-        oversized = FakeResponse("", b"{}" + b"x" * profiles_module.MAX_RESPONSE)
-        with patch.object(profiles_module.urllib.request, "build_opener", return_value=FakeOpener([oversized])):
-            with self.assertRaisesRegex(profiles_module.ProfileSyncError, "profile_response_too_large"):
-                profiles_module.sync_profiles(FakeRelay(), [
-                    {"conversationExternalId": "group-1", "displayName": "Group"}
-                ])
-        self.assertEqual(oversized.read_limit, profiles_module.MAX_RESPONSE + 1)
-
-    def test_http_or_response_failure_propagates_and_stops_batch(self):
-        opener = FakeOpener([
-            FakeResponse("", b'{"ok":true}'),
-            urllib.error.URLError("offline"),
-            FakeResponse(""),
-        ])
-        with patch.object(profiles_module.urllib.request, "build_opener", return_value=opener):
-            with self.assertRaisesRegex(profiles_module.ProfileSyncError, "profile_request_failed"):
-                profiles_module.sync_profiles(FakeRelay(), [
-                    {"conversationExternalId": "group-1", "displayName": "Group 1"},
-                    {"conversationExternalId": "group-2", "displayName": "Group 2"},
-                    {"conversationExternalId": "group-3", "displayName": "Group 3"},
-                ])
-        self.assertEqual(len(opener.requests), 2)
+    def test_request_failure_propagates_and_stops_batch(self):
+        relay = FakeRelay([(200, '{"ok":true}'), OSError("offline"), (200, '{"ok":true}')])
+        with self.assertRaisesRegex(profiles_module.ProfileSyncError, "profile_request_failed"):
+            profiles_module.sync_profiles(relay, [
+                {"conversationExternalId": "group-1", "displayName": "Group 1"},
+                {"conversationExternalId": "group-2", "displayName": "Group 2"},
+                {"conversationExternalId": "group-3", "displayName": "Group 3"},
+            ])
+        self.assertEqual(len(relay.calls), 2)
 
     def test_worker_rejection_is_not_acknowledged_as_success(self):
-        relay = FakeRelay()
-        rejected = FakeResponse("", json.dumps({"ok": False, "error": "invalid_conversation_profile"}).encode())
-        with patch.object(profiles_module.urllib.request, "build_opener", return_value=FakeOpener([rejected])):
+        for outcome in ((200, '{"ok":false,"error":"invalid_conversation_profile"}'), (400, '{"ok":true}')):
+            relay = FakeRelay([outcome])
             with self.assertRaisesRegex(profiles_module.ProfileSyncError, "profile_update_rejected"):
                 profiles_module.sync_profiles(relay, [
                     {"conversationExternalId": "group-1", "displayName": "Group"}
                 ])
-        self.assertEqual(relay.heartbeats, [])
 
-    def test_profile_progress_heartbeat_follows_each_valid_ack_without_affecting_sync_failure(self):
-        relay = FakeRelay(heartbeat_error=OSError("heartbeat offline"))
-        opener = FakeOpener([FakeResponse(""),
-                             FakeResponse("", b'{"ok":false,"error":"rejected"}')])
-        with patch.object(profiles_module.urllib.request, "build_opener", return_value=opener):
-            with self.assertRaisesRegex(profiles_module.ProfileSyncError, "profile_update_rejected"):
-                profiles_module.sync_profiles(relay, [
-                    {"conversationExternalId": "group-1", "displayName": "Group 1"},
-                    {"conversationExternalId": "group-2", "displayName": "Group 2"},
-                ])
-        self.assertEqual(relay.heartbeats, [("connector-test", "online")])
-
-    def test_heartbeat_failure_does_not_cancel_valid_profile_or_avatar_sync(self):
-        png = b"\x89PNG\r\n\x1a\nprogress-avatar"
-        relay = FakeRelay(heartbeat_error=OSError("heartbeat offline"))
-        profile_opener = FakeOpener([FakeResponse("")])
-        with patch.object(profiles_module.urllib.request, "build_opener", return_value=profile_opener):
-            self.assertEqual(profiles_module.sync_profiles(relay, [
-                {"conversationExternalId": "group-1", "displayName": "Group"}
-            ]), 1)
-
-        avatar_opener = FakeOpener([FakeResponse("")])
-        with patch.object(profiles_module.urllib.request, "build_opener", return_value=avatar_opener):
-            self.assertEqual(profiles_module.sync_sender_avatars(relay, [
-                {"senderId": "sender-1", "avatarBase64": base64.b64encode(png).decode("ascii")}
-            ]), 1)
-        self.assertEqual(relay.heartbeats, [("connector-test", "online")] * 2)
-
-    def test_sender_avatar_progress_heartbeat_requires_valid_ack(self):
-        avatar = b"\x89PNG\r\n\x1a\nsender-avatar"
-        encoded = base64.b64encode(avatar).decode("ascii")
-        relay = FakeRelay()
-        opener = FakeOpener([FakeResponse(""), FakeResponse("", b'{"ok":false}')])
-        with patch.object(profiles_module.urllib.request, "build_opener", return_value=opener):
-            with self.assertRaisesRegex(profiles_module.ProfileSyncError, "sender_avatar_update_rejected"):
-                profiles_module.sync_sender_avatars(relay, [
-                    {"senderId": "sender-1", "avatarBase64": encoded},
-                    {"senderId": "sender-2", "avatarBase64": encoded},
-                ])
-        self.assertEqual(relay.heartbeats, [("connector-test", "online")])
+    def test_sender_avatar_rejection_is_reported(self):
+        encoded = base64.b64encode(b"\x89PNG\r\n\x1a\nsender-avatar").decode("ascii")
+        relay = FakeRelay([(200, '{"ok":true}'), (200, '{"ok":false}')])
+        with self.assertRaisesRegex(profiles_module.ProfileSyncError, "sender_avatar_update_rejected"):
+            profiles_module.sync_sender_avatars(relay, [
+                {"senderId": "sender-1", "avatarBase64": encoded},
+                {"senderId": "sender-2", "avatarBase64": encoded},
+            ])
 
     def test_valid_png_avatar_puts_raw_bytes_with_worker_headers(self):
         avatar = b"\x89PNG\r\n\x1a\nsynthetic-png"
@@ -233,26 +131,24 @@ class ConversationProfileTests(unittest.TestCase):
             "displayName": "Group",
             "avatarBase64": base64.b64encode(avatar).decode("ascii"),
         }
-        result, opener = self.request_with([profile])
-        request = opener.requests[0]
+        result, relay = self.request_with([profile])
+        _method, _path, headers, body = relay.calls[0]
         self.assertEqual(result, 1)
-        self.assertEqual(request.data, avatar)
-        self.assertEqual(request.get_header("Content-type"), "image/png")
-        self.assertEqual(request.get_header("Content-length"), str(len(avatar)))
-        self.assertEqual(request.get_header("X-content-sha256"), hashlib.sha256(avatar).hexdigest())
+        self.assertEqual(body, avatar)
+        self.assertEqual(headers["Content-Type"], "image/png")
+        self.assertEqual(headers["x-content-sha256"], hashlib.sha256(avatar).hexdigest())
 
     def test_missing_and_empty_avatar_keep_metadata_only_put(self):
         profiles = [
             {"conversationExternalId": "group-1", "displayName": "Group 1"},
             {"conversationExternalId": "group-2", "displayName": "Group 2", "avatarBase64": ""},
         ]
-        result, opener = self.request_with(profiles)
+        result, relay = self.request_with(profiles)
         self.assertEqual(result, 2)
-        for request in opener.requests:
-            self.assertEqual(request.data, b"")
-            self.assertEqual(request.get_header("Content-length"), "0")
-            self.assertIsNone(request.get_header("Content-type"))
-            self.assertIsNone(request.get_header("X-content-sha256"))
+        for _method, _path, headers, body in relay.calls:
+            self.assertEqual(body, b"")
+            self.assertNotIn("Content-Type", headers)
+            self.assertNotIn("x-content-sha256", headers)
 
     def test_avatar_base64_is_strict_and_full_batch_is_prevalidated(self):
         avatar = b"\x89PNG\r\n\x1a\nsynthetic-png"
@@ -261,10 +157,10 @@ class ConversationProfileTests(unittest.TestCase):
              "avatarBase64": base64.b64encode(avatar).decode("ascii")},
             {"conversationExternalId": "group-2", "displayName": "Group 2", "avatarBase64": "%%%="},
         ]
-        with patch.object(profiles_module.urllib.request, "build_opener") as build:
-            with self.assertRaisesRegex(profiles_module.ProfileSyncError, "invalid_profile_avatar"):
-                profiles_module.sync_profiles(FakeRelay(), profiles)
-            build.assert_not_called()
+        relay = FakeRelay()
+        with self.assertRaisesRegex(profiles_module.ProfileSyncError, "invalid_profile_avatar"):
+            profiles_module.sync_profiles(relay, profiles)
+        self.assertEqual(relay.calls, [])
 
     def test_avatar_per_image_and_batch_decoded_caps_are_enforced_before_network(self):
         def png(size):
@@ -281,48 +177,41 @@ class ConversationProfileTests(unittest.TestCase):
              "avatarBase64": base64.b64encode(png(64 * 1024 + 1)).decode("ascii")},
         ]
         for profiles in ([oversized_image], over_batch):
-            with self.subTest(count=len(profiles)), patch.object(
-                profiles_module.urllib.request, "build_opener"
-            ) as build:
+            with self.subTest(count=len(profiles)):
+                relay = FakeRelay()
                 with self.assertRaisesRegex(profiles_module.ProfileSyncError, "profile_avatar_too_large"):
-                    profiles_module.sync_profiles(FakeRelay(), profiles)
-                build.assert_not_called()
+                    profiles_module.sync_profiles(relay, profiles)
+                self.assertEqual(relay.calls, [])
 
     def test_invalid_avatar_magic_is_rejected_before_network(self):
         profile = {
             "conversationExternalId": "group-1", "displayName": "Group",
             "avatarBase64": base64.b64encode(b"not-an-image").decode("ascii"),
         }
-        with patch.object(profiles_module.urllib.request, "build_opener") as build:
-            with self.assertRaisesRegex(profiles_module.ProfileSyncError, "invalid_profile_avatar"):
-                profiles_module.sync_profiles(FakeRelay(), [profile])
-            build.assert_not_called()
+        relay = FakeRelay()
+        with self.assertRaisesRegex(profiles_module.ProfileSyncError, "invalid_profile_avatar"):
+            profiles_module.sync_profiles(relay, [profile])
+        self.assertEqual(relay.calls, [])
 
     def test_sender_avatar_put_uses_raw_bytes_and_connector_auth_headers(self):
         avatar = b"\x89PNG\r\n\x1a\nsynthetic-sender"
         item = {"senderId": "qq:sender-1", "avatarBase64": base64.b64encode(avatar).decode("ascii")}
-        opener = FakeOpener([FakeResponse("")])
-        with patch.object(profiles_module.urllib.request, "build_opener", return_value=opener) as build:
-            self.assertEqual(profiles_module.sync_sender_avatars(FakeRelay(), [item]), 1)
-        self.assertIsInstance(build.call_args.args[0], profiles_module.NoRedirect)
-        request = opener.requests[0]
-        self.assertEqual(request.full_url, "https://worker.example/api/connectors/sender-avatars/qq:sender-1")
-        self.assertEqual(request.get_method(), "PUT")
-        self.assertEqual(request.data, avatar)
-        self.assertEqual(request.get_header("Content-type"), "image/png")
-        self.assertEqual(request.get_header("Content-length"), str(len(avatar)))
-        self.assertEqual(request.get_header("X-content-sha256"), hashlib.sha256(avatar).hexdigest())
-        self.assertEqual(request.get_header("Authorization"), "Bearer " + "x" * 40)
-        self.assertEqual(request.get_header("X-connector-id"), "connector-test")
+        relay = FakeRelay()
+        self.assertEqual(profiles_module.sync_sender_avatars(relay, [item]), 1)
+        method, path, headers, body = relay.calls[0]
+        self.assertEqual(method, "PUT")
+        self.assertEqual(path, "/api/connectors/sender-avatars/qq:sender-1")
+        self.assertEqual(body, avatar)
+        self.assertEqual(headers["Content-Type"], "image/png")
+        self.assertEqual(headers["x-content-sha256"], hashlib.sha256(avatar).hexdigest())
 
     def test_sender_avatar_empty_batch_or_empty_images_do_not_open_network(self):
         for avatars in ([], [{"senderId": "sender-1", "avatarBase64": ""}],
                         [{"senderId": "sender-1"}]):
-            with self.subTest(avatars=avatars), patch.object(
-                profiles_module.urllib.request, "build_opener"
-            ) as build:
-                self.assertEqual(profiles_module.sync_sender_avatars(FakeRelay(), avatars), 0)
-                build.assert_not_called()
+            with self.subTest(avatars=avatars):
+                relay = FakeRelay()
+                self.assertEqual(profiles_module.sync_sender_avatars(relay, avatars), 0)
+                self.assertEqual(relay.calls, [])
 
     def test_sender_avatar_batches_are_fully_validated_and_bounded_before_network(self):
         png = lambda size: b"\x89PNG\r\n\x1a\n" + b"x" * (size - 8)
@@ -338,12 +227,11 @@ class ConversationProfileTests(unittest.TestCase):
             [{"senderId": "sender-%d" % index} for index in range(profiles_module.MAX_PROFILES + 1)],
         ]
         for avatars in invalid_batches:
-            with self.subTest(count=len(avatars)), patch.object(
-                profiles_module.urllib.request, "build_opener"
-            ) as build:
+            with self.subTest(count=len(avatars)):
+                relay = FakeRelay()
                 with self.assertRaises(profiles_module.ProfileSyncError):
-                    profiles_module.sync_sender_avatars(FakeRelay(), avatars)
-                build.assert_not_called()
+                    profiles_module.sync_sender_avatars(relay, avatars)
+                self.assertEqual(relay.calls, [])
 
 
 if __name__ == "__main__":

@@ -1,20 +1,16 @@
-"""Bounded HTTPS synchronization for conversation profile metadata."""
+"""Bounded synchronization for conversation profile metadata."""
 
 import base64
 import datetime
 import hashlib
 import json
 import re
-import urllib.error
 import urllib.parse
-import urllib.request
 
 
 MAX_PROFILES = 20
 MAX_AVATAR_BYTES = 128 * 1024
 MAX_AVATAR_BATCH_BYTES = 128 * 1024
-MAX_RESPONSE = 1024 * 1024
-REQUEST_TIMEOUT = 20
 CONVERSATION_ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._:-]{0,199}\Z")
 CONVERSATION_TYPES = {"direct", "group", "unknown"}
 PLACEMENTS = {"normal", "folded", "message_box", "unknown"}
@@ -24,16 +20,40 @@ class ProfileSyncError(RuntimeError):
     pass
 
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, request, response, code, message, headers, new_url):
-        raise urllib.error.HTTPError(request.full_url, code, "redirect_refused", headers, response)
+# The unread observation time moves on every scan; the unread count it qualifies is already in the digest.
+UNSTABLE_HEADERS = {"x-conversation-unread-observed-at"}
 
 
-def _report_upload_progress(relay):
+def _digest(headers, content_type, avatar):
+    stable = sorted((name, value) for name, value in headers.items() if name not in UNSTABLE_HEADERS)
+    hasher = hashlib.sha256(json.dumps([stable, content_type], separators=(",", ":")).encode("utf-8"))
+    hasher.update(avatar or b"")
+    return hasher.hexdigest()
+
+
+def _unchanged(relay, kind, key, digest):
+    row = relay.db.execute("SELECT digest FROM sync_digests WHERE connector_id=? AND kind=? AND key=?",
+                           (relay.connector, kind, key)).fetchone()
+    return row is not None and row[0] == digest
+
+
+def _remember(relay, kind, key, digest):
+    relay.db.execute("INSERT OR REPLACE INTO sync_digests(connector_id,kind,key,digest) VALUES(?,?,?,?)",
+                     (relay.connector, kind, key, digest))
+    relay.db.commit()
+
+
+def _put(relay, path, headers, body, error):
     try:
-        relay.send_heartbeat(relay.connector, "online")
-    except Exception:
-        pass
+        status, text = relay.api_call("PUT", path, headers, body)
+    except Exception as exc:
+        raise ProfileSyncError(error + "_request_failed") from exc
+    try:
+        result = json.loads(text)
+    except ValueError as exc:
+        raise ProfileSyncError(error + "_invalid_response") from exc
+    if status >= 400 or not isinstance(result, dict) or result.get("ok") is not True:
+        raise ProfileSyncError(error + "_update_rejected")
 
 
 def _utf16_length(value):
@@ -182,43 +202,19 @@ def sync_profiles(relay, profiles):
     if not prepared:
         return 0
 
-    opener = urllib.request.build_opener(NoRedirect())
-    base = relay.base.rstrip("/")
-    headers_base = relay.headers()
+    sent = 0
     for conversation_id, profile_headers, avatar, content_type in prepared:
-        headers = dict(headers_base)
-        headers.update(profile_headers)
-        body = avatar if avatar is not None else b""
-        headers["Content-Length"] = str(len(body))
+        digest = _digest(profile_headers, content_type, avatar)
+        if _unchanged(relay, "profile", conversation_id, digest):
+            continue
+        headers = dict(profile_headers)
         if avatar is not None:
             headers["Content-Type"] = content_type
             headers["x-content-sha256"] = hashlib.sha256(avatar).hexdigest()
-        request = urllib.request.Request(
-            base + "/api/connectors/conversation-profiles/" + conversation_id,
-            data=body,
-            headers=headers,
-            method="PUT",
-        )
-        try:
-            with opener.open(request, timeout=REQUEST_TIMEOUT) as response:
-                if response.geturl() != request.full_url:
-                    raise ProfileSyncError("profile_redirect_refused")
-                raw = response.read(MAX_RESPONSE + 1)
-                if len(raw) > MAX_RESPONSE:
-                    raise ProfileSyncError("profile_response_too_large")
-        except ProfileSyncError:
-            raise
-        except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
-            raise ProfileSyncError("profile_request_failed") from exc
-
-        try:
-            result = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ProfileSyncError("profile_invalid_response") from exc
-        if not isinstance(result, dict) or result.get("ok") is not True:
-            raise ProfileSyncError("profile_update_rejected")
-        _report_upload_progress(relay)
-    return len(prepared)
+        _put(relay, "/api/connectors/conversation-profiles/" + conversation_id, headers, avatar or b"", "profile")
+        _remember(relay, "profile", conversation_id, digest)
+        sent += 1
+    return sent
 
 
 def sync_sender_avatars(relay, avatars):
@@ -240,37 +236,13 @@ def sync_sender_avatars(relay, avatars):
     if not prepared:
         return 0
 
-    opener = urllib.request.build_opener(NoRedirect())
-    base = relay.base.rstrip("/")
-    headers_base = relay.headers()
+    sent = 0
     for sender_id, avatar, content_type in prepared:
-        headers = dict(headers_base)
-        headers["Content-Length"] = str(len(avatar))
-        headers["Content-Type"] = content_type
-        headers["x-content-sha256"] = hashlib.sha256(avatar).hexdigest()
-        request = urllib.request.Request(
-            base + "/api/connectors/sender-avatars/" + sender_id,
-            data=avatar,
-            headers=headers,
-            method="PUT",
-        )
-        try:
-            with opener.open(request, timeout=REQUEST_TIMEOUT) as response:
-                if response.geturl() != request.full_url:
-                    raise ProfileSyncError("sender_avatar_redirect_refused")
-                raw = response.read(MAX_RESPONSE + 1)
-                if len(raw) > MAX_RESPONSE:
-                    raise ProfileSyncError("sender_avatar_response_too_large")
-        except ProfileSyncError:
-            raise
-        except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
-            raise ProfileSyncError("sender_avatar_request_failed") from exc
-
-        try:
-            result = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ProfileSyncError("sender_avatar_invalid_response") from exc
-        if not isinstance(result, dict) or result.get("ok") is not True:
-            raise ProfileSyncError("sender_avatar_update_rejected")
-        _report_upload_progress(relay)
-    return len(prepared)
+        digest = _digest({}, content_type, avatar)
+        if _unchanged(relay, "sender_avatar", sender_id, digest):
+            continue
+        headers = {"Content-Type": content_type, "x-content-sha256": hashlib.sha256(avatar).hexdigest()}
+        _put(relay, "/api/connectors/sender-avatars/" + sender_id, headers, avatar, "sender_avatar")
+        _remember(relay, "sender_avatar", sender_id, digest)
+        sent += 1
+    return sent

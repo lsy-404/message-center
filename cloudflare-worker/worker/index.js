@@ -307,6 +307,8 @@ const CONNECTOR_STATES = new Set(["online", "offline", "degraded"]);
 function liveState(row, live = new Set()) {
   const state = text(row?.state);
   if (!CONNECTOR_STATES.has(state)) return "offline";
+  // Email Routing only touches last_seen_at when mail arrives.
+  if (row.id === EMAIL_CONNECTOR_ID || text(row.kind) === "email") return state;
   const seen = Date.parse(text(row.last_seen_at));
   const freshFor = live.has(row.id) ? 15 * 60_000 : 90_000;
   return Number.isFinite(seen) && Date.now() - seen <= freshFor ? state : "offline";

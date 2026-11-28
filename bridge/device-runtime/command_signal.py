@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import json
 import os
 import select
 import socket
@@ -16,7 +17,7 @@ import urllib.parse
 PING_INTERVAL = 60
 DEAD_AFTER = 150
 CONNECT_TIMEOUT = 20
-MAX_FRAME = 64 * 1024
+MAX_FRAME = 4 * 1024 * 1024
 MAX_BACKOFF = 60
 ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -28,7 +29,8 @@ class SignalClosed(Exception):
 class CommandSignal(threading.Thread):
     """Keeps one connector's signal socket open, reconnecting with backoff. `on_signal(connector_id)` runs on this
     thread when a command is announced and after each successful (re)connect, since commands may have been queued
-    while the socket was down. `connected` is true while the socket is open."""
+    while the socket was down. `connected` is true while the socket is open. `request` carries a JSON API call over
+    the socket and returns the Worker's response."""
 
     def __init__(self, base, connector_id, token, on_signal):
         super().__init__(name="command-signal-" + connector_id, daemon=True)
@@ -37,6 +39,80 @@ class CommandSignal(threading.Thread):
         self.token = token
         self.on_signal = on_signal
         self.connected = False
+        self.sock = None
+        self.send_lock = threading.Lock()
+        self.cond = threading.Condition()
+        self.pending = {}
+        self.next_id = 1
+
+    def set_connected(self, sock):
+        with self.cond:
+            self.sock = sock
+            self.connected = sock is not None
+            if sock is None:
+                # Wakes every waiter; their responses can no longer arrive.
+                self.pending = {key: None if value == () else value for key, value in self.pending.items()}
+            self.cond.notify_all()
+
+    def wait_connected(self, timeout):
+        deadline = time.monotonic() + timeout
+        with self.cond:
+            while not self.connected:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SignalClosed("not_connected")
+                self.cond.wait(remaining)
+
+    def request(self, method, path, headers, body, timeout):
+        """Sends one API call and waits for its response; returns (status, body text). Raises SignalClosed when the
+        socket is down, drops, or the response does not arrive in time."""
+        deadline = time.monotonic() + timeout
+        self.wait_connected(timeout)
+        with self.cond:
+            sock = self.sock
+            request_id = self.next_id
+            self.next_id += 1
+            self.pending[request_id] = ()
+        frame = {"t": "req", "id": request_id, "method": method, "path": path, "headers": headers,
+                 "body": None, "bodyEncoding": "utf8"}
+        if body:
+            try:
+                frame["body"] = body.decode("utf-8")
+            except UnicodeDecodeError:
+                frame["body"] = base64.b64encode(body).decode("ascii")
+                frame["bodyEncoding"] = "base64"
+        try:
+            if sock is None:
+                raise SignalClosed("not_connected")
+            self.send(sock, 0x1, json.dumps(frame, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            with self.cond:
+                while self.pending.get(request_id) == ():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise SignalClosed("timeout")
+                    self.cond.wait(remaining)
+                result = self.pending.get(request_id)
+        finally:
+            with self.cond:
+                self.pending.pop(request_id, None)
+        if result is None:
+            raise SignalClosed("disconnected")
+        return result
+
+    def deliver(self, payload):
+        try:
+            frame = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return
+        if not isinstance(frame, dict) or frame.get("t") != "res":
+            return
+        status, body = frame.get("status"), frame.get("body", "")
+        if type(status) is not int or not isinstance(body, str):
+            return
+        with self.cond:
+            if self.pending.get(frame.get("id")) == ():
+                self.pending[frame["id"]] = (status, body)
+                self.cond.notify_all()
 
     def run(self):
         backoff = 1
@@ -44,14 +120,15 @@ class CommandSignal(threading.Thread):
             sock = None
             try:
                 sock = self.connect()
-                self.connected = True
+                sock.settimeout(CONNECT_TIMEOUT)
+                self.set_connected(sock)
                 backoff = 1
                 self.on_signal(self.connector_id)
                 self.listen(sock)
             except (OSError, ssl.SSLError, SignalClosed, ValueError):
                 pass
             finally:
-                self.connected = False
+                self.set_connected(None)
                 if sock is not None:
                     try:
                         sock.close()
@@ -103,11 +180,12 @@ class CommandSignal(threading.Thread):
             # TLS may already hold a decrypted frame that select cannot see.
             if not sock.pending() and not select.select([sock], [], [], 1)[0]:
                 continue
-            sock.settimeout(CONNECT_TIMEOUT)
-            opcode, payload = self.read_frame(sock)
+            opcode, payload = self.read_message(sock)
             last_seen = time.monotonic()
             if opcode == 0x1 and payload == b"command":
                 self.on_signal(self.connector_id)
+            elif opcode == 0x1 and payload[:1] == b"{":
+                self.deliver(payload)
             elif opcode == 0x9:
                 self.send(sock, 0xA, payload)
             elif opcode == 0x8:
@@ -124,6 +202,35 @@ class CommandSignal(threading.Thread):
             data += chunk
         return data
 
+    def read_message(self, sock):
+        """One data or control frame; fragments of a data message are joined."""
+        opcode, final, payload = self.read_frame(sock)
+        if opcode >= 0x8:
+            if not final:
+                raise SignalClosed("unsupported_frame")
+            return opcode, payload
+        if opcode == 0x0:
+            raise SignalClosed("unexpected_continuation")
+        parts = [payload]
+        size = len(payload)
+        while not final:
+            part_opcode, final, payload = self.read_frame(sock)
+            if part_opcode >= 0x8:
+                # A control frame may interleave with fragments; only ping/pong are expected there.
+                if part_opcode == 0x9:
+                    self.send(sock, 0xA, payload)
+                elif part_opcode == 0x8:
+                    raise SignalClosed("closed")
+                final = False
+                continue
+            if part_opcode != 0x0:
+                raise SignalClosed("unsupported_frame")
+            size += len(payload)
+            if size > MAX_FRAME:
+                raise SignalClosed("frame_too_large")
+            parts.append(payload)
+        return opcode, b"".join(parts)
+
     def read_frame(self, sock):
         first, second = self.read_exact(sock, 2)
         opcode = first & 0x0F
@@ -132,13 +239,29 @@ class CommandSignal(threading.Thread):
             length = struct.unpack("!H", self.read_exact(sock, 2))[0]
         elif length == 127:
             length = struct.unpack("!Q", self.read_exact(sock, 8))[0]
-        if second & 0x80 or not first & 0x80 or length > MAX_FRAME:
+        if second & 0x80 or length > MAX_FRAME:
             raise SignalClosed("unsupported_frame")
-        return opcode, self.read_exact(sock, length)
+        return opcode, bool(first & 0x80), self.read_exact(sock, length)
 
-    @staticmethod
-    def send(sock, opcode, payload):
+    def send(self, sock, opcode, payload):
         # Client frames must be masked.
         mask = os.urandom(4)
-        header = bytes([0x80 | opcode, 0x80 | len(payload)])
-        sock.sendall(header + mask + bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload)))
+        length = len(payload)
+        if length < 126:
+            header = bytes([0x80 | opcode, 0x80 | length])
+        elif length < 65536:
+            header = bytes([0x80 | opcode, 0x80 | 126]) + struct.pack("!H", length)
+        else:
+            header = bytes([0x80 | opcode, 0x80 | 127]) + struct.pack("!Q", length)
+        key = (mask * (length // 4 + 1))[:length]
+        masked = (int.from_bytes(payload, "big") ^ int.from_bytes(key, "big")).to_bytes(length, "big")
+        with self.send_lock:
+            try:
+                sock.sendall(header + mask + masked)
+            except (OSError, ssl.SSLError) as exc:
+                # A partial frame would corrupt the stream, so the connection is abandoned.
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                raise SignalClosed("send_failed") from exc

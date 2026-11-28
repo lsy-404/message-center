@@ -18,7 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from command_signal import CommandSignal
+from command_signal import CommandSignal, SignalClosed
 from conversation_profiles import sync_profiles, sync_sender_avatars
 
 if os.name == "posix":
@@ -26,6 +26,8 @@ if os.name == "posix":
 
 MAX_RESPONSE = 1024 * 1024
 MAX_SCAN_RESPONSE = 900 * 1024
+MAX_SOCKET_BODY = 900 * 1024
+REQUEST_TIMEOUT = 20
 MAX_CURSOR_BYTES = 65_536
 MAX_EVENT = 256 * 1024
 MAX_OUTBOX_BATCH_MESSAGES = 20
@@ -130,6 +132,8 @@ def open_database(path):
         state TEXT NOT NULL,
         result TEXT, retryable INTEGER NOT NULL DEFAULT 0);
       CREATE UNIQUE INDEX IF NOT EXISTS command_ledger_key ON command_ledger(connector_id,idempotency_key);
+      CREATE TABLE IF NOT EXISTS sync_digests(connector_id TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL,
+        digest TEXT NOT NULL, PRIMARY KEY(connector_id,kind,key));
     """)
     return db
 
@@ -301,10 +305,9 @@ class Relay:
 
     def start_signals(self):
         for connector in self.connectors:
-            if connector.get("receiveOnly") is not True:
-                signal_thread = CommandSignal(self.base, connector["id"], connector["token"], self.on_signal)
-                self.signals[connector["id"]] = signal_thread
-                signal_thread.start()
+            signal_thread = CommandSignal(self.base, connector["id"], connector["token"], self.on_signal)
+            self.signals[connector["id"]] = signal_thread
+            signal_thread.start()
 
     def on_signal(self, connector_id):
         with self.signal_lock:
@@ -413,23 +416,57 @@ class Relay:
                 "User-Agent": "MessageCenterDevice/1.0",
                 "Accept": "application/json"}
 
+    def signal_call(self, method, path, headers, body):
+        """One API call over the active connector's signal socket; returns (status, response text). The socket also
+        carries the connector's presence, so a down socket fails the call and the caller's backoff applies."""
+        signal_thread = self.signals.get(self.connector)
+        if signal_thread is None:
+            raise RuntimeError("signal_unavailable")
+        try:
+            return signal_thread.request(method, path, headers, body, REQUEST_TIMEOUT)
+        except SignalClosed as error:
+            raise RuntimeError("signal_" + str(error)) from None
+
+    def https_call(self, method, path, headers, body):
+        req = urllib.request.Request(self.base + path, data=body, headers=headers, method=method)
+        opener = urllib.request.build_opener(NoRedirect())
+        try:
+            with opener.open(req, timeout=REQUEST_TIMEOUT) as response:
+                if response.geturl() != req.full_url:
+                    raise RuntimeError("redirect_refused")
+                raw = response.read(MAX_RESPONSE + 1)
+                status = response.status
+        except urllib.error.HTTPError as error:
+            raw = error.read(MAX_RESPONSE + 1)
+            status = error.code
+        if len(raw) > MAX_RESPONSE:
+            raise RuntimeError("response_too_large")
+        return status, raw.decode("utf-8")
+
+    def api_call(self, method, path, headers, body):
+        """Sends a request with the active connector's credentials; frames the Worker would refuse as too large
+        go over HTTPS directly. Returns (status, response text)."""
+        headers = dict(headers)
+        headers["Authorization"] = "Bearer " + self.active_connector["token"]
+        headers["x-connector-id"] = self.connector
+        if body is not None and len(body) > MAX_SOCKET_BODY:
+            headers["User-Agent"] = "MessageCenterDevice/1.0"
+            headers["Accept"] = "application/json"
+            return self.https_call(method, path, headers, body)
+        return self.signal_call(method, path, headers, body)
+
     def request(self, method, path, payload=None):
         data = None if payload is None else compact(payload).encode("utf-8")
-        headers = self.headers()
-        if data is not None:
-            headers["Content-Type"] = "application/json"
-        req = urllib.request.Request(self.base + path, data=data, headers=headers, method=method)
-        opener = urllib.request.build_opener(NoRedirect())
-        with opener.open(req, timeout=20) as response:
-            if response.geturl() != req.full_url:
-                raise RuntimeError("redirect_refused")
-            raw = response.read(MAX_RESPONSE + 1)
-            if len(raw) > MAX_RESPONSE:
-                raise RuntimeError("response_too_large")
-            value = json.loads(raw.decode("utf-8")) if raw else {}
-            if not isinstance(value, dict) or value.get("ok") is False:
-                raise RuntimeError(str(value.get("error", "invalid_response")))
-            return value
+        headers = {"Content-Type": "application/json"} if data is not None else {}
+        status, text = self.api_call(method, path, headers, data)
+        try:
+            value = json.loads(text) if text else {}
+        except ValueError:
+            raise RuntimeError("invalid_response") from None
+        if not isinstance(value, dict) or value.get("ok") is False or status >= 400:
+            raise RuntimeError(str(value.get("error", "http_" + str(status))) if isinstance(value, dict)
+                               else "invalid_response")
+        return value
 
     def count_bytes(self, connector_id=None):
         if connector_id is None:

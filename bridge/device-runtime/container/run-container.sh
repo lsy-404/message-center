@@ -38,6 +38,7 @@ docker run -d --name "selkies-$NAME" --hostname "$HOST" --mac-address "$(cat "$I
   -e CUSTOM_USER=iris -e PASSWORD="$(cat "$D/password")" \
   -e SELKIES_ENABLE_BASIC_AUTH=false -e SELKIES_MASTER_TOKEN="$(cat "$I/master-token")" \
   -e SELKIES_TOKENS_FILE=/config/selkies-tokens.json -e SELKIES_FRAME_ANCESTORS="$(cat "$D/frame-ancestors")" \
+  -e SELKIES_MANUAL_RESOLUTION="true|locked" -e SELKIES_MANUAL_WIDTH=1920 -e SELKIES_MANUAL_HEIGHT=1080 \
   -e SELKIES_AUDIO_ENABLED=false -e SELKIES_PRINTING_ENABLED=false -e SELKIES_ENABLE_DUAL_MODE=false \
   -e AUTO_START_WECHAT="$WECHAT" -e AUTO_START_QQ="$QQ" -e TZ=Asia/Shanghai \
   -v "$I/config:/config" "$IMAGE"
