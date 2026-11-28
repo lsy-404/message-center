@@ -37,6 +37,19 @@ export function avatarTone(seed) {
   return stableHash(String(seed || '').trim()) % AVATAR_TONE_COUNT
 }
 
+const CHANNEL_ICONS = new Map([
+  ['qq', 'qq'],
+  ['微信', 'wechat'],
+  ['wechat', 'wechat'],
+  ['邮箱', 'mail'],
+  ['邮件', 'mail'],
+  ['email', 'mail'],
+])
+
+export function channelIcon(label) {
+  return CHANNEL_ICONS.get(String(label || '').trim().toLowerCase()) || null
+}
+
 export function channelGlyph(label) {
   const text = String(label || '').trim()
   if (/^[\x21-\x7e]+$/.test(text)) return text.slice(0, 2).toUpperCase() || '?'

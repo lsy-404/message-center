@@ -33,6 +33,7 @@ import {
   avatarTone,
   buildThreadEntries,
   channelGlyph,
+  channelIcon,
   channelTone,
   formatClock,
   formatFullStamp,
@@ -257,15 +258,22 @@ const nativeDesktops = computed(() => {
     if (group) group.connectors.push(connector)
     else groups.set(key, { key, connectors: [connector] })
   }
-  return [...groups.values()].map((group) => {
-    const labels = [...new Set(group.connectors.map((connector) => channelLabel(connector)))]
+  const desktops = [...groups.values()].map((group) => {
+    const ids = new Set(group.connectors.map((connector) => connector.id))
     return {
       key: group.key,
-      label: labels.join(' · '),
+      channel: [...new Set(group.connectors.map((connector) => channelLabel(connector)))].join(' · '),
+      account: group.connectors.map((connector) => connector.accountLabel).join(' · '),
+      unread: unreadTotal(snapshot.value.conversations.filter((item) => ids.has(item.connectorId))),
       connector: group.connectors[0],
       src: `/native/${encodeURIComponent(group.connectors[0].id)}/`,
     }
   })
+  return desktops.map((desktop) => ({
+    ...desktop,
+    label: desktops.filter((item) => item.channel === desktop.channel).length > 1
+      ? `${desktop.channel} · ${desktop.account}` : desktop.channel,
+  }))
 })
 const activeNativeDesktop = computed(() =>
   nativeDesktops.value.find((item) => item.key === nativeDesktopKey.value) ?? nativeDesktops.value[0] ?? null,
@@ -1940,9 +1948,38 @@ onUnmounted(() => {
 
       <nav class="nav-scroll" aria-label="收件箱分类">
         <div class="nav-section">
-          <p class="nav-label">收件箱</p>
+          <p class="nav-label">{{ nativeViewActive ? '原生桌面' : '收件箱' }}</p>
+          <template v-if="nativeViewActive">
+            <button class="nav-item is-disabled" type="button" aria-disabled="true" title="切换到信息视图后可查看全部会话">
+              <span class="nav-glyph is-all" aria-hidden="true"><AppIcon name="inbox" :size="16" /></span>
+              <span class="nav-copy">全部</span>
+            </button>
+            <button
+              v-for="desktop in nativeDesktops"
+              :key="desktop.key"
+              class="nav-item"
+              :class="{ active: desktop.key === activeNativeDesktop?.key }"
+              type="button"
+              :title="desktop.label"
+              :aria-current="desktop.key === activeNativeDesktop?.key ? 'page' : undefined"
+              @click="selectNativeDesktop(desktop.key)"
+            >
+              <span
+                class="nav-glyph channel-tone"
+                :class="`tone-${channelTone(desktop.channel)}`"
+                :data-unread="desktop.unread > 0 || undefined"
+                aria-hidden="true"
+              >
+                <AppIcon v-if="channelIcon(desktop.channel)" :name="channelIcon(desktop.channel)!" :size="16" />
+                <template v-else>{{ channelGlyph(desktop.channel) }}</template>
+              </span>
+              <span class="nav-copy">{{ desktop.label }}</span>
+              <span v-if="desktop.unread" class="nav-count is-unread" aria-hidden="true">{{ desktop.unread > 99 ? '99+' : desktop.unread }}</span>
+              <span v-if="desktop.unread" class="sr-only">，{{ desktop.unread }} 条未读</span>
+            </button>
+          </template>
           <button
-            v-for="filter in filters"
+            v-for="filter in nativeViewActive ? [] : filters"
             :key="filter.id"
             class="nav-item"
             :class="{ active: activeFilter === filter.id && !overlayPane && !nativeViewActive }"
@@ -1960,6 +1997,7 @@ onUnmounted(() => {
               aria-hidden="true"
             >
               <AppIcon v-if="!filter.channel" name="inbox" :size="16" />
+              <AppIcon v-else-if="channelIcon(filter.channel)" :name="channelIcon(filter.channel)!" :size="16" />
               <template v-else>{{ channelGlyph(filter.channel) }}</template>
             </span>
             <span class="nav-copy">{{ filter.label }}</span>
@@ -2018,17 +2056,7 @@ onUnmounted(() => {
 
     <section v-if="nativeViewActive && !overlayPane" class="native-pane" aria-label="原生桌面">
       <header class="thread-header native-header">
-        <div class="segmented native-tabs" role="tablist" aria-label="原生桌面">
-          <button
-            v-for="desktop in nativeDesktops"
-            :key="desktop.key"
-            type="button"
-            role="tab"
-            :class="{ active: desktop.key === activeNativeDesktop?.key }"
-            :aria-selected="desktop.key === activeNativeDesktop?.key"
-            @click="selectNativeDesktop(desktop.key)"
-          >{{ desktop.label }}</button>
-        </div>
+        <h1 class="native-title">{{ activeNativeDesktop?.label }}</h1>
         <a v-if="activeNativeDesktop" class="native-open-link" :href="activeNativeDesktop.src" target="_blank" rel="noopener noreferrer">在新窗口打开</a>
       </header>
       <iframe
@@ -2183,7 +2211,7 @@ onUnmounted(() => {
                   class="channel-badge channel-tone"
                   :class="`tone-${channelTone(conversation.channel)}`"
                   aria-hidden="true"
-                >{{ channelGlyph(conversation.channel) }}</span>
+                ><AppIcon v-if="channelIcon(conversation.channel)" :name="channelIcon(conversation.channel)!" :size="12" /><template v-else>{{ channelGlyph(conversation.channel) }}</template></span>
               </span>
               <span class="conversation-copy">
                 <span class="conversation-title-row">
@@ -2199,7 +2227,7 @@ onUnmounted(() => {
                       class="contact-channel channel-tone"
                       :class="`tone-${channelTone(label)}`"
                       :title="label"
-                    >{{ channelGlyph(label) }}</span>
+                    ><AppIcon v-if="channelIcon(label)" :name="channelIcon(label)!" :size="11" /><template v-else>{{ channelGlyph(label) }}</template></span>
                   </span>
                   <AppIcon v-if="conversation.pinned" class="pin-icon" name="pin" :size="12" />
                   <span v-if="conversation.muted" class="muted-icon" role="img" aria-label="免打扰"><AppIcon name="bellOff" :size="13" /></span>
@@ -2745,7 +2773,10 @@ onUnmounted(() => {
           :data-state="connector.state"
         >
           <header>
-            <span class="instance-glyph channel-tone" :class="`tone-${channelTone(channelLabel(connector))}`" aria-hidden="true">{{ channelGlyph(channelLabel(connector)) }}</span>
+            <span class="instance-glyph channel-tone" :class="`tone-${channelTone(channelLabel(connector))}`" aria-hidden="true">
+              <AppIcon v-if="channelIcon(channelLabel(connector))" :name="channelIcon(channelLabel(connector))!" :size="18" />
+              <template v-else>{{ channelGlyph(channelLabel(connector)) }}</template>
+            </span>
             <div class="instance-heading">
               <p>{{ channelLabel(connector) }}</p>
               <h2>{{ connector.accountLabel }}</h2>

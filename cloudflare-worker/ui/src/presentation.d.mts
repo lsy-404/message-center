@@ -8,6 +8,7 @@ export const AVATAR_TONE_COUNT: number
 export function stableHash(value: unknown): number
 export function channelTone(label: unknown): ChannelTone
 export function avatarTone(seed: unknown): number
+export function channelIcon(label: unknown): 'qq' | 'wechat' | 'mail' | null
 export function channelGlyph(label: unknown): string
 export function dayKey(value: unknown): string
 export function formatClock(value: unknown): string

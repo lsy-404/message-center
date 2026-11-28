@@ -551,9 +551,10 @@ button { color: inherit; }
   min-height: 0;
   background: var(--thread-bg);
 }
-.native-tabs { max-width: 100%; overflow-x: auto; }
-.native-tabs button { white-space: nowrap; }
 .native-header { justify-content: space-between; }
+.native-title { min-width: 0; margin: 0; overflow: hidden; font-size: 16px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.nav-item.is-disabled, .nav-item.is-disabled:hover { color: var(--text-disabled); background: transparent; cursor: not-allowed; }
+.nav-item.is-disabled .nav-glyph { opacity: .5; }
 .view-switch { display: flex; margin: 4px 12px 8px; padding: 2px; border: 1px solid var(--ctrl-border); border-radius: 7px; background: var(--subtle-tertiary); }
 .view-switch button { flex: 1; height: 28px; border: 0; border-radius: 5px; color: var(--text-secondary); background: transparent; font-size: 13px; cursor: pointer; }
 .view-switch button:hover { color: var(--text-primary); }
