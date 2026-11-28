@@ -15,6 +15,7 @@ import datetime
 import hashlib
 import json
 import os
+import random
 import re
 import secrets
 import shutil
@@ -63,6 +64,7 @@ ROW_MARKERS = re.compile(r"^(\[(有人@我|有新文件|有人@你|草稿)\])+")
 SENDER = re.compile(r"^([^:：\[\]\n]{1,64})(?:: |：)(.*)$", re.S)
 CONTAINER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 INPUT_TIMEOUT = 20
+POINTER_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pointer_path.mjs")
 # Each signed-in account leaves a marker here; the newest one is the account signed in now.
 ACCOUNT_MARKERS = {
     "qq": ("/config/.config/QQ/global/nt_data/Login", re.compile(r"^\.([1-9][0-9]{4,11})$")),
@@ -163,11 +165,11 @@ def container(config, profile):
         raise AdapterError("token_missing")
     if not token:
         raise AdapterError("token_missing")
-    name, docker = entry.get("container"), config.get("docker")
-    if not isinstance(name, str) or not CONTAINER_NAME.match(name) or not isinstance(docker, str) \
-            or not os.path.isabs(docker):
+    name, docker, node = entry.get("container"), config.get("docker"), config.get("node")
+    if not isinstance(name, str) or not CONTAINER_NAME.match(name) \
+            or not all(isinstance(path, str) and os.path.isabs(path) for path in (docker, node)):
         raise AdapterError("profile_invalid")
-    return Desktop(url, "Bearer " + token, docker, name), entry
+    return Desktop(url, "Bearer " + token, docker, name, node), entry
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -178,11 +180,12 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 class Desktop:
     """The container's Pelorus API for windows, accessibility trees and pictures, and xdotool for input."""
 
-    def __init__(self, url, authorization, docker, name):
+    def __init__(self, url, authorization, docker, name, node):
         self.url = url
         self.authorization = authorization
         self.docker = docker
         self.name = name
+        self.node = node
 
     def call(self, path, method="GET", payload=None):
         data = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -211,11 +214,30 @@ class Desktop:
 
     def xdotool(self, *arguments):
         try:
-            subprocess.run([self.docker, "exec", self.name, "env", "DISPLAY=:20", "xdotool"] + list(arguments),
-                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=INPUT_TIMEOUT, check=True)
+            return subprocess.run([self.docker, "exec", self.name, "env", "DISPLAY=:20", "xdotool"] + list(arguments),
+                                  stdin=subprocess.DEVNULL, capture_output=True,
+                                  timeout=INPUT_TIMEOUT, check=True).stdout.decode("ascii", "replace")
         except (OSError, subprocess.SubprocessError):
             raise AdapterError("desktop_input_failed")
+
+    def glide(self, bounds, *then):
+        """Moves the pointer into `bounds` along a ghost-cursor path, one xdotool step every few milliseconds, then
+        runs the xdotool commands in `then` from there."""
+        location = dict(re.findall(r"^([XY])=(-?\d+)$", self.xdotool("getmouselocation", "--shell"), re.M))
+        if "X" not in location or "Y" not in location:
+            raise AdapterError("desktop_input_failed")
+        try:
+            output = subprocess.run(
+                [self.node, POINTER_PATH, location["X"], location["Y"]]
+                + [str(int(bounds[key])) for key in ("x", "y", "w", "h")],
+                stdin=subprocess.DEVNULL, capture_output=True, timeout=INPUT_TIMEOUT, check=True).stdout
+            points = json.loads(output)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            raise AdapterError("pointer_path_failed")
+        steps = []
+        for x, y in points:
+            steps += ["mousemove", str(x), str(y), "sleep", "{:.3f}".format(random.uniform(0.004, 0.008))]
+        self.xdotool(*(steps + list(then)))
 
     def control(self, window_id, pattern):
         return control_in(self.tree(window_id), pattern)
@@ -224,15 +246,18 @@ class Desktop:
         self.click(control["bounds"])
 
     def click(self, bounds, button="left"):
-        x, y = int(bounds["x"] + bounds["w"] / 2), int(bounds["y"] + bounds["h"] / 2)
-        self.xdotool("mousemove", str(x), str(y), "click", "3" if button == "right" else "1")
+        code = "3" if button == "right" else "1"
+        self.glide(bounds, "sleep", "{:.3f}".format(random.uniform(0.05, 0.15)),
+                   "mousedown", code, "sleep", "{:.3f}".format(random.uniform(0.06, 0.12)), "mouseup", code)
 
     def point(self, x, y):
-        self.xdotool("mousemove", str(int(x)), str(int(y)))
+        self.glide({"x": x - 3, "y": y - 3, "w": 6, "h": 6})
 
     def scroll(self, at, direction, amount):
-        self.xdotool("mousemove", str(int(at[0])), str(int(at[1])),
-                     "click", "--repeat", str(amount), "--delay", "15", "4" if direction == "up" else "5")
+        notches = []
+        for _ in range(amount):
+            notches += ["click", "4" if direction == "up" else "5", "sleep", "{:.3f}".format(random.uniform(0.01, 0.03))]
+        self.glide({"x": at[0] - 10, "y": at[1] - 10, "w": 20, "h": 20}, *notches)
 
     def key(self, keys):
         self.xdotool("key", "--clearmodifiers", keys)
@@ -241,8 +266,15 @@ class Desktop:
         self.xdotool("type", "--delay", "8", "--", text)
 
     def activate(self, window_id):
-        # Clicks and scrolls land on whatever window is on top at that point, so raise the target first.
-        self.call("/window/{}/activate".format(window_id), "POST")
+        """Brings the window to the front the way a person would, by clicking its title bar when it is not focused;
+        clicks and scrolls land on whatever window is on top."""
+        desktop = self.call("/desktop")
+        if desktop.get("focus") == window_id:
+            return
+        window = next((w for w in desktop.get("windows") or [] if w.get("id") == window_id), None)
+        if not window or not window.get("frame"):
+            raise AdapterError("window_missing")
+        self.click(title_spot(window, self.tree(window_id)))
         time.sleep(0.2)
 
     def windows(self):
@@ -279,6 +311,26 @@ class Desktop:
         if window and window.get("rect"):
             x, y, w, _ = window["rect"]
             self.point(x + w / 2, y + 12)
+
+
+CONTROL_ROLES = {"button", "push button", "toggle button", "link", "entry", "password text", "page tab", "menu item",
+                 "check box", "radio button", "combo box", "list item", "image", "static", "label"}
+
+
+def title_spot(window, tree):
+    """An empty patch of the window's title strip to click on: the window manager's title bar when the window has
+    one, otherwise the top of the client's own drag area away from any control."""
+    fx, fy, fw, _ = window["frame"]
+    rx, ry = window["rect"][0], window["rect"][1]
+    if ry - fy >= 12:
+        return {"x": fx + fw * 0.3, "y": fy + 2, "w": fw * 0.4, "h": ry - fy - 4}
+    controls = [n["bounds"] for n in walk(tree) if n.get("role") in CONTROL_ROLES and n.get("bounds")]
+    for step in range(30, 70, 4):
+        spot = {"x": rx + fw * step / 100, "y": ry + 2, "w": 24, "h": 10}
+        if not any(b["x"] < spot["x"] + spot["w"] and spot["x"] < b["x"] + b["w"]
+                   and b["y"] < spot["y"] + spot["h"] and spot["y"] < b["y"] + b["h"] for b in controls):
+            return spot
+    raise AdapterError("window_title_covered")
 
 
 def control_in(tree, pattern):

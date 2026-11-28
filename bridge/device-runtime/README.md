@@ -40,6 +40,7 @@ A connector's `id` is its `kind`, a hyphen and the account it reads: the QQ numb
 ```json
 {
   "docker": "/opt/homebrew/bin/docker",
+  "node": "/usr/local/bin/node",
   "profiles": {
     "wechat-a": {
       "desktopUrl": "http://127.0.0.1:13000",
@@ -61,6 +62,8 @@ A connector's `id` is its `kind`, a hyphen and the account it reads: the QQ numb
 ```
 
 The adapter reads windows, accessibility trees and screenshots through Pelorus at `desktopUrl`, and sends clicks, keys and text with `xdotool` inside `container` through `docker exec`, using the absolute `docker` path (launchd gives the runtime a minimal `PATH`): Pelorus pauses about a second after every action it performs, while `docker exec xdotool` takes about 0.1 second, and `xdotool type` enters CJK text and 「」 as they are.
+
+The pointer moves the way a hand moves it. Before every click, scroll and hover the adapter reads the pointer position and has `pointer_path.mjs` (run with the absolute `node` path; install the bridge's dependencies with `pnpm install`) draw a path with [ghost-cursor](https://github.com/Xetera/ghost-cursor): a Bézier curve whose number of steps follows Fitts's law, ending at a random point inside the target away from its edges, and overshooting then correcting on moves longer than 500 px. `xdotool` replays it one step every 4–8 ms, then presses and releases the button 60–120 ms apart; scrolling sends wheel notches 10–30 ms apart. A move across the screen takes about half a second. A window is brought forward by clicking an empty patch of its title strip, only when it is not already focused.
 
 `outgoingDirectory` is a folder inside the container's mounted config volume and `containerOutgoingDirectory` is the same folder as the container sees it; files to send are copied there under their own names (recipients see them) and removed after a day. Without both, sends with files are refused before anything is sent. `tokenFile` holds the container's Selkies master token (`SELKIES_MASTER_TOKEN`), which the adapter sends as `Authorization: Bearer`; it stays outside the repository. The runtime starts the adapter directly, so keep it executable (`chmod 755 selkies_adapter.py`). Run one container per client account (`AUTO_START_WECHAT` / `AUTO_START_QQ` pick the client), so each desktop has one client to restore, maximize and read, and a second account is one more container. A container costs about 0.3 GB for the desktop and streaming stack (with audio, printing and the TURN server turned off as below) plus 0.4–1 GB for its client, which grows the longer it runs. The adapter keeps each profile's chat names and recent sends, and nothing else, in `selkies_adapter.<profile>.state.json` beside itself (mode `0600`), so two accounts in the same group do not take each other's messages for their own.
 
