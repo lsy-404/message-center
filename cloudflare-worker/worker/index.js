@@ -3005,7 +3005,7 @@ async function completeCommand(request, env, commandId) {
 
 async function downloadFile(request, env, ctx, fileId) {
   if (!validId(fileId)) throw new Error("invalid_file_id");
-  const human = await oidcIdentity(request, env);
+  const human = await oidcIdentity(request, env, ctx);
   const connectorId = request.headers.get("x-connector-id") || "";
   const [agent, connector] = await Promise.all([
     hasRole(request, env, "agent"),
@@ -3745,7 +3745,7 @@ export default {
         return json({ ok: true, service: "message-center", architecture: "cloudflare-worker", storage: ["D1", "R2"] });
       }
       if (url.pathname === "/login" && request.method === "GET") {
-        return await oidcIdentity(request, env) ? redirect("/app") : authenticationResult(await beginOidcLogin(request, env));
+        return await oidcIdentity(request, env, ctx) ? redirect("/app") : authenticationResult(await beginOidcLogin(request, env));
       }
       if (url.pathname === "/signed-out" && request.method === "GET") return authenticationPage("已退出 Message Center。再次访问需要登录。");
       if (url.pathname === "/api/auth/callback" && request.method === "GET") return authenticationResult(await completeOidcLogin(request, env));
@@ -3794,7 +3794,7 @@ export default {
 
       if (request.method === "GET" && PUBLIC_PWA_FILES.has(url.pathname)) return await pwaFileResponse(request, env, url.pathname);
 
-      const identity = await oidcIdentity(request, env);
+      const identity = await oidcIdentity(request, env, ctx);
       if (!identity && (url.pathname === "/" || url.pathname === "/app" || url.pathname === "/index.html") && request.method === "GET") return redirect("/login");
       if (!identity) return fail("access_required", 401, "Administrator sign-in is required at /login.");
       if (["POST", "PUT", "PATCH", "DELETE"].includes(request.method) && !sameOrigin(request)) return fail("cross_origin_denied", 403);

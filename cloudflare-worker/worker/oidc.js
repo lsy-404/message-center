@@ -390,7 +390,7 @@ async function refreshSession(env, cfg, session) {
   }
 }
 
-export async function oidcIdentity(request, env) {
+export async function oidcIdentity(request, env, ctx) {
   let cfg;
   let session;
   try {
@@ -411,7 +411,12 @@ export async function oidcIdentity(request, env) {
       return null;
     }
     cfg = await client(env, request);
-    if (session.tokens.access_exp <= Math.floor(Date.now() / 1000) + 30) session = await refreshSession(env, cfg, session);
+    if (session.tokens.access_exp <= Math.floor(Date.now() / 1000) + 30) {
+      // A client that disconnects cancels its request; a refresh cut off mid-rotation would strand the session.
+      const refreshing = refreshSession(env, cfg, session);
+      ctx?.waitUntil?.(refreshing.catch(() => {}));
+      session = await refreshing;
+    }
     const identity = await introspect(cfg, session.tokens.access_token);
     validateAdminIntrospection(identity, cfg, session.tokens.subject);
     return { id: `oidc:${identity.sub}`, name: typeof session.tokens.name === "string" ? session.tokens.name : "", email: typeof session.tokens.email === "string" ? session.tokens.email : "", authLabel: "OIDC" };
