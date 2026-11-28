@@ -76,6 +76,7 @@
 - staging 文件最长保留 24 小时；成功排队后转为命令附件，取消或过期文件由 Worker 定时清理。
 - 排队操作保证幂等。设备 relay 在本地持久化执行账本；只有明确未调用客户端时才自动重试。客户端调用结果不确定时转入人工检查，避免一次物理发送被重复执行。
 - `CommandSignal` Durable Object 持有休眠的 WebSocket：设备连 `/api/connectors/signal`，命令排队时收到 `command` 后立即领取；已登录的页面连 `/api/live`，命令完成、新消息入库或表情取回完成时收到 `changed` 后立即刷新。两边都只传唤醒信号，内容仍走原有接口；页面在实时连接断开时每 5 秒轮询，连接正常时每 60 秒轮询一次以刷新接入状态。设备还可在同一条连接上发 `{"t":"req","id","method","path","headers","body","bodyEncoding"}` 帧调用 `/api/connectors/*` 接口（`signal` 与 `files/*` 除外，单帧上限 1 MiB），Worker 以同样的路由与鉴权处理后回 `{"t":"res","id","status","body"}`，省去单独的 HTTP 请求。
+- QQ / 微信群聊支持提及与拍一拍：`POST /api/messages/send` 可带 `mentions`（至多 10 个互不相同的显示名，正文须含对应的 `@名字`），写入发送命令的 `payload.mentions`；`POST /api/messages/:messageId/pat`（带 `clientRequestId`）对群里的入站消息发送者排队一条 `pat` 命令，载荷为 `externalConversationId`、`senderName`、`messageText`（前 200 字）和 `body`，设备按发送命令的租约与回报格式处理。`/api/inbox` 在选中群聊时返回 `members`（入站发送者名，最近发言在前，至多 200）。
 
 ## 构建与部署
 

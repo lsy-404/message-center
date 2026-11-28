@@ -248,6 +248,8 @@ def adapter_timeout_for_request(request):
         return ADAPTER_SEND_TIMEOUT + 120 * len(request.get("attachments") or [])
     if operation == "fetch":
         return ADAPTER_FETCH_TIMEOUT
+    if operation == "pat":
+        return ADAPTER_SEND_TIMEOUT
     raise ValueError("unsupported_adapter_operation")
 
 
@@ -928,8 +930,10 @@ class Relay:
             return
         payload = command.get("payload") or {}
         fingerprint = hashlib.sha256(compact({
+            "kind": command.get("kind"),
             "externalConversationId": payload.get("externalConversationId"),
             "body": payload.get("body", ""), "attachments": payload.get("attachments", []),
+            "mentions": payload.get("mentions") or [], "senderName": payload.get("senderName"),
         }).encode("utf-8")).hexdigest()
         row = self.db.execute("SELECT state,result,retryable,fingerprint FROM command_ledger WHERE connector_id=? AND idempotency_key=?",
                               (self.connector, key)).fetchone()
@@ -976,14 +980,19 @@ class Relay:
             except Exception:
                 result = {"ok": False, "retryable": True, "dispatched": False, "error": "attachment_download_failed"}
             else:
-                request = {"op": "send", "driver": driver,
+                request = {"driver": driver,
                            "profile": profile, "account": connector_account(connector),
                            "commandId": command["id"],
                            "idempotencyKey": key,
-                           "conversationExternalId": payload.get("externalConversationId"),
-                           "body": payload.get("body", ""),
-                           "confirmed": True, "targetConfirmed": True,
-                           "attachments": downloaded}
+                           "conversationExternalId": payload.get("externalConversationId")}
+                if command.get("kind") == "pat":
+                    request.update({"op": "pat", "senderName": payload.get("senderName"),
+                                    "messageText": payload.get("messageText") or ""})
+                else:
+                    request.update({"op": "send", "body": payload.get("body", ""),
+                                    "mentions": payload.get("mentions") or [],
+                                    "confirmed": True, "targetConfirmed": True,
+                                    "attachments": downloaded})
                 result = self.adapter_call(request)
             if result.get("ok") is True and isinstance(result.get("receipt"), str) and result.get("receipt"):
                 outcome = {"ok": True, "result": {"receipt": result["receipt"]}}

@@ -122,6 +122,14 @@ Every request also carries `account`, the account named by the connector id, whi
 - It sends (WeChat with Enter, QQ with the 发送 button), then waits until the input is empty and the last message in the chat equals the text. Only then does it answer with a receipt. A result it cannot confirm carries no `dispatched: false`, so the runtime records it as uncertain for manual review and never sends it again.
 - The next scans recognise the chat-list preview of a message the adapter just sent and do not report it as an incoming message; the outbound message already exists in Message Center.
 
+`send` may carry `mentions`, display names whose `@<name>` appears in the body (group chats only). Each one is typed as `@` and the name, and the member is chosen from the client's suggestion list: WeChat's list is a small window of its own whose best match is taken with Enter, and only once that window is open, since Enter without it would send the draft; QQ's suggestion row naming the member is clicked. WeChat turns the mention into one U+FFFC object in the input, so the read-back compares the text around the mentions and counts them.
+
+`pat` request: `{"op":"pat", ..., "conversationExternalId", "senderName", "messageText"}` pats the member who sent a group message (拍一拍) from their avatar's context menu, which offers `@ <name>` and 拍一拍:
+
+- QQ names each avatar `<name>的头像`; the adapter right-clicks the newest one and clicks the 拍一拍 menu item.
+- WeChat's message rows carry neither positions nor senders, so the adapter finds the avatar squares down the list's left (others) and right (own) edges in a screenshot, pairs them with the message rows from the bottom up (time and notice rows have no avatar), and takes the newest message from someone else whose text starts with `messageText`. Its menu is not in the tree either; 拍一拍 is its second entry, below the pointer.
+- The client then adds a notice such as `我拍了拍「<name>」`; a new last row with 拍了拍 and the name is the receipt. Without it the result is uncertain, and a mention left in the input by a stray click is cleared. Never press Escape in the WeChat window: it hides the client to the tray.
+
 To try a send on a real account, send an ordinary message of the kind the account would send anyway, to a chat you own (文件传输助手, 我的手机), not marker text such as numbered test strings: QQ and WeChat watch for automated-looking traffic, and such text also lingers in real chats.
 
 ### Fetching media

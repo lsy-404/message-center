@@ -649,13 +649,21 @@ def wechat_find_row(desktop, window_id, list_name, name):
     center = wechat_list_center(tree, list_name)
     if not center:
         return None
-    desktop.scroll(center, "up", 30)
-    time.sleep(0.4)
+    def visible_rows():
+        chats = find(desktop.tree(window_id), lambda n: n.get("role") == "list" and n.get("name") == list_name)
+        return wechat_list_rows(chats, "normal") if chats else []
+    # The client drops wheel notches that arrive close together, so scroll up until the rows stop changing.
     previous = None
     for _ in range(SCROLL_PAGES):
-        tree = desktop.tree(window_id)
-        chats = find(tree, lambda n: n.get("role") == "list" and n.get("name") == list_name)
-        rows = wechat_list_rows(chats, "normal") if chats else []
+        desktop.scroll(center, "up", 15)
+        time.sleep(0.4)
+        names = [row["name"] for row in visible_rows()]
+        if names == previous:
+            break
+        previous = names
+    previous = None
+    for _ in range(SCROLL_PAGES):
+        rows = visible_rows()
         for row in rows:
             if row["bounds"] and (row["name"] == name or (row["selected"] and name.startswith(row["name"]))):
                 return row
@@ -935,10 +943,9 @@ def restore_from_tray(desktop, driver):
     if panel is None:
         return False
     tree = desktop.tree(panel["id"])
-    tabs = [n for n in walk(tree) if n.get("role") == "page tab" and n.get("bounds")]
-    start = max((n["bounds"]["x"] for n in tabs), default=0)
-    tray = [n for n in walk(tree) if n.get("role") == "button" and n.get("bounds") and n["bounds"]["x"] > start
-            and n.get("name") not in ("通知", "时钟", "显示桌面")]
+    # Only called with no client window mapped, so the panel has no task button for the client to confuse with.
+    tray = [n for n in walk(tree) if n.get("role") == "button" and n.get("bounds")
+            and n.get("name") not in ("开始菜单", "通知", "时钟", "显示桌面")]
     if driver == "wechat":
         target = next((n for n in tray if (n.get("name") or "").lower() == "wechat"), None)
     else:
@@ -999,18 +1006,76 @@ def open_conversation(desktop, driver, window_id, tree, name, folded):
     return tree
 
 
-def type_text(desktop, driver, window_id, tree, name, body):
-    lines = body.split("\n")
+def mention_parts(body, mentions):
+    """`body` split into (is_mention, text) pieces, a mention being "@<name>" for a name in `mentions`."""
+    names = sorted({m for m in mentions if m}, key=len, reverse=True)
+    parts, start, index = [], 0, 0
+    while index < len(body):
+        hit = next((n for n in names if body.startswith("@" + n, index)), None)
+        if hit is None:
+            index += 1
+            continue
+        if index > start:
+            parts.append((False, body[start:index]))
+        parts.append((True, hit))
+        index += len(hit) + 1
+        start = index
+    if start < len(body):
+        parts.append((False, body[start:]))
+    return parts
+
+
+def without_mentions(text, mentions):
+    """`text` with mention pills (WeChat shows each as U+FFFC) and "@<name>" pieces removed, whitespace collapsed."""
+    for name in sorted(mentions, key=len, reverse=True):
+        text = text.replace("@" + name, "")
+    return collapse(text.replace("\ufffc", ""))
+
+
+def pick_mention(desktop, driver, window_id, name):
+    """After "@<name>" was typed, chooses the member from the client's suggestion list. WeChat's list is a small
+    window of its own whose rows are not in the tree and whose first row is the best match; QQ lists members in the
+    chat window."""
+    if driver == "wechat":
+        popup = wait_for(lambda: any(w.get("app_id") == "wechat" and w.get("type") == "utility" and w.get("mapped")
+                                     for w in desktop.windows()), 2, every=0.1)
+        if not popup:
+            raise AdapterError("mention_unavailable")
+        # Return without the list open would send the draft.
+        desktop.key("Return")
+        return
+
+    def option():
+        return next((n for n in walk(desktop.tree(window_id)) if n.get("bounds")
+                     and n.get("role") in ("list item", "menu item", "option")
+                     and (text_of(n) == name or text_of(n).startswith(name + " ") or
+                          any(text_of(c) == name for c in walk(n) if c is not n))), None)
+    item = wait_for(option, 2, every=0.1)
+    if item is None:
+        raise AdapterError("mention_unavailable")
+    desktop.click(item["bounds"])
+
+
+def type_text(desktop, driver, window_id, tree, name, body, mentions=()):
     node, _ = chat_input(driver, tree, name, loose=True)
-    if node is None:
+    if node is None or not node.get("bounds"):
         raise AdapterError("input_not_found")
-    if not node.get("bounds"):
-        raise AdapterError("input_not_found")
-    type_into(desktop, lines[0], node)
-    for line in lines[1:]:
-        desktop.key("shift+Return")
-        if line:
-            desktop.write(line)
+    desktop.press(node)
+    for is_mention, text in mention_parts(body, mentions):
+        if is_mention:
+            desktop.write("@")
+            time.sleep(0.3)
+            desktop.write(text)
+            pick_mention(desktop, driver, window_id, text)
+            time.sleep(0.2)
+            continue
+        lines = text.split("\n")
+        if lines[0]:
+            desktop.write(lines[0])
+        for line in lines[1:]:
+            desktop.key("shift+Return")
+            if line:
+                desktop.write(line)
 
 
 def clear_input(desktop):
@@ -1214,6 +1279,10 @@ def send(request, config):
         return {"ok": False, "dispatched": False, "error": "invalid_attachments"}
     if (not body and not attachments) or len(body) > MAX_BODY:
         return {"ok": False, "dispatched": False, "error": "invalid_body"}
+    mentions = request.get("mentions") or []
+    if not isinstance(mentions, list) or len(mentions) > 10 or not all(
+            isinstance(m, str) and 0 < len(m) <= 64 and "\n" not in m and "@" + m in body for m in mentions):
+        return {"ok": False, "dispatched": False, "error": "invalid_mentions"}
     conversation = request.get("conversationExternalId")
     dispatched = False
 
@@ -1252,12 +1321,23 @@ def send(request, config):
         if staged:
             tree = desktop.tree(window_id)
         before_text, before_count = last_message(driver, tree)
-        type_text(desktop, driver, window_id, tree, name, body)
+        try:
+            type_text(desktop, driver, window_id, tree, name, body, mentions)
+        except AdapterError:
+            clear_input(desktop)
+            raise
+        wanted = sum(1 for is_mention, _ in mention_parts(body, mentions) if is_mention)
 
         def typed_in():
             current = desktop.tree(window_id)
             node, typed = chat_input(driver, current, name, loose=True)
-            return current if node is not None and collapse(typed) == collapse(body) else None
+            if node is None:
+                return None
+            if not mentions:
+                return current if collapse(typed) == collapse(body) else None
+            pills = typed.count("\ufffc") + sum(typed.count("@" + m) for m in mentions)
+            return current if pills >= wanted and without_mentions(typed, mentions) == without_mentions(body, mentions) \
+                else None
         tree = wait_for(typed_in, 2, every=0.1)
         if not tree:
             clear_input(desktop)
@@ -1280,7 +1360,9 @@ def send(request, config):
             node, remaining = chat_input(driver, tree, name, loose=True)
             last, count = last_message(driver, tree)
             fresh = collapse(before_text) != collapse(body) or count != before_count
-            if node is not None and not collapse(remaining) and collapse(last) == collapse(body) and fresh:
+            landed = collapse(last) == collapse(body) or (
+                mentions and count != before_count and without_mentions(last, mentions) == without_mentions(body, mentions))
+            if node is not None and not collapse(remaining) and landed and fresh:
                 now = int(time.time() * 1000)
                 state["recent"].setdefault(conversation, []).append({"t": digest(collapse(body)), "at": now})
                 save_state(state)
@@ -1288,6 +1370,122 @@ def send(request, config):
     except AdapterError as error:
         print(str(error), file=sys.stderr)
     return {"ok": False, "error": "send_unverified"}
+
+
+WECHAT_TIME_ROW = re.compile(r"^(昨天|前天|星期[一二三四五六日天]|\d{4}年|\d{1,2}月\d{1,2}日)?\s*\d{1,2}:\d{2}$")
+WECHAT_NOTICE_ROW = re.compile(r"拍了拍|撤回了一条消息|加入了群聊|邀请|移出了群聊|修改群名|以下为新消息|收到红包|领取了")
+
+
+def wechat_avatars(desktop, window_id, messages):
+    """Avatar squares down the message list's left (others) and right (own) edges, read from a screenshot:
+    [(top, left_side, bounds)] from top to bottom. Each message row carries one avatar and time and notice rows none."""
+    box = messages["bounds"]
+    png, (left, top, scale) = desktop.screenshot(window_id)
+    rows, bpp = png_left_columns(png, int((box["x"] + box["w"] - left) * scale))
+    def px(x, y):
+        return rows[int((y - top) * scale)][int((x - left) * scale) * bpp:int((x - left) * scale) * bpp + 3]
+    background = px(box["x"] + box["w"] // 2, box["y"] + 4)
+    found = []
+    for side, x0 in ((True, box["x"] + 20), (False, box["x"] + box["w"] - 58)):
+        start = None
+        for y in range(box["y"], box["y"] + box["h"]):
+            ink = sum(1 for x in range(x0, x0 + 36, 2) if max(abs(a - b) for a, b in zip(px(x, y), background)) > 24)
+            if ink >= 6 and start is None:
+                start = y
+            elif ink < 6 and start is not None:
+                if 24 <= y - start <= 48:
+                    found.append((start, side, {"x": x0 + 4, "y": start + 4, "w": 28, "h": y - start - 8}))
+                start = None
+    return sorted(found, key=lambda item: item[0])
+
+
+def wechat_pat_target(desktop, window_id, tree, message_text):
+    """The avatar beside the newest visible message from someone else whose text is `message_text` (a chat-list
+    preview, so possibly cut short with an ellipsis), matching message rows to avatars from the bottom up."""
+    messages = find(tree, lambda n: n.get("role") == "list" and n.get("name") == "消息")
+    if not messages or not messages.get("bounds"):
+        raise AdapterError("message_list_missing")
+    items = [n.get("name") or "" for n in (messages.get("children") or []) if n.get("role") == "list item"]
+    items = [t for t in items if not WECHAT_TIME_ROW.match(t.strip()) and not WECHAT_NOTICE_ROW.search(t)]
+    avatars = wechat_avatars(desktop, window_id, messages)
+    wanted = collapse(message_text).rstrip("…").rstrip(".")
+    for item, (_, others, bounds) in zip(reversed(items), reversed(avatars)):
+        if others and wanted and collapse(item).startswith(wanted):
+            return bounds
+    raise AdapterError("pat_target_not_visible")
+
+
+def pointer_at(desktop):
+    found = dict(re.findall(r"(\w+)=(-?\d+)", desktop.xdotool("getmouselocation", "--shell")))
+    return int(found["X"]), int(found["Y"])
+
+
+def pat(request, config):
+    """Pats the member who sent a group message: right-clicks their avatar beside the message and picks 拍一拍.
+    The client then adds a notice naming whom it patted, which is the receipt."""
+    driver = request.get("driver")
+    sender = request.get("senderName") if isinstance(request.get("senderName"), str) else ""
+    message_text = request.get("messageText") if isinstance(request.get("messageText"), str) else ""
+    conversation = request.get("conversationExternalId")
+    if driver not in APPS:
+        return {"ok": False, "dispatched": False, "error": "driver_unsupported"}
+    if not sender or len(sender) > 200:
+        return {"ok": False, "dispatched": False, "error": "invalid_sender"}
+    try:
+        desktop, _ = container(config, request.get("profile"))
+        state = load_state(request.get("profile"))
+        target = state["conversations"].get(conversation) if isinstance(conversation, str) else None
+        if not target:
+            return {"ok": False, "dispatched": False, "error": "conversation_unknown"}
+        name = target["name"]
+        window_id, tree = open_client(desktop, driver)
+        check_account(desktop, driver, request)
+        tree = open_conversation(desktop, driver, window_id, tree, name, bool(target.get("folder")))
+        _, draft = chat_input(driver, tree, name, loose=True)
+        if collapse(draft):
+            return {"ok": False, "dispatched": False, "error": "draft_present"}
+        before_text, before_count = last_message(driver, tree)
+        if driver == "wechat":
+            spot = wechat_pat_target(desktop, window_id, tree, message_text)
+            desktop.click(spot, button="right")
+            time.sleep(0.5)
+            x, y = pointer_at(desktop)
+            # The menu opens at the pointer: "@ <name>" first, 拍一拍 second.
+            item = {"x": x + 16, "y": y + 50, "w": 60, "h": 12}
+        else:
+            messages = find(tree, lambda n: n.get("name") == "消息列表")
+            avatars = [n for n in walk(messages) if n.get("bounds") and n.get("role") in ("button", "image")
+                       and n.get("name") == sender + "的头像"] if messages else []
+            if not avatars:
+                return {"ok": False, "dispatched": False, "error": "pat_target_not_visible"}
+            desktop.click(avatars[-1]["bounds"], button="right")
+            found = wait_for(lambda: next((n for n in walk(desktop.tree(window_id)) if n.get("bounds")
+                                           and n.get("role") == "menu item" and text_of(n) == "拍一拍"), None), 2, every=0.1)
+            if found is None:
+                desktop.click({"x": avatars[-1]["bounds"]["x"] + 300, "y": avatars[-1]["bounds"]["y"], "w": 40, "h": 10})
+                return {"ok": False, "dispatched": False, "error": "pat_menu_missing"}
+            item = found["bounds"]
+    except AdapterError as error:
+        return {"ok": False, "dispatched": False, "error": str(error)}
+    try:
+        desktop.click(item)
+
+        def noticed():
+            last, count = last_message(driver, desktop.tree(window_id))
+            return last if count != before_count or collapse(last) != collapse(before_text) else None
+        notice = wait_for(noticed, 5, every=0.2)
+        if notice and "拍了拍" in notice and sender[:6] in notice:
+            now = int(time.time() * 1000)
+            state["recent"].setdefault(conversation, []).append({"t": digest(collapse(notice)), "at": now})
+            save_state(state)
+            return {"ok": True, "receipt": "{}:{}:{}".format(conversation, digest(notice), now)}
+        _, draft = chat_input(driver, desktop.tree(window_id), name, loose=True)
+        if collapse(draft):
+            # The click took the menu's other entry and left a mention in the input.
+            clear_input(desktop)
+    except AdapterError as error:
+        print(str(error), file=sys.stderr)
+    return {"ok": False, "error": "pat_unverified"}
 
 
 def png_encode(rows, width, bpp):
@@ -1447,11 +1645,13 @@ def handle(request):
     try:
         config = load_config()
     except AdapterError as error:
-        if operation == "send":
+        if operation in ("send", "pat"):
             return {"ok": False, "dispatched": False, "error": str(error)}
         return {"ok": False, "sourceReadStatus": "failed", "error": str(error)}
     if operation == "send":
         return send(request, config)
+    if operation == "pat":
+        return pat(request, config)
     if operation == "fetch":
         return fetch(request, config)
     if operation != "scan":

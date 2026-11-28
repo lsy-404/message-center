@@ -2060,8 +2060,19 @@ async function readInbox(env, selectedConversationId, selectedContactId) {
       };
     });
   }
+  const selectedConversation = conversations.find((item) => item.id === selected);
+  let members = [];
+  if (selectedConversation?.conversationType === "group" &&
+      (selectedConversation.connectorKind === "qq" || selectedConversation.connectorKind === "wechat")) {
+    const memberRows = await env.DB.prepare(`
+      SELECT sender_name FROM messages
+      WHERE conversation_id = ? AND direction = 'inbound' AND TRIM(COALESCE(sender_name, '')) != ''
+      GROUP BY sender_name ORDER BY MAX(occurred_at) DESC LIMIT 200
+    `).bind(selected).all();
+    members = (memberRows.results || []).map((row) => row.sender_name);
+  }
   const filteredTotal = await env.DB.prepare("SELECT COUNT(*) AS total FROM messages WHERE queue_class = 'filtered'").first();
-  return { connectors, conversations, contacts, messages, selectedConversationId: selected,
+  return { connectors, conversations, contacts, messages, members, selectedConversationId: selected,
     filteredCount: count(filteredTotal?.total) };
 }
 
@@ -2531,6 +2542,21 @@ async function cleanupOrphanAttachmentObjects(env) {
   }
 }
 
+function normalizedMentions(value, body) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value) || value.length > 10) throw new Error("invalid_mentions");
+  const names = value.map((name) => typeof name === "string" ? name : "");
+  if (new Set(names).size !== names.length ||
+      names.some((name) => name.length < 1 || name.length > 64 || /[\r\n\u0000]/.test(name) || !body.includes(`@${name}`))) {
+    throw new Error("invalid_mentions");
+  }
+  return names;
+}
+
+function isMentionableGroup(conversation) {
+  return conversation.conversation_type === "group" && (conversation.connector_kind === "qq" || conversation.connector_kind === "wechat");
+}
+
 async function queueOutbound(env, input, retryDepth = 0) {
   const body = String(input.body || "").replace(/\u0000/g, "").trim();
   const attachmentIds = input.attachmentIds.map(String);
@@ -2538,6 +2564,7 @@ async function queueOutbound(env, input, retryDepth = 0) {
   if (body.length > 20_000) throw new Error("message_too_large");
   if (attachmentIds.length > 10) throw new Error("too_many_attachments");
   if (new Set(attachmentIds).size !== attachmentIds.length) throw new Error("duplicate_attachment_id");
+  const mentions = normalizedMentions(input.mentions, body);
   const requestFingerprint = await sha256Hex(ENCODER.encode(JSON.stringify({
     idempotencyKey: input.idempotencyKey,
     userId: input.userId,
@@ -2584,7 +2611,7 @@ async function queueOutbound(env, input, retryDepth = 0) {
   const existing = await readExisting();
   if (existing) return existing;
   const conversation = await env.DB.prepare(`
-    SELECT c.*, k.capabilities_json, k.mode AS connector_mode,
+    SELECT c.*, k.capabilities_json, k.mode AS connector_mode, k.kind AS connector_kind,
       COALESCE(p.conversation_type, 'unknown') AS conversation_type
     FROM conversations c
     JOIN connector_instances k ON k.id = c.connector_id
@@ -2595,6 +2622,7 @@ async function queueOutbound(env, input, retryDepth = 0) {
   if (!conversation) throw new Error("conversation_not_found");
   const capabilities = capabilitySet(conversation);
   if (body && !capabilities.has("send_text")) throw new Error("connector_text_send_not_supported");
+  if (mentions.length && !isMentionableGroup(conversation)) throw new Error("mentions_group_only");
   if (conversation.connector_mode === "device_relay" && body.length > 500) {
     throw new Error("message_too_large");
   }
@@ -2738,6 +2766,7 @@ async function queueOutbound(env, input, retryDepth = 0) {
     `).bind(commandId, conversation.connector_id, input.conversationId, messageId,
       files.length ? "send_message_with_files" : "send_text",
       JSON.stringify({ externalConversationId: conversation.external_id, body,
+        ...(mentions.length ? { mentions } : {}),
         attachments: files.map((file) => ({ ...file, downloadPath: `/api/files/${file.id}` })) }),
       input.idempotencyKey, input.userId, stamp, messageId),
     env.DB.prepare(`
@@ -2792,10 +2821,76 @@ async function sendHumanMessage(request, env, identity) {
     throw new Error("invalid_send_request");
   }
   const result = await queueOutbound(env, {
-    conversationId, body: String(body.body || ""), attachmentIds,
+    conversationId, body: String(body.body || ""), attachmentIds, mentions: body.mentions,
     userId: identity.id, userName: identity.name, idempotencyKey,
   });
   return json({ ok: true, ...result }, 202);
+}
+
+async function requestPat(request, env, identity, messageId) {
+  const body = await readJson(request, 8 * 1024);
+  const idempotencyKey = String(body.clientRequestId || request.headers.get("idempotency-key") || "");
+  if (!validId(messageId) || !validId(idempotencyKey)) throw new Error("invalid_pat_request");
+  const existing = await env.DB.prepare(`
+    SELECT id, message_id, state, kind, created_by, payload_json FROM commands WHERE idempotency_key = ?
+  `).bind(idempotencyKey).first();
+  const existingPayload = existing ? safeJson(existing.payload_json, {}) : {};
+  if (existing) {
+    const target = await env.DB.prepare("SELECT 1 AS ok FROM messages WHERE id = ? AND direction = 'inbound' AND sender_name = ?")
+      .bind(messageId, String(existingPayload.senderName || "")).first();
+    if (existing.kind !== "pat" || existing.created_by !== identity.id || !target) throw new Error("idempotency_key_conflict");
+    return json({ ok: true, messageId: existing.message_id, commandId: existing.id, state: existing.state }, 202);
+  }
+  const row = await env.DB.prepare(`
+    SELECT m.id, m.body, m.sender_name, m.direction, c.id AS conversation_id, c.external_id, c.connector_id,
+      k.kind AS connector_kind, k.capabilities_json, COALESCE(p.conversation_type, 'unknown') AS conversation_type
+    FROM messages m JOIN conversations c ON c.id = m.conversation_id
+    JOIN connector_instances k ON k.id = c.connector_id
+    LEFT JOIN conversation_profiles p ON p.connector_id = c.connector_id
+      AND p.conversation_external_id = c.external_id
+    WHERE m.id = ?
+  `).bind(messageId).first();
+  if (!row || row.direction !== "inbound") throw new Error("message_not_found");
+  const senderName = String(row.sender_name || "").trim();
+  if (!isMentionableGroup(row) || !capabilitySet(row).has("send_text") || !senderName) {
+    throw new Error("pat_not_available");
+  }
+  const line = `我拍了拍「${senderName}」`;
+  const stamp = now();
+  const newMessageId = crypto.randomUUID();
+  const commandId = crypto.randomUUID();
+  const preview = `[拍一拍] ${line}`;
+  try {
+    await env.DB.batch([
+      env.DB.prepare(`
+        INSERT INTO messages (
+          id, conversation_id, connector_id, external_id, direction, sender_id, sender_name, body,
+          content_type, delivery_state, metadata_json, occurred_at, created_by, created_at
+        ) VALUES (?, ?, ?, NULL, 'outbound', ?, ?, ?, 'text', 'queued', '{}', ?, ?, ?)
+      `).bind(newMessageId, row.conversation_id, row.connector_id, identity.id, identity.name.slice(0, 200),
+        preview, stamp, identity.id, stamp),
+      env.DB.prepare(`
+        INSERT INTO commands (
+          id, connector_id, conversation_id, message_id, kind, payload_json, state,
+          idempotency_key, attempts, created_by, created_at
+        ) VALUES (?, ?, ?, ?, 'pat', ?, 'pending', ?, 0, ?, ?)
+      `).bind(commandId, row.connector_id, row.conversation_id, newMessageId,
+        JSON.stringify({ externalConversationId: row.external_id, senderName,
+          messageText: String(row.body || "").slice(0, 200), body: line }),
+        idempotencyKey, identity.id, stamp),
+      env.DB.prepare(`
+        UPDATE conversations SET last_message_preview = ?, last_message_at = ?, updated_at = ? WHERE id = ?
+      `).bind(preview, stamp, stamp, row.conversation_id),
+    ]);
+  } catch (error) {
+    const concurrent = await env.DB.prepare("SELECT id, message_id, state FROM commands WHERE idempotency_key = ?")
+      .bind(idempotencyKey).first();
+    if (concurrent) return json({ ok: true, messageId: concurrent.message_id, commandId: concurrent.id, state: concurrent.state }, 202);
+    throw error;
+  }
+  await audit(env, identity.id, "outbound_queued", newMessageId, { commandId, connectorId: row.connector_id, kind: "pat" });
+  await signalCommand(env, row.connector_id);
+  return json({ ok: true, messageId: newMessageId, commandId, state: "pending" }, 202);
 }
 
 async function leaseCommands(request, env, url) {
@@ -3871,6 +3966,8 @@ export default {
       const stagedFile = url.pathname.match(/^\/api\/files\/([a-zA-Z0-9._:-]+)$/);
       if (stagedFile && request.method === "DELETE") return await discardHumanFile(env, ctx, identity, stagedFile[1]);
       if (url.pathname === "/api/messages/send" && request.method === "POST") return await sendHumanMessage(request, env, identity);
+      const patRoute = url.pathname.match(/^\/api\/messages\/([a-zA-Z0-9._:-]+)\/pat$/);
+      if (patRoute && request.method === "POST") return await requestPat(request, env, identity, patRoute[1]);
       const mediaFetch = url.pathname.match(/^\/api\/messages\/([a-zA-Z0-9._:-]+)\/fetch-media$/);
       if (mediaFetch && request.method === "POST") return await requestMediaFetch(env, identity, mediaFetch[1]);
       const policy = url.pathname.match(/^\/api\/conversations\/([a-zA-Z0-9._:-]+)\/policy$/);

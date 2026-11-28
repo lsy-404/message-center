@@ -171,6 +171,7 @@ type Snapshot = {
   conversations: Conversation[]
   contacts: Contact[]
   messages: Message[]
+  members: string[]
   selectedConversationId: string | null
   filteredCount: number
 }
@@ -190,7 +191,7 @@ type MessageScrollState = {
   anchorOffset: number
 }
 
-const emptySnapshot = (): Snapshot => ({ connectors: [], conversations: [], contacts: [], messages: [], selectedConversationId: null, filteredCount: 0 })
+const emptySnapshot = (): Snapshot => ({ connectors: [], conversations: [], contacts: [], messages: [], members: [], selectedConversationId: null, filteredCount: 0 })
 const snapshot = ref<Snapshot>(emptySnapshot())
 const initialConversationId = new URLSearchParams(window.location.search).get('conversation') || ''
 const selectedId = ref(initialConversationId)
@@ -755,6 +756,8 @@ function storeComposer() {
 }
 
 function restoreComposer(conversationId: string) {
+  rememberedMentions.value = []
+  mentionPicker.value = null
   draft.value = draftCache.get(conversationId) || ''
   staged.value = [...(stagedCache.get(conversationId) || [])]
 }
@@ -880,7 +883,8 @@ function sameInbox(left: Snapshot, right: Snapshot) {
   if (left.connectors.length !== right.connectors.length
       || left.conversations.length !== right.conversations.length
       || left.messages.length !== right.messages.length
-      || JSON.stringify(left.contacts) !== JSON.stringify(right.contacts)) return false
+      || JSON.stringify(left.contacts) !== JSON.stringify(right.contacts)
+      || left.members.join('\n') !== right.members.join('\n')) return false
   for (let index = 0; index < left.connectors.length; index += 1) {
     const a = left.connectors[index]
     const b = right.connectors[index]
@@ -964,6 +968,7 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
         body.selectedConversationId = contact.defaultConversationId
         reloadConversationId = contact.defaultConversationId
         body.messages = []
+        body.members = []
       }
     } else if (!conversationListPath.value.length && body.selectedConversationId) {
       const owner = body.contacts.find((item) => item.conversationIds.includes(body.selectedConversationId || ''))
@@ -971,6 +976,7 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
         selectedContactId.value = owner.id
         reloadConversationId = body.selectedConversationId
         body.messages = []
+        body.members = []
       }
     }
     if (conversationListPath.value.length) {
@@ -989,7 +995,7 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
       body.selectedConversationId = selectedConversationId
       reloadConversationId = selectedConversationId && selectedConversationId !== request.conversationId
         ? selectedConversationId : ''
-      if (reloadConversationId || !selectedConversationId) body.messages = []
+      if (reloadConversationId || !selectedConversationId) { body.messages = []; body.members = [] }
     }
     const priorThread = document.querySelector<HTMLElement>('.message-scroll')
     const priorSelectedId = selectedId.value
@@ -1797,6 +1803,8 @@ async function send() {
   if (!conversation || !canSend.value || sendingConversationIds.value.has(conversation.id)) return
   const targetConversationId = conversation.id
   const sentDraft = draft.value
+  const sentMentions = mentionable.value
+    ? rememberedMentions.value.filter((name) => sentDraft.includes(`@${name}`)) : []
   const sentFiles = [...staged.value]
   sendingConversationIds.value = new Set([...sendingConversationIds.value, targetConversationId])
   try {
@@ -1814,6 +1822,7 @@ async function send() {
         conversationId: conversation.id,
         body: sentDraft,
         attachmentIds: sentFiles.map((file) => file.id),
+        ...(sentMentions.length ? { mentions: sentMentions } : {}),
         clientRequestId: pendingRequest.clientRequestId,
       }),
     })
@@ -1840,7 +1849,10 @@ async function send() {
     else stagedCache.delete(targetConversationId)
   }
   if (selectedId.value === targetConversationId) {
-    if (draft.value === sentDraft) draft.value = ''
+    if (draft.value === sentDraft) {
+      draft.value = ''
+      rememberedMentions.value = []
+    }
     staged.value = staged.value.filter((file) => !sentFileIds.has(file.id))
   }
   notify('已加入发送队列')
@@ -1852,7 +1864,154 @@ async function send() {
   }
 }
 
+const MENTION_TRIGGER = /(^|\s)@([^\s@]{0,64})$/
+const composerInput = ref<HTMLTextAreaElement | null>(null)
+const rememberedMentions = ref<string[]>([])
+const mentionPicker = ref<{ start: number, query: string } | null>(null)
+const mentionIndex = ref(0)
+const avatarMenu = ref<{ x: number, y: number, message: Message } | null>(null)
+let avatarPressTimer: number | undefined
+
+const mentionable = computed(() => {
+  const conversation = selectedConversation.value
+  return Boolean(canSendText.value && conversation?.conversationType === 'group'
+    && (conversation.connectorKind === 'qq' || conversation.connectorKind === 'wechat'))
+})
+const mentionCandidates = computed(() => {
+  const picker = mentionPicker.value
+  if (!picker || !mentionable.value) return []
+  const query = picker.query.toLowerCase()
+  return snapshot.value.members.filter((name) => name.toLowerCase().includes(query)).slice(0, 8)
+})
+
+function updateMentionPicker() {
+  const input = composerInput.value
+  if (!input || !mentionable.value) { mentionPicker.value = null; return }
+  const caret = input.selectionStart ?? 0
+  const match = MENTION_TRIGGER.exec(draft.value.slice(0, caret))
+  if (!match) { mentionPicker.value = null; return }
+  mentionPicker.value = { start: caret - match[2].length - 1, query: match[2] }
+  mentionIndex.value = 0
+}
+
+function rememberMention(name: string) {
+  if (!rememberedMentions.value.includes(name)) rememberedMentions.value = [...rememberedMentions.value, name]
+}
+
+function chooseMention(name: string) {
+  const input = composerInput.value
+  const picker = mentionPicker.value
+  if (!input || !picker) return
+  const caret = input.selectionStart ?? picker.start
+  const insert = `@${name} `
+  draft.value = draft.value.slice(0, picker.start) + insert + draft.value.slice(caret)
+  rememberMention(name)
+  mentionPicker.value = null
+  void nextTick(() => {
+    input.focus()
+    const position = picker.start + insert.length
+    input.setSelectionRange(position, position)
+  })
+}
+
+function insertMention(name: string) {
+  const separator = draft.value && !/\s$/.test(draft.value) ? ' ' : ''
+  draft.value = `${draft.value}${separator}@${name} `
+  rememberMention(name)
+  void nextTick(() => {
+    const input = composerInput.value
+    input?.focus()
+    input?.setSelectionRange(draft.value.length, draft.value.length)
+  })
+}
+
+function canActOnSender(message: Message) {
+  return mentionable.value && message.direction === 'inbound' && !message.presentation
+    && message.senderName.trim().length > 0
+}
+
+function openAvatarMenu(event: { clientX: number, clientY: number }, message: Message) {
+  avatarMenu.value = {
+    x: Math.min(event.clientX, window.innerWidth - 140),
+    y: Math.min(event.clientY, window.innerHeight - 90),
+    message,
+  }
+}
+
+function onAvatarContextmenu(event: MouseEvent, message: Message) {
+  if (!canActOnSender(message)) return
+  event.preventDefault()
+  openAvatarMenu(event, message)
+}
+
+function onAvatarTouchStart(event: TouchEvent, message: Message) {
+  if (!canActOnSender(message)) return
+  const touch = event.touches[0]
+  if (!touch) return
+  const point = { clientX: touch.clientX, clientY: touch.clientY }
+  cancelAvatarPress()
+  avatarPressTimer = window.setTimeout(() => openAvatarMenu(point, message), 500)
+}
+
+function cancelAvatarPress() {
+  if (avatarPressTimer) window.clearTimeout(avatarPressTimer)
+  avatarPressTimer = undefined
+}
+
+function mentionSender() {
+  const message = avatarMenu.value?.message
+  avatarMenu.value = null
+  if (message) insertMention(message.senderName)
+}
+
+async function patSender() {
+  const message = avatarMenu.value?.message
+  avatarMenu.value = null
+  if (!message) return
+  try {
+    await api(`/api/messages/${encodeURIComponent(message.id)}/pat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ clientRequestId: `web-${crypto.randomUUID()}` }),
+    })
+  } catch (error) {
+    notify(`拍一拍失败：${error instanceof Error ? error.message : String(error)}`)
+    return
+  }
+  try {
+    await load(selectedId.value, true)
+  } catch {
+    notify('已发出，列表稍后自动刷新')
+  }
+}
+
+function onMenuPointer(event: PointerEvent) {
+  if (avatarMenu.value && !(event.target as Element | null)?.closest('.avatar-menu')) avatarMenu.value = null
+}
+
+function onMenuKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape' && avatarMenu.value) avatarMenu.value = null
+}
+
 function onComposerKeydown(event: KeyboardEvent) {
+  if (mentionPicker.value && mentionCandidates.value.length && !event.isComposing) {
+    const count = mentionCandidates.value.length
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault()
+      mentionIndex.value = (mentionIndex.value + (event.key === 'ArrowDown' ? 1 : count - 1)) % count
+      return
+    }
+    if (event.key === 'Enter' || event.key === 'Tab') {
+      event.preventDefault()
+      chooseMention(mentionCandidates.value[mentionIndex.value])
+      return
+    }
+  }
+  if (event.key === 'Escape' && mentionPicker.value) {
+    event.preventDefault()
+    mentionPicker.value = null
+    return
+  }
   if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
     event.preventDefault()
     void send()
@@ -1912,6 +2071,8 @@ onMounted(() => {
   document.addEventListener('pointerdown', onStickerPointer)
   document.addEventListener('keydown', onStickerKeydown)
   document.addEventListener('keydown', onPackDialogKeydown)
+  document.addEventListener('pointerdown', onMenuPointer)
+  document.addEventListener('keydown', onMenuKeydown)
   window.addEventListener('pagehide', onOffline)
   window.addEventListener('online', onOnline)
   window.addEventListener('offline', onOffline)
@@ -1922,6 +2083,9 @@ onUnmounted(() => {
   document.removeEventListener('pointerdown', onStickerPointer)
   document.removeEventListener('keydown', onStickerKeydown)
   document.removeEventListener('keydown', onPackDialogKeydown)
+  document.removeEventListener('pointerdown', onMenuPointer)
+  document.removeEventListener('keydown', onMenuKeydown)
+  cancelAvatarPress()
   refreshLoop?.stop()
   liveSignal.stop()
   cancelInboxRead()
@@ -2404,7 +2568,12 @@ onUnmounted(() => {
             >
               <span
                 class="avatar message-avatar"
-                :class="entry.byAgent ? 'avatar-agent' : `avatar-tone-${avatarTone(entry.message.senderName)}`"
+                :class="[entry.byAgent ? 'avatar-agent' : `avatar-tone-${avatarTone(entry.message.senderName)}`, { 'avatar-actionable': canActOnSender(entry.message) }]"
+                @contextmenu="onAvatarContextmenu($event, entry.message)"
+                @touchstart.passive="onAvatarTouchStart($event, entry.message)"
+                @touchmove.passive="cancelAvatarPress"
+                @touchend="cancelAvatarPress"
+                @touchcancel="cancelAvatarPress"
               >
                 <AppIcon v-if="entry.byAgent" name="bot" :size="16" />
                 <span v-else aria-hidden="true">{{ initials(entry.message.senderName) }}</span>
@@ -2545,7 +2714,20 @@ onUnmounted(() => {
             </button>
           </div>
           <div class="compose-surface" :class="{ disabled: !canSendText }">
+            <div v-if="mentionPicker && mentionCandidates.length" class="mention-popover" role="listbox" aria-label="提及成员">
+              <button
+                v-for="(name, index) in mentionCandidates"
+                :key="name"
+                type="button"
+                role="option"
+                :aria-selected="index === mentionIndex"
+                :class="{ active: index === mentionIndex }"
+                @mousedown.prevent
+                @click="chooseMention(name)"
+              >{{ name }}</button>
+            </div>
             <textarea
+              ref="composerInput"
               v-model="draft"
               :disabled="!canSendText"
               :maxlength="maxTextLength"
@@ -2553,6 +2735,9 @@ onUnmounted(() => {
               :aria-label="`回复 ${composerName}`"
               rows="2"
               @keydown="onComposerKeydown"
+              @input="updateMentionPicker"
+              @click="updateMentionPicker"
+              @blur="mentionPicker = null"
             />
             <div class="compose-toolbar">
               <label v-if="selectedContact && sendTargetOptions.length > 1" class="send-target">
@@ -2873,6 +3058,15 @@ onUnmounted(() => {
     </section>
   </main>
 
+  <div
+    v-if="avatarMenu"
+    class="avatar-menu"
+    role="menu"
+    :style="{ left: `${avatarMenu.x}px`, top: `${avatarMenu.y}px` }"
+  >
+    <button type="button" role="menuitem" @click="mentionSender">@TA</button>
+    <button type="button" role="menuitem" @click="patSender">拍一拍</button>
+  </div>
   <Transition name="toast">
     <div v-if="toast" class="toast" role="status">{{ toast }}</div>
   </Transition>
