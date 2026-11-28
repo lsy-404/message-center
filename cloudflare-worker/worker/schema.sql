@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS conversations (
   trust_tier TEXT NOT NULL DEFAULT 'untrusted',
   agent_policy_json TEXT NOT NULL DEFAULT '{}',
   unread_count INTEGER NOT NULL DEFAULT 0,
+  read_baseline INTEGER NOT NULL DEFAULT 0,
   last_message_preview TEXT NOT NULL DEFAULT '',
   last_message_at TEXT,
   created_at TEXT NOT NULL,

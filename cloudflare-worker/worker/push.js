@@ -77,7 +77,7 @@ export async function notifyInbound(env, messageIds) {
   for (const messageId of messageIds) {
     const row = await env.DB.prepare(`
       SELECT m.sender_name, m.body, m.queue_class, m.direction, m.metadata_json, c.id AS conversation_id,
-        COALESCE(ct.display_name, p.display_name, c.title) AS title, COALESCE(p.is_muted, 0) AS muted
+        COALESCE(ct.display_name, p.display_name, c.title) AS title, COALESCE(p.is_muted, 0) OR COALESCE(p.placement, '') IN ('folded', 'message_box') AS muted
       FROM messages m JOIN conversations c ON c.id = m.conversation_id
       LEFT JOIN conversation_profiles p ON p.connector_id = c.connector_id AND p.conversation_external_id = c.external_id
       LEFT JOIN contact_conversations cc ON cc.conversation_id = c.id

@@ -1,0 +1,1 @@
+ALTER TABLE conversations ADD COLUMN read_baseline INTEGER NOT NULL DEFAULT 0;

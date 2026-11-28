@@ -939,6 +939,14 @@ function cancelInboxRead() {
   inboxReads.cancel()
 }
 
+// An open chat counts as read: its unread badge clears here and stays clear until new messages arrive.
+function markSelectedRead(body: Snapshot) {
+  const open = body.conversations.find((item) => item.id === body.selectedConversationId)
+  if (!open || !(open.unreadCount > 0)) return
+  open.unreadCount = 0
+  void api(`/api/conversations/${encodeURIComponent(open.id)}/read`, { method: 'POST' }).catch(() => {})
+}
+
 async function load(conversationId = selectedId.value, silent = false, forceScrollToBottom = false) {
   if (document.hidden || !navigator.onLine) {
     if (!silent) detailLoading.value = false
@@ -1014,6 +1022,7 @@ async function load(conversationId = selectedId.value, silent = false, forceScro
       loadedAttachmentImages.value = new Set([...loadedAttachmentImages.value].filter((key) => currentImageKeys.has(key)))
     }
     advanceAvatarRetries(body.conversations, body.messages)
+    markSelectedRead(body)
     if (sameInbox(snapshot.value, body)) {
       if (reloadConversationId) void load(reloadConversationId, true)
       return
@@ -2318,7 +2327,7 @@ onUnmounted(() => {
           <li v-for="listFolder in listFolders" :key="listFolder.id">
             <button
               class="conversation-row conversation-folder-row"
-              :class="{ active: listFolder.active, unread: listFolder.unreadCount > 0 }"
+              :class="{ active: listFolder.active, unread: listFolder.unreadCount > 0, muted: !listFolder.unreadCount }"
               type="button"
               :aria-label="`${listFolder.title}，${listFolder.count} ${getConversationFolder(listFolder.id)?.unit ?? ''}，${listFolder.unreadCount} 条未读`"
               :aria-current="listFolder.active ? 'true' : undefined"
@@ -2337,8 +2346,8 @@ onUnmounted(() => {
                 </span>
                 <span class="conversation-meta-row">
                   <span class="conversation-preview">{{ listFolder.count }} {{ getConversationFolder(listFolder.id)?.unit }}</span>
-                  <span v-if="listFolder.unreadCount" class="unread-count" aria-hidden="true">
-                    {{ listFolder.unreadCount > 99 ? '99+' : listFolder.unreadCount }}
+                  <span v-if="listFolder.unreadCount || listFolder.quietUnreadCount" class="unread-count" aria-hidden="true">
+                    {{ (listFolder.unreadCount || listFolder.quietUnreadCount) > 99 ? '99+' : (listFolder.unreadCount || listFolder.quietUnreadCount) }}
                   </span>
                 </span>
               </span>

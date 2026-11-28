@@ -29,6 +29,7 @@ import zlib
 
 REQUEST_TIMEOUT = 15
 MAX_REMEMBERED = 300
+AVATAR_REFRESH_MS = 7 * 24 * 60 * 60 * 1000
 MAX_PROFILES = 20
 MAX_BODY = 20000
 MAX_STATE_CONVERSATIONS = 1000
@@ -119,6 +120,7 @@ def load_state(profile):
         state = {}
     state.setdefault("conversations", {})
     state.setdefault("recent", {})
+    state.setdefault("avatars", {})
     state["profile"] = profile
     return state
 
@@ -132,6 +134,7 @@ def save_state(state):
     state["recent"] = {key: [entry for entry in entries if now - entry.get("at", 0) < RECENT_SEND_MS]
                        for key, entries in state["recent"].items()}
     state["recent"] = {key: entries for key, entries in state["recent"].items() if entries}
+    state["avatars"] = {key: at for key, at in state.get("avatars", {}).items() if key in state["conversations"]}
     path = state_path(state["profile"])
     directory = os.path.dirname(path)
     descriptor, temporary = tempfile.mkstemp(prefix=".selkies-state-", dir=directory)
@@ -797,6 +800,38 @@ def rows_known(driver, rows, seen, folder_seen):
     return True
 
 
+class RowPictures:
+    """Chat-list row avatars cut from one screenshot taken while the main chat list is on screen."""
+
+    def __init__(self, desktop, window_id, rows):
+        right = max((r["bounds"]["x"] + 90 for r in rows if r.get("bounds")), default=0)
+        self.shot = None
+        if right:
+            png, (self.left, self.top, self.scale) = desktop.screenshot(window_id)
+            self.rows, self.bpp = png_left_columns(png, int((right - self.left) * self.scale))
+            self.shot = True
+
+    def avatar(self, bounds):
+        """The square picture at the row's left end, found as the ink that differs from the row's own background."""
+        if not self.shot or not bounds:
+            return None
+        bpp, scale = self.bpp, self.scale
+        x0, y0 = int((bounds["x"] - self.left) * scale), int((bounds["y"] - self.top) * scale)
+        x1, y1 = x0 + int(80 * scale), min(len(self.rows), y0 + int(bounds["h"] * scale))
+        if y0 < 0 or y1 - y0 < 16:
+            return None
+        background = self.rows[y0 + 2][(x0 + 2) * bpp:(x0 + 2) * bpp + 3]
+        inked = [(x, y) for y in range(y0, y1) for x in range(x0, x1)
+                 if max(abs(a - b) for a, b in zip(self.rows[y][x * bpp:x * bpp + 3], background)) > 24]
+        if len(inked) < 200:
+            return None
+        left, top = min(x for x, _ in inked), min(y for _, y in inked)
+        size = min(max(x for x, _ in inked) - left, max(y for _, y in inked) - top) + 1
+        if size < 20 or size > 72:
+            return None
+        return png_encode([row[left * bpp:(left + size) * bpp] for row in self.rows[top:top + size]], size, bpp)
+
+
 def scan(request, config):
     driver = request.get("driver")
     if driver not in APPS:
@@ -814,13 +849,26 @@ def scan(request, config):
     full_at = cursor.get("full") if isinstance(cursor.get("full"), int) else 0
 
     rows = main_rows(driver, tree) or []
-    if now - full_at < FULL_SCAN_MS and rows_known(driver, rows, seen, cursor.get("a")):
+    pictures_due = any(r.get("bounds") and not r["unread"] and r["name"] not in AGGREGATES[driver] and
+                       now - state["avatars"].get("{}-{}".format(APPS[driver]["prefix"], digest(r["name"])), 0)
+                       > AVATAR_REFRESH_MS for r in rows)
+    if now - full_at < FULL_SCAN_MS and not pictures_due and rows_known(driver, rows, seen, cursor.get("a")):
         return {"ok": True, "sourceReadStatus": "complete", "health": "online", "cursor": cursor,
                 "messages": [], "conversationProfiles": [], "active": True, "more": False}
     if driver == "qq":
         desktop.activate(window_id)
         tree = qq_scroll_top(desktop, window_id, tree)
         rows = qq_mark_pinned(desktop, window_id, main_rows(driver, tree) or [], qq_open_chat(tree))
+
+    on_screen = {id(r) for r in rows if r.get("bounds")}
+
+    def wants_avatar(row):
+        # An unread badge sits on WeChat's avatars, so pictures are taken from read rows.
+        key = "{}-{}".format(APPS[driver]["prefix"], digest(row["name"]))
+        return (id(row) in on_screen and not row["unread"] and row["name"] not in AGGREGATES[driver]
+                and now - state["avatars"].get(key, 0) > AVATAR_REFRESH_MS)
+    pictures = RowPictures(desktop, window_id, [r for r in rows if wants_avatar(r)]) \
+        if any(wants_avatar(r) for r in rows) else None
 
     aggregate = next((r for r in rows if r["name"] == APPS[driver]["folder"]), None)
     aggregate_print = folder_print(aggregate) if aggregate else None
@@ -849,7 +897,8 @@ def scan(request, config):
             row["pinned"] = bool(previous and len(previous.get("s") or "") > 1 and previous["s"][1] == "1")
         traits = row_traits(row)
         changed = previous is None or previous.get("p") != fingerprint or unread > previous.get("u", 0)
-        if not changed and previous.get("s") == traits:
+        picture = pictures.avatar(row["bounds"]) if pictures and wants_avatar(row) else None
+        if not changed and previous.get("s") == traits and picture is None:
             continue
         if (changed and len(messages) >= limit) or len(profiles) >= MAX_PROFILES:
             more = True
@@ -879,6 +928,9 @@ def scan(request, config):
         if isinstance(row["unread"], int):
             profile["unreadCount"] = row["unread"]
             profile["unreadObservedAt"] = iso(now)
+        if picture is not None and sum(len(p.get("avatarBase64", "")) for p in profiles) < 120_000:
+            profile["avatarBase64"] = base64.b64encode(picture).decode("ascii")
+            state["avatars"][conversation] = now
         profiles.append(profile)
         seen[conversation] = {"p": fingerprint, "u": unread, "g": group, "s": traits,
                               "at": now if changed else previous.get("at", now)}

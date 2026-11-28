@@ -20,7 +20,8 @@ export type ConversationFolderDefinition = {
 }
 export function getConversationFolder(folderId: unknown): ConversationFolderDefinition | null
 export function conversationFolderOf(conversation: Record<string, any>): ConversationFolderDefinition | null
-export function unreadTotal(conversations: Array<{ unreadCount?: unknown, muted?: boolean }>): number
+export function unreadTotal(conversations: Array<{ unreadCount?: unknown, muted?: boolean, placement?: string | null }>): number
+export function quietUnreadTotal(conversations: Array<{ unreadCount?: unknown, muted?: boolean, placement?: string | null }>): number
 export function normalizeChannelLabel(value: unknown): string
 export function isQQGroupAssistantConversation<T extends Record<string, any>>(conversation: T): boolean
 export function filterQQGroupAssistantConversations<T extends Record<string, any>>(conversations: T[]): T[]
@@ -52,7 +53,7 @@ export function buildConversationListModel<T extends Record<string, any>>(
   conversations: T[]
   scopeConversations: T[]
   selectionConversations: T[]
-  folders: Array<{ kind: 'folder', id: string, title: string, count: number, unreadCount: number, active: boolean }>
+  folders: Array<{ kind: 'folder', id: string, title: string, count: number, unreadCount: number, quietUnreadCount: number, active: boolean }>
 }
 export function resolveConversationSelection<T extends { id: string }>(
   conversations: T[], selectedId: string,

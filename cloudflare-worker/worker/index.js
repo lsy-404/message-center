@@ -1847,6 +1847,7 @@ async function ingestGroupTextBackups(request, env) {
           AND b.received_at < ?
       )
       AND NOT EXISTS (SELECT 1 FROM agent_queue q WHERE q.message_id = messages.id)
+      AND NOT EXISTS (SELECT 1 FROM attachments a WHERE a.message_id = messages.id)
   `).bind(connectorId, retentionCutoff).run();
   await env.DB.prepare(`
     DELETE FROM conversations
@@ -1941,6 +1942,19 @@ async function readStickers(env) {
   }));
 }
 
+// Unread counts mirror the client's, which clears only when the chat is opened there. Opening the chat here sets a
+// baseline that hides the count seen so far; a count below the baseline means the chat was read in the client.
+function visibleUnread(unread, baseline) {
+  const total = count(unread);
+  return total < count(baseline) ? total : total - count(baseline);
+}
+
+async function markConversationRead(env, conversationId) {
+  if (!validId(conversationId)) throw new Error("invalid_conversation_id");
+  await env.DB.prepare("UPDATE conversations SET read_baseline = unread_count WHERE id = ?").bind(conversationId).run();
+  return json({ ok: true });
+}
+
 async function readInbox(env, selectedConversationId, selectedContactId) {
   const connectorsResult = await env.DB.prepare(`
     SELECT * FROM connector_instances ORDER BY kind, display_name
@@ -1981,7 +1995,7 @@ async function readInbox(env, selectedConversationId, selectedContactId) {
     connectorChannelLabel: row.conversation_channel_label || row.connector_channel_label || row.connector_kind,
     conversationType: row.conversation_type, placement: row.placement,
     pinned: Boolean(row.is_pinned), muted: Boolean(row.is_muted), title: row.profile_title,
-    avatarLabel: row.avatar_label, trustTier: row.trust_tier, unreadCount: row.unread_count,
+    avatarLabel: row.avatar_label, trustTier: row.trust_tier, unreadCount: visibleUnread(row.unread_count, row.read_baseline),
     avatarPath: row.avatar_object_key
       ? `/api/avatars/${encodeURIComponent(row.connector_id)}/${encodeURIComponent(row.external_id)}?v=${encodeURIComponent(row.avatar_sha256 || "")}` : null,
     lastMessagePreview: row.last_message_preview, lastMessageAt: row.last_message_at,
@@ -3970,6 +3984,8 @@ export default {
       if (patRoute && request.method === "POST") return await requestPat(request, env, identity, patRoute[1]);
       const mediaFetch = url.pathname.match(/^\/api\/messages\/([a-zA-Z0-9._:-]+)\/fetch-media$/);
       if (mediaFetch && request.method === "POST") return await requestMediaFetch(env, identity, mediaFetch[1]);
+      const readMark = url.pathname.match(/^\/api\/conversations\/([a-zA-Z0-9._:-]+)\/read$/);
+      if (readMark && request.method === "POST") return await markConversationRead(env, readMark[1]);
       const policy = url.pathname.match(/^\/api\/conversations\/([a-zA-Z0-9._:-]+)\/policy$/);
       if (policy && new Set(["GET", "PUT"]).has(request.method)) return await conversationPolicy(request, env, identity, policy[1]);
       return fail("not_found", 404);

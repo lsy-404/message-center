@@ -37,7 +37,7 @@ test('QQ root shows one group-assistant folder row and keeps non-assistant conve
   assert.equal(model.title, 'QQ')
   assert.deepEqual(model.conversations.map(({ id }) => id), ['normal-group', 'direct', 'unknown-placement'])
   assert.deepEqual(model.folders, [{
-    kind: 'folder', id: QQ_GROUP_ASSISTANT_FOLDER_ID, title: '群助手', count: 2, unreadCount: 2, active: true,
+    kind: 'folder', id: QQ_GROUP_ASSISTANT_FOLDER_ID, title: '群助手', count: 2, unreadCount: 0, quietUnreadCount: 2, active: true,
   }])
   assert.ok(model.selectionConversations.some(({ id }) => id === 'folded'))
 })
@@ -62,7 +62,7 @@ test('search and unread filters determine folder presence and counts within the 
   const unread = buildConversationListModel(filterConversations(qqConversations, { unreadOnly: true }), {
     scopeKinds: ['qq'],
   })
-  assert.deepEqual([unread.folders[0].count, unread.folders[0].unreadCount], [1, 2])
+  assert.deepEqual([unread.folders[0].count, unread.folders[0].unreadCount, unread.folders[0].quietUnreadCount], [1, 0, 2])
   assert.deepEqual(unread.conversations.map(({ id }) => id), ['normal-group', 'direct'])
 
   const noMatchingAssistant = buildConversationListModel(

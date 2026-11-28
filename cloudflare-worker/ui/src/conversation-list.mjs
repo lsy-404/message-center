@@ -53,9 +53,20 @@ export function filterQQGroupAssistantConversations(conversations) {
   return conversations.filter(isQQGroupAssistantConversation)
 }
 
+// Folded chats (WeChat 折叠的聊天, QQ 群助手) do not notify in the clients either, so they count as muted.
+function quiet(conversation) {
+  return Boolean(conversation.muted) || isFoldedPlacement(conversation)
+}
+
 export function unreadTotal(conversations) {
   return conversations.reduce(
-    (total, conversation) => total + (conversation.muted ? 0 : Math.max(0, Number(conversation.unreadCount) || 0)), 0,
+    (total, conversation) => total + (quiet(conversation) ? 0 : Math.max(0, Number(conversation.unreadCount) || 0)), 0,
+  )
+}
+
+export function quietUnreadTotal(conversations) {
+  return conversations.reduce(
+    (total, conversation) => total + (quiet(conversation) ? Math.max(0, Number(conversation.unreadCount) || 0) : 0), 0,
   )
 }
 
@@ -167,6 +178,7 @@ export function buildConversationListModel(conversations, options = {}) {
         title: folder.title,
         count: members.length,
         unreadCount: unreadTotal(members),
+        quietUnreadCount: quietUnreadTotal(members),
         active: members.includes(selectedInFolder),
       }]
     }),
