@@ -44,7 +44,7 @@ function safeJson(value, fallback) {
 function text(value) { return typeof value === "string" ? value : ""; }
 function count(value) { return typeof value === "number" ? value : Number(value || 0); }
 function now() { return new Date().toISOString(); }
-function validId(value) { return typeof value === "string" && /^[a-zA-Z0-9][a-zA-Z0-9._:-]{7,199}$/.test(value); }
+function validId(value) { return typeof value === "string" && /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{7,199}$/.test(value); }
 function validShort(value) { return typeof value === "string" && /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,199}$/.test(value); }
 
 async function sha256Hex(value) {

@@ -13,10 +13,10 @@ Store a UTF-8 JSON configuration at a private local path with mode `0600`. Relat
   "adapter": "./selkies_adapter.py",
   "mediaDirectory": "./message-center-media",
   "connectors": [
-    {"id":"instance-selkies-wechat","token":"injected-token-a",
+    {"id":"wechat-wxid_example","token":"injected-token-a",
      "kind":"wechat","accountLabel":"Account A","displayName":"WeChat A","profile":"wechat-a",
      "nativeDesktop":"DESKTOP_WECHAT_A"},
-    {"id":"instance-selkies-qq","token":"injected-token-b",
+    {"id":"qq-10001","token":"injected-token-b",
      "kind":"qq","accountLabel":"Account A","displayName":"QQ A","profile":"qq-a",
      "nativeDesktop":"DESKTOP_QQ_A"}
   ],
@@ -26,6 +26,8 @@ Store a UTF-8 JSON configuration at a private local path with mode `0600`. Relat
 ```
 
 Use a real HTTPS origin and keep each bearer token private; the sample values are placeholders. The relay rejects redirects so credentials cannot be forwarded to another host. One process owns all configured connector identities and serializes polling and adapter calls across them. Run with `python3 device_runtime.py /path/to/private-config.json`. The supported drivers are `qq` and `wechat`.
+
+A connector's `id` is its `kind`, a hyphen and the account it reads: the QQ number (`qq-10001`) or the WeChat ID (`wechat-wxid_…`). The adapter reads the signed-in account from the client's own data directory in the container on every scan, send and fetch (QQ: the newest `.<number>` marker in `/config/.config/QQ/global/nt_data/Login`; WeChat: the newest entry in `/config/xwechat_files/all_users/login`) and refuses with `account_mismatch` when it differs, so a client signed in to another account is never read or sent from under this connector. A connector set up before its client was ever signed in has no account to name yet; give it its real id once the client is signed in.
 
 `receiveOnly` is optional. When `true` the connector registers only `receive_text` and `receive_images` and the runtime does not poll for commands; otherwise it also registers `send_text`, `send_files` and `send_images` and runs approved sends through the adapter. For a send with files, the runtime first downloads each file from the Worker (`GET /api/files/<id>` with the connector token) into `<mediaDirectory>/outgoing`, checks its size and SHA-256, passes the local path to the adapter, and removes the copy afterwards. A failed download is retried without anything having been sent.
 
@@ -100,7 +102,7 @@ Sign each client in once in Message Center's native view. Tick QQ's 自动登录
 - When the 群助手 / 折叠的聊天 row itself is pinned it cannot move, so the adapter opens it as described below even without `readFolders`; chats pinned inside 群助手 are recognised the same way.
 - With `readFolders: true` the adapter also opens 群助手 (QQ) or 折叠的聊天 (WeChat) when that row changes, or every 10 minutes, reads the chats on screen inside it with placement `folded`, and returns to the main list. Opening the folder means clicking its row in a list that reorders whenever a message arrives; the adapter clicks only after two reads 400 ms apart agree on the row and every row above it, but a message landing in between can still turn the click into opening the chat that moved into place, which marks it read. Pinning 群助手 in QQ keeps the row in place. The option is off by default.
 - Only rows on screen are visible to the accessibility tree, so the adapter restores and maximizes the client window before reading. A client hidden to the panel tray is shown again from its tray button; the adapter never presses Escape, which hides both clients to the tray.
-- Failures such as `client_not_running`, `client_signed_out`, `desktop_unreachable`, and `desktop_auth_refused` return `{"ok":false,"sourceReadStatus":"failed","error":code}`; the runtime marks the source failed and backs off.
+- Failures such as `client_not_running`, `client_signed_out`, `account_mismatch`, `desktop_unreachable`, and `desktop_auth_refused` return `{"ok":false,"sourceReadStatus":"failed","error":code}`; the runtime marks the source failed and backs off.
 
 ## Adapter process contract
 
@@ -112,7 +114,9 @@ Scan requests also include a connector-specific `mediaDirectory` and `maxMediaBy
 
 A scan may also return `conversationProfiles`, with at most 20 entries. Each entry contains `conversationExternalId` and `displayName`, plus optional type, placement, pin, unread count, preview and ISO timestamp fields. The runtime synchronizes these through the existing conversation profile API before committing the scan cursor. A failed update leaves the cursor unchanged.
 
-`send` request: `{"op":"send","profile":"profile-a","commandId":"...","idempotencyKey":"...","conversationExternalId":"...","body":"...","attachments":[]}`. Response success is `{"ok":true,"receipt":"..."}` with a nonempty receipt. A retryable failure must explicitly mean the operation was not dispatched: `{"ok":false,"retryable":true,"dispatched":false,"error":"short_code"}`. A definite pre-dispatch refusal is `{"ok":false,"dispatched":false,"error":"short_code"}`. Ambiguous or dispatched-without-receipt outcomes are uncertain. A process restart after the operation begins is treated as uncertain and is never automatically sent again. `selkies_adapter.py` sends text and up to 20 files to a chat a scan has seen; attachments are `{fileName, mimeType, localPath}` entries:
+Every request also carries `account`, the account named by the connector id, which the adapter compares with the signed-in account.
+
+`send` request: `{"op":"send","profile":"profile-a","account":"10001","commandId":"...","idempotencyKey":"...","conversationExternalId":"...","body":"...","attachments":[]}`. Response success is `{"ok":true,"receipt":"..."}` with a nonempty receipt. A retryable failure must explicitly mean the operation was not dispatched: `{"ok":false,"retryable":true,"dispatched":false,"error":"short_code"}`. A definite pre-dispatch refusal is `{"ok":false,"dispatched":false,"error":"short_code"}`. Ambiguous or dispatched-without-receipt outcomes are uncertain. A process restart after the operation begins is treated as uncertain and is never automatically sent again. `selkies_adapter.py` sends text and up to 20 files to a chat a scan has seen; attachments are `{fileName, mimeType, localPath}` entries:
 
 - It opens the chat: WeChat by scrolling the chat list (or 折叠的聊天) to the row and clicking it once two reads agree, QQ through the search box, whose results do not reorder.
 - It checks that the input box belongs to that chat and holds no draft.
@@ -120,6 +124,8 @@ A scan may also return `conversationProfiles`, with at most 20 entries. Each ent
 - Then it types the text (new lines with Shift+Enter) and reads the input back; any mismatch clears the input and refuses with `dispatched: false`, or, once a file already went out, reports an uncertain result.
 - It sends (WeChat with Enter, QQ with the 发送 button), then waits until the input is empty and the last message in the chat equals the text. Only then does it answer with a receipt. A result it cannot confirm carries no `dispatched: false`, so the runtime records it as uncertain for manual review and never sends it again.
 - The next scans recognise the chat-list preview of a message the adapter just sent and do not report it as an incoming message; the outbound message already exists in Message Center.
+
+To try a send on a real account, send an ordinary message of the kind the account would send anyway, to a chat you own (文件传输助手, 我的手机), not marker text such as numbered test strings: QQ and WeChat watch for automated-looking traffic, and such text also lingers in real chats.
 
 ### Fetching media
 

@@ -44,7 +44,7 @@ STATE_BASE = os.path.splitext(os.path.abspath(__file__))[0]
 
 APPS = {
     "wechat": {"app_id": "wechat", "sign_in": ("扫码登录", "当前登录用户", "需在手机上完成登录"), "folder": "折叠的聊天", "prefix": "wx"},
-    "qq": {"app_id": "QQ", "sign_in": ("手机QQ扫码登录",), "folder": "群助手", "prefix": "qq"},
+    "qq": {"app_id": "QQ", "sign_in": ("手机QQ扫码登录", "输入QQ密码"), "folder": "群助手", "prefix": "qq"},
 }
 # Rows that gather other chats rather than being one conversation.
 AGGREGATES = {
@@ -61,9 +61,13 @@ TIME_LABEL = re.compile(r"^(\d{1,4}[:/]\d{1,2}(/\d{1,2})?|昨天|前天|星期.)
 # Row-level markers the client prints in front of a preview; they describe the row, not the message.
 ROW_MARKERS = re.compile(r"^(\[(有人@我|有新文件|有人@你|草稿)\])+")
 SENDER = re.compile(r"^([^:：\[\]\n]{1,64})(?:: |：)(.*)$", re.S)
-# Typing these produces 〈〉 in the container, so they are pressed as keysyms instead.
 CONTAINER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 INPUT_TIMEOUT = 20
+# Each signed-in account leaves a marker here; the newest one is the account signed in now.
+ACCOUNT_MARKERS = {
+    "qq": ("/config/.config/QQ/global/nt_data/Login", re.compile(r"^\.([1-9][0-9]{4,11})$")),
+    "wechat": ("/config/xwechat_files/all_users/login", re.compile(r"^(wxid_[A-Za-z0-9_-]{4,60}|[A-Za-z][A-Za-z0-9_-]{5,19})$")),
+}
 IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 SAFE_FILE_NAME = re.compile(r"^[^/\\\x00-\x1f]{1,200}$")
 
@@ -243,6 +247,20 @@ class Desktop:
 
     def windows(self):
         return self.call("/desktop").get("windows") or []
+
+    def account(self, driver):
+        """The account signed in to the client, read from the client's own data directory."""
+        directory, pattern = ACCOUNT_MARKERS[driver]
+        try:
+            listing = subprocess.run([self.docker, "exec", self.name, "ls", "-At", directory],
+                                     stdin=subprocess.DEVNULL, capture_output=True, timeout=INPUT_TIMEOUT, check=True)
+        except (OSError, subprocess.SubprocessError):
+            raise AdapterError("account_unknown")
+        for line in listing.stdout.decode("utf-8", "replace").splitlines():
+            match = pattern.match(line.strip())
+            if match:
+                return match.group(1)
+        raise AdapterError("account_unknown")
 
     def screenshot(self, window_id):
         """The window's picture as PNG bytes, and the (x, y, scale) that maps a screen point into it."""
@@ -539,6 +557,12 @@ def main_rows(driver, tree):
     return wechat_rows(tree) if driver == "wechat" else qq_rows(tree)
 
 
+def check_account(desktop, driver, request):
+    """Refuses to act for a connector whose id names another account than the one signed in."""
+    if desktop.account(driver) != request.get("account"):
+        raise AdapterError("account_mismatch")
+
+
 def open_client(desktop, driver):
     """The client's main window, signed in, maximized and showing its main chat list."""
     app = APPS[driver]
@@ -740,6 +764,7 @@ def scan(request, config):
     desktop, entry = container(config, request.get("profile"))
     state = load_state(request.get("profile"))
     window_id, tree = open_client(desktop, driver)
+    check_account(desktop, driver, request)
     owner = qq_owner(tree) if driver == "qq" else None
     cursor = request.get("cursor") if isinstance(request.get("cursor"), dict) else {}
     seen = dict(cursor.get("chats") or {})
@@ -1173,6 +1198,7 @@ def send(request, config):
         name = target["name"]
         staged = outgoing_files(entry, attachments, request.get("commandId")) if attachments else []
         window_id, tree = open_client(desktop, driver)
+        check_account(desktop, driver, request)
         # open_conversation raises the window when it has to open the chat; an open chat's input is checked after typing.
         tree = open_conversation(desktop, driver, window_id, tree, name, bool(target.get("folder")))
         node, draft = chat_input(driver, tree, name, loose=True)
@@ -1361,6 +1387,7 @@ def fetch(request, config):
         if not target:
             return {"ok": False, "error": "conversation_unknown"}
         window_id, tree = open_client(desktop, driver)
+        check_account(desktop, driver, request)
         desktop.activate(window_id)
         tree = open_conversation(desktop, driver, window_id, tree, target["name"], bool(target.get("folder")))
         desktop.park_pointer(window_id)

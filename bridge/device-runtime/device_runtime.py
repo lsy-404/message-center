@@ -134,6 +134,12 @@ def open_database(path):
     return db
 
 
+def connector_account(connector):
+    """The account a device connector reads: its id is the kind and the account, such as qq-123456789."""
+    prefix = str(connector.get("kind")) + "-"
+    return connector["id"][len(prefix):] if connector["id"].startswith(prefix) else None
+
+
 def compact(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
@@ -265,7 +271,7 @@ class Relay:
         if len({item["token"] for item in self.connectors}) != len(self.connectors):
             raise ValueError("connector_tokens_must_be_unique")
         for connector in self.connectors:
-            if (not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._:-]{7,199}", connector["id"]) or
+            if (not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.:-]{7,199}", connector["id"]) or
                     len(connector["token"]) < 32):
                 raise ValueError("invalid_connector_configuration")
             native_desktop = connector.get("nativeDesktop")
@@ -542,7 +548,7 @@ class Relay:
         if driver not in {"qq", "wechat"}:
             raise RuntimeError("unsupported_connector_driver")
         scan_request = {"op": "scan", "driver": driver,
-                                        "profile": profile, "cursor": cursor,
+                                        "profile": profile, "account": connector_account(connector), "cursor": cursor,
                                         "limit": limit, "maxBytes": MAX_SCAN_RESPONSE,
                                         "maxEventBytes": MAX_EVENT, "mediaDirectory": self.media_directory_for(self.connector),
                                         "maxMediaBytes": remaining, "history": bool(history)}
@@ -856,6 +862,7 @@ class Relay:
             connector = self.connector_by_id[self.connector]
             result = self.adapter_call({
                 "op": "fetch", "driver": connector.get("kind"), "profile": profile,
+                "account": connector_account(connector),
                 "conversationExternalId": payload.get("externalConversationId"),
                 "kind": payload.get("kind"), "fileName": payload.get("fileName"),
                 "mediaDirectory": self.media_directory_for(self.connector),
@@ -933,7 +940,8 @@ class Relay:
                 result = {"ok": False, "retryable": True, "dispatched": False, "error": "attachment_download_failed"}
             else:
                 request = {"op": "send", "driver": driver,
-                           "profile": profile, "commandId": command["id"],
+                           "profile": profile, "account": connector_account(connector),
+                           "commandId": command["id"],
                            "idempotencyKey": key,
                            "conversationExternalId": payload.get("externalConversationId"),
                            "body": payload.get("body", ""),
