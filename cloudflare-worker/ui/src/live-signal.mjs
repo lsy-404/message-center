@@ -54,6 +54,9 @@ export function createLiveSignal(onChanged, url = `${location.protocol === 'http
       running = true
       connect()
     },
+    connected() {
+      return socket?.readyState === WebSocket.OPEN
+    },
     stop() {
       running = false
       if (retryTimer !== undefined) window.clearTimeout(retryTimer)

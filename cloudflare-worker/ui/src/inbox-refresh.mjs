@@ -26,7 +26,7 @@ export function createInboxReadGate() {
   }
 }
 
-export function createInboxRefreshLoop(refresh, isEnabled, timers = window) {
+export function createInboxRefreshLoop(refresh, isEnabled, timers = window, idleDelay = () => 5_000) {
   let timer
   let running = false
   let inFlight = false
@@ -62,7 +62,7 @@ export function createInboxRefreshLoop(refresh, isEnabled, timers = window) {
     } finally {
       inFlight = false
       if (running && isEnabled()) {
-        const delay = wakeAfterFlight ? 0 : Math.min(60_000, 5_000 * (2 ** failures))
+        const delay = wakeAfterFlight ? 0 : failures ? Math.min(60_000, 5_000 * (2 ** failures)) : idleDelay()
         wakeAfterFlight = false
         schedule(delay)
       }
@@ -73,7 +73,7 @@ export function createInboxRefreshLoop(refresh, isEnabled, timers = window) {
     start(immediate = false) {
       running = true
       if (inFlight) wakeAfterFlight = immediate
-      else schedule(immediate ? 0 : 5_000)
+      else schedule(immediate ? 0 : idleDelay())
     },
     stop() {
       running = false

@@ -1891,6 +1891,7 @@ onMounted(() => {
     navigator.serviceWorker.register('/sw.js', { scope: '/' }).then(refreshPush, () => {})
   }
   let firstLoad = true
+  // With the live socket open, changes arrive as wake-ups; the slow poll only refreshes connector presence.
   refreshLoop = createInboxRefreshLoop(async () => {
     if (inboxReads.isBusy()) return
     try {
@@ -1903,7 +1904,7 @@ onMounted(() => {
       }
       throw error
     }
-  }, refreshAllowed)
+  }, refreshAllowed, window, () => (liveSignal.connected() ? 60_000 : 5_000))
   refreshLoop.start(true)
   liveSignal.start()
   clockTimer = window.setInterval(() => { nowTick.value = Date.now() }, 60_000)

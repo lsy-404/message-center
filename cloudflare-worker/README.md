@@ -75,7 +75,7 @@
 - 浏览器先把附件写入私有 R2 staging，再用稳定的 `clientRequestId` 原子排队；同一请求的并发重试只会生成一条消息和一条命令。
 - staging 文件最长保留 24 小时；成功排队后转为命令附件，取消或过期文件由 Worker 定时清理。
 - 排队操作保证幂等。设备 relay 在本地持久化执行账本；只有明确未调用客户端时才自动重试。客户端调用结果不确定时转入人工检查，避免一次物理发送被重复执行。
-- `CommandSignal` Durable Object 持有休眠的 WebSocket：设备连 `/api/connectors/signal`，命令排队时收到 `command` 后立即领取；已登录的页面连 `/api/live`，命令完成、新消息入库或表情取回完成时收到 `changed` 后立即刷新。两边都只传唤醒信号，内容仍走原有接口；页面保留 5 秒轮询作为兜底。设备还可在同一条连接上发 `{"t":"req","id","method","path","headers","body","bodyEncoding"}` 帧调用 `/api/connectors/*` 接口（`signal` 与 `files/*` 除外，单帧上限 1 MiB），Worker 以同样的路由与鉴权处理后回 `{"t":"res","id","status","body"}`，省去单独的 HTTP 请求。
+- `CommandSignal` Durable Object 持有休眠的 WebSocket：设备连 `/api/connectors/signal`，命令排队时收到 `command` 后立即领取；已登录的页面连 `/api/live`，命令完成、新消息入库或表情取回完成时收到 `changed` 后立即刷新。两边都只传唤醒信号，内容仍走原有接口；页面在实时连接断开时每 5 秒轮询，连接正常时每 60 秒轮询一次以刷新接入状态。设备还可在同一条连接上发 `{"t":"req","id","method","path","headers","body","bodyEncoding"}` 帧调用 `/api/connectors/*` 接口（`signal` 与 `files/*` 除外，单帧上限 1 MiB），Worker 以同样的路由与鉴权处理后回 `{"t":"res","id","status","body"}`，省去单独的 HTTP 请求。
 
 ## 构建与部署
 

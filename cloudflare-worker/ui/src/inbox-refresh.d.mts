@@ -11,6 +11,7 @@ export function createInboxRefreshLoop(
   refresh: () => Promise<unknown>,
   isEnabled: () => boolean,
   timers?: Pick<Window, 'setTimeout' | 'clearTimeout'>,
+  idleDelay?: () => number,
 ): {
   start(immediate?: boolean): void
   stop(): void
